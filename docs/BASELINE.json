@@ -1,0 +1,42 @@
+[
+  {
+    "File": "assets\\icon.ico",
+    "SHA256": "2C1DCBB327162630D5C9579A4C9DE77694E29F717F204EA3B864ECEAC1D6B858",
+    "BaselineOK": true
+  },
+  {
+    "File": "embedded\\WinStateDiag\\EXPC_WinDiagProbe.ps1",
+    "SHA256": "2729220E50E7ACD45094BACCAB72B853565C65955411267BFB941752D7A869D9",
+    "BaselineOK": true
+  },
+  {
+    "File": "embedded\\WinStateDiag\\Compatibility.psm1",
+    "SHA256": "85252D3E5F5117C413BCEDF3D14776D4492F51AB2B45CEABDDD145C874E0D97E",
+    "BaselineOK": true
+  },
+  {
+    "File": "embedded\\WinStateDiag\\ReportStorage.psm1",
+    "SHA256": "0A019358483A182A39E24FFD6CE3C2B889A3F3D3F395B6838D08AA4943B487CB",
+    "BaselineOK": true
+  },
+  {
+    "File": "embedded\\WinStateDiag\\ReportViewer.ps1",
+    "SHA256": "9AEC3876AF5836F25276352A4D6BF5AC9033F6421A996BFFA9EC7A10ABA56BCB",
+    "BaselineOK": true
+  },
+  {
+    "File": "embedded\\EXPC-Diagnostic\\EXPC-Diagnostic.ps1",
+    "SHA256": "C1FC065F344BF5D8707F1086A3E37A101815625AE69633B4B0C7438A7C0C83BC",
+    "BaselineOK": true
+  },
+  {
+    "File": "embedded\\Hardware-Report\\Hardware-Diagnostic.ps1",
+    "SHA256": "50EE00DBC66B505E479E9F15895F8B7FE75ACEF7ADF4464B56304FF4A586A082",
+    "BaselineOK": true
+  },
+  {
+    "File": "embedded\\Hardware-Report\\HardwarePassport.psm1",
+    "SHA256": "800CEAFA97D3179FC0DB57D1CEE3377C44F9C8042D7EE49B81C3F0A0CDA55403",
+    "BaselineOK": true
+  }
+]

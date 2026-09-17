@@ -1,0 +1,31 @@
+# Rust build
+/target/
+
+# Distribution binaries
+/dist/*
+!/dist/.gitkeep
+
+# Diagnostic reports
+/Reports/
+/reports/
+*.zip
+
+# Internal engineering material
+/docs/AUDIT/
+/legacy-tests/
+
+# Claude working artifacts
+/Claude outputs/
+
+# Temporary / backup files
+*.log
+*.tmp
+*.bak
+*.before-*
+*~
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
