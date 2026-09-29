@@ -84,3 +84,11 @@ Windows 10 / 11 x64, без установки, один файл `WinStateDiag.
 - Интерфейс RU / EN, безопасный запуск графики (резервный программный рендер WARP), журнал сессии.
 
 **Отчёт**: одна накопительная ZIP-папка на компьютер и дату в `Reports\`, внутри — `manifest.json` (машиночитаемое описание модулей, файлов и результатов глубоких проверок). После проверки итогового ZIP в папке отчёта остаётся только он; при любой ошибке все файлы сохраняются.
+
+## Real screenshots / Реальные скриншоты
+
+Real WinStateDiag v0.4.0 sessions on Windows.
+
+![WinStateDiag v0.4.0 real diagnostic session](assets/screenshots/WinStateDiag-v0.4.0-real-01.jpg)
+
+![WinStateDiag v0.4.0 real diagnostic session](assets/screenshots/WinStateDiag-v0.4.0-real-02.jpg)
