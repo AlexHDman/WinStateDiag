@@ -89,6 +89,7 @@ Windows 10 / 11 x64, без установки, один файл `WinStateDiag.
 
 Real WinStateDiag v0.4.0 sessions on Windows.
 
-![WinStateDiag v0.4.0 real diagnostic session](assets/screenshots/WinStateDiag-v0.4.0-real-01.jpg)
+![WinStateDiag v0.4.0 real diagnostic session](assets/screenshots/WinStateDiag-v0.4.0-real-01-v2.jpg)
 
 ![WinStateDiag v0.4.0 real diagnostic session](assets/screenshots/WinStateDiag-v0.4.0-real-02.jpg)
+
