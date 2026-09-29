@@ -30,6 +30,9 @@ TRIM / cleanup / registry changes
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
+try {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+} catch {}
 
 $ScriptVersion = '1.5'
 $ComputerName  = $env:COMPUTERNAME
@@ -141,6 +144,68 @@ function Set-CheckStatus {
         Check  = $Key
         Status = $Status
         Detail = $Detail
+    }
+}
+
+# Microsoft Defender summary (read-only classification of Get-MpComputerStatus
+# values). $true/'True' = enabled, $false/'False' = disabled; anything else
+# (missing property, $null, unexpected text) = not determined.
+function ConvertTo-DefenderFlag {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [bool]) { return [bool]$Value }
+    $text = ([string]$Value).Trim()
+    if ($text -eq 'True' -or $text -eq '1') { return $true }
+    if ($text -eq 'False' -or $text -eq '0') { return $false }
+    return $null
+}
+
+function Get-DefenderStateSummary {
+    param(
+        $AntivirusEnabled,
+        $AMServiceEnabled,
+        $RealTimeProtectionEnabled
+    )
+
+    $names = @('Antivirus', 'AMService', 'RealTimeProtection')
+    $values = @(
+        (ConvertTo-DefenderFlag $AntivirusEnabled),
+        (ConvertTo-DefenderFlag $AMServiceEnabled),
+        (ConvertTo-DefenderFlag $RealTimeProtectionEnabled)
+    )
+
+    $enabled = @()
+    $disabled = @()
+    $unknown = @()
+    for ($i = 0; $i -lt $names.Count; $i++) {
+        if ($null -eq $values[$i]) {
+            $unknown += $names[$i]
+        } elseif ($values[$i]) {
+            $enabled += $names[$i]
+        } else {
+            $disabled += $names[$i]
+        }
+    }
+
+    $parts = @()
+    if ($disabled.Count -gt 0) { $parts += ('отключено — {0}' -f ($disabled -join ', ')) }
+    if ($enabled.Count -gt 0) { $parts += ('включено — {0}' -f ($enabled -join ', ')) }
+    if ($unknown.Count -gt 0) { $parts += ('не определено — {0}' -f ($unknown -join ', ')) }
+
+    if ($disabled.Count -gt 0) {
+        $status = 'ATTENTION'
+    } elseif ($unknown.Count -gt 0) {
+        $status = 'UNKNOWN'
+    } else {
+        $status = 'OK'
+    }
+
+    [PSCustomObject]@{
+        Status   = $status
+        Detail   = ('Microsoft Defender: {0}.' -f ($parts -join '; '))
+        Enabled  = $enabled
+        Disabled = $disabled
+        Unknown  = $unknown
     }
 }
 
@@ -535,7 +600,9 @@ function Invoke-NativeWithProgress {
     param(
         [Parameter(Mandatory=$true)][string]$FilePath,
         [Parameter(Mandatory=$true)][string]$Arguments,
-        [Parameter(Mandatory=$true)][string]$Label
+        [Parameter(Mandatory=$true)][string]$Label,
+        [int]$OverallStart = -1,
+        [int]$OverallEnd   = -1
     )
 
     $tempRoot = Join-Path $env:TEMP 'EXPC-Diagnostic'
@@ -575,6 +642,16 @@ function Invoke-NativeWithProgress {
             if ($null -ne $pct) { $lastPercent = [double]$pct }
 
             Show-LiveProgress -Label $Label -Percent $lastPercent -Elapsed $sw.Elapsed
+
+            # Emit interpolated WSD_PROGRESS for Rust GUI when overall range is known
+            if ($OverallStart -ge 0 -and $OverallEnd -ge 0 -and $null -ne $lastPercent) {
+                $span = $OverallEnd - $OverallStart
+                $interpolated = [math]::Floor($OverallStart + ($span * $lastPercent / 100.0))
+                if ($interpolated -lt $OverallStart) { $interpolated = $OverallStart }
+                if ($interpolated -ge $OverallEnd)   { $interpolated = $OverallEnd - 1 }
+                [Console]::Out.WriteLine(('WSD_PROGRESS|{0}|{1} — {2:n0}%' -f $interpolated, $Label, $lastPercent))
+                [Console]::Out.Flush()
+            }
 
             $alive = $false
             try {
@@ -1236,16 +1313,13 @@ function Get-VssShadowStorageInfo {
 }
 
 function Get-BiosSafetyContext {
-    $firmwareMode = 'UNKNOWN'
-    try {
-        $pe = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name PEFirmwareType -ErrorAction Stop).PEFirmwareType
-        $firmwareMode = switch ([int]$pe) { 1 { 'Legacy BIOS' } 2 { 'UEFI' } default { 'UNKNOWN' } }
-    } catch {}
-
-    $secureBoot = 'UNKNOWN'
-    if (Get-Command Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) {
-        try { $secureBoot = [string][bool](Confirm-SecureBootUEFI -ErrorAction Stop) } catch { $secureBoot = 'Unsupported/UNKNOWN' }
-    }
+    # Единый механизм (v0.3.6, Compatibility.psm1: Get-CompatFirmwareState),
+    # тот же, что использует Hardware Report — устраняет расхождение, когда
+    # один модуль по WinPE-only registry значению ошибочно давал UNKNOWN,
+    # а другой достоверно определял UEFI через нативный Win32 API.
+    $firmwareState = Get-CompatFirmwareState
+    $firmwareMode = switch ($firmwareState.Firmware) { 'UEFI' { 'UEFI' } 'Legacy' { 'Legacy BIOS' } default { 'UNKNOWN' } }
+    $secureBoot = switch ($firmwareState.SecureBoot) { 'Enabled' { 'True' } 'Disabled' { 'False' } default { 'Unsupported/UNKNOWN' } }
 
     $tpmPresent = 'UNKNOWN'; $tpmReady = 'UNKNOWN'; $tpmEnabled = 'UNKNOWN'
     if (Get-Command Get-Tpm -ErrorAction SilentlyContinue) {
@@ -1337,6 +1411,9 @@ function Invoke-Step {
     )
 
     $decision = Get-StepDecision -Title $Title -Long:$Long -DeepKey $DeepKey
+    $totalSteps = 14
+    $startPercent = [math]::Floor((($Number - 1) * 100) / $totalSteps)
+    $completePercent = [math]::Floor(($Number * 100) / $totalSteps)
 
     if ($decision -eq 'Exit') {
         Write-Section ("ДИАГНОСТИКА ОСТАНОВЛЕНА ПОЛЬЗОВАТЕЛЕМ НА ШАГЕ {0}" -f $Number)
@@ -1344,6 +1421,8 @@ function Invoke-Step {
     }
 
     if ($decision -eq 'Skip') {
+        [Console]::Out.WriteLine(('WSD_PROGRESS|{0}|{1}' -f $startPercent,$Title))
+        [Console]::Out.Flush()
         Write-Section ("[{0:00}] {1}" -f $Number, $Title)
         Write-Log 'ПРОПУЩЕНО: глубокая проверка не выбрана / выбран основной режим.'
         Write-Host ("Пропущено: {0}" -f $Title) -ForegroundColor DarkGray
@@ -1351,9 +1430,13 @@ function Invoke-Step {
         if (-not [string]::IsNullOrWhiteSpace($DeepKey)) {
             Set-CheckStatus -Key $DeepKey -Status 'SKIPPED' -Detail 'Не выбрано при запуске.'
         }
+        [Console]::Out.WriteLine(('WSD_PROGRESS|{0}|{1} — пропущено' -f $completePercent,$Title))
+        [Console]::Out.Flush()
         return $true
     }
 
+    [Console]::Out.WriteLine(('WSD_PROGRESS|{0}|{1}' -f $startPercent,$Title))
+    [Console]::Out.Flush()
     Write-Host ''
     Write-Host ("Выполняется: {0}" -f $Title) -ForegroundColor Green
     Write-Section ("[{0:00}] {1}" -f $Number, $Title)
@@ -1387,6 +1470,9 @@ function Invoke-Step {
             Set-CheckStatus -Key ("Step {0:00}" -f $Number) -Status 'ERROR' -Detail ("{0}: {1} (line {2})" -f $Title, $msg, $scriptLine)
         }
     }
+
+    [Console]::Out.WriteLine(('WSD_PROGRESS|{0}|{1} — завершено' -f $completePercent,$Title))
+    [Console]::Out.Flush()
 
     return $true
 }
@@ -2316,13 +2402,17 @@ $continue = Invoke-Step -Number 10 -Title 'Антивирус и состоян�
                     QuickScanAge, FullScanAge
             ) -Format List
 
-            if (-not $mp.AntivirusEnabled -or -not $mp.AMServiceEnabled -or -not $mp.RealTimeProtectionEnabled) {
-                $msg = 'Microsoft Defender сообщает об отключённом Antivirus/AMService/RealTimeProtection.'
-                Add-Attention $msg
-                Set-CheckStatus -Key 'Defender' -Status 'ATTENTION' -Detail $msg
-            } else {
-                Set-CheckStatus -Key 'Defender' -Status 'OK' -Detail 'Antivirus, AMService и RealTimeProtection включены.'
+            # Each component is reported exactly as Defender states it (a
+            # disabled RealTimeProtection must not read as "everything off").
+            $defender = Get-DefenderStateSummary `
+                -AntivirusEnabled $mp.AntivirusEnabled `
+                -AMServiceEnabled $mp.AMServiceEnabled `
+                -RealTimeProtectionEnabled $mp.RealTimeProtectionEnabled
+            Write-Log $defender.Detail
+            if ($defender.Status -eq 'ATTENTION') {
+                Add-Attention $defender.Detail
             }
+            Set-CheckStatus -Key 'Defender' -Status $defender.Status -Detail $defender.Detail
         } catch {
             Write-Log ("Get-MpComputerStatus: {0}" -f $_.Exception.Message)
             Set-CheckStatus -Key 'Defender' -Status 'UNKNOWN' -Detail 'Не удалось получить Get-MpComputerStatus.'
@@ -2399,7 +2489,9 @@ $continue = Invoke-Step `
     $r = Invoke-NativeWithProgress `
         -FilePath (Join-Path $env:SystemRoot 'System32\sfc.exe') `
         -Arguments '/verifyonly' `
-        -Label 'SFC /verifyonly'
+        -Label 'SFC /verifyonly' `
+        -OverallStart $startPercent `
+        -OverallEnd $completePercent
 
     if ($r.ExitCodeKnown) {
         Write-Log ("ExitCode: {0}" -f $r.ExitCode)
@@ -2488,7 +2580,9 @@ $continue = Invoke-Step `
     $r = Invoke-NativeWithProgress `
         -FilePath (Join-Path $env:SystemRoot 'System32\DISM.exe') `
         -Arguments '/Online /Cleanup-Image /ScanHealth /NoRestart /English' `
-        -Label 'DISM /ScanHealth'
+        -Label 'DISM /ScanHealth' `
+        -OverallStart $startPercent `
+        -OverallEnd $completePercent
 
     if ($r.ExitCodeKnown) {
         Write-Log ("ExitCode: {0}" -f $r.ExitCode)
@@ -2582,7 +2676,9 @@ $continue = Invoke-Step `
     $r = Invoke-NativeWithProgress `
         -FilePath (Join-Path $env:SystemRoot 'System32\chkdsk.exe') `
         -Arguments ("{0} /scan" -f $env:SystemDrive) `
-        -Label ("CHKDSK {0} /scan" -f $env:SystemDrive)
+        -Label ("CHKDSK {0} /scan" -f $env:SystemDrive) `
+        -OverallStart $startPercent `
+        -OverallEnd $completePercent
 
     if ($r.ExitCodeKnown) {
         Write-Log ("ExitCode: {0}" -f $r.ExitCode)
@@ -2923,12 +3019,19 @@ $continue = Invoke-Step -Number 14 -Title 'BIOS, основные драйвер
         }
     )
 
+    # DriverDate/INF age is metadata only (v0.3.6): an old INF date alone
+    # never elevates this check to WARNING/REVIEW — that conflated a real
+    # problem with a purely cosmetic INF timestamp (e.g. a current, DriverAudit
+    # OK Realtek 2.5GbE driver flagged only for its old INF date). Current
+    # driver version/provider recency is DriverAudit's job, not this
+    # inventory listing's; this stays informational (Status=INFO) regardless
+    # of the age-based counts, which are still shown for transparency.
     if ($reviewRows.Count -gt 0) {
-        $detail = "Версии собраны; REVIEW по возрасту: {0}; CHECK: {1}; OEM/WU verification: {2}. Возраст сам по себе не означает неисправность." -f $reviewRows.Count, $checkRows.Count, $oemCheckRows.Count
-        Set-CheckStatus -Key 'BIOS / Drivers' -Status 'REVIEW' -Detail $detail
+        $detail = "Версии собраны; по возрасту INF отмечено для сверки: {0}; CHECK: {1}; OEM/WU verification: {2}. Возраст INF сам по себе не является предупреждением/проблемой; актуальность версии определяется Driver Audit." -f $reviewRows.Count, $checkRows.Count, $oemCheckRows.Count
+        Set-CheckStatus -Key 'BIOS / Drivers' -Status 'INFO' -Detail $detail
     } elseif ($checkRows.Count -gt 0) {
         $detail = "Версии собраны; CHECK: {0}; OEM/WU verification: {1}. Latest требует внешней сверки." -f $checkRows.Count, $oemCheckRows.Count
-        Set-CheckStatus -Key 'BIOS / Drivers' -Status 'REVIEW' -Detail $detail
+        Set-CheckStatus -Key 'BIOS / Drivers' -Status 'INFO' -Detail $detail
     } else {
         $detail = "Версии собраны; возрастных CHECK/REVIEW флагов нет; OEM/WU verification: {0}. Latest требует внешней сверки." -f $oemCheckRows.Count
         Set-CheckStatus -Key 'BIOS / Drivers' -Status 'INFO' -Detail $detail

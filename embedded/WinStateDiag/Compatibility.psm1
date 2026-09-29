@@ -67,4 +67,49 @@ function Get-CompatInstance {
     throw (New-Object PlatformNotSupportedException 'Neither Get-CimInstance nor Get-WmiObject is available.')
 }
 
-Export-ModuleMember -Function Test-CompatCommand,Test-CompatPowerShellVersion,Get-CompatRuntimeInfo,Get-CompatInstance
+function Get-CompatFirmwareState {
+    [CmdletBinding()]
+    param()
+    # Single shared mechanism (v0.3.6) for Firmware/Secure Boot, so every
+    # caller agrees: one module previously read a WinPE-only registry value
+    # (HKLM:\SYSTEM\CurrentControlSet\Control!PEFirmwareType, normally
+    # absent -> silently UNKNOWN) while another used the reliable Win32
+    # GetFirmwareType API and correctly reported UEFI. That divergence is
+    # what this function removes: everyone now calls this, and only this.
+    $firmware = 'Unable to determine'
+    try {
+        if (-not ('ExpcCompatFirmwareNative' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ExpcCompatFirmwareNative {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool GetFirmwareType(out UInt32 firmwareType);
+}
+'@
+        }
+        [uint32]$native = 0
+        if ([ExpcCompatFirmwareNative]::GetFirmwareType([ref]$native)) {
+            $firmware = switch ($native) { 1 { 'Legacy' } 2 { 'UEFI' } default { 'Unable to determine' } }
+        }
+    } catch { $firmware = 'Unable to determine' }
+
+    # Secure Boot only means anything on UEFI; on Legacy/unknown firmware
+    # the state is "Unable to determine", never a guessed Disabled/False.
+    $secureBoot = 'Unable to determine'
+    if ($firmware -eq 'UEFI') {
+        try {
+            $state = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -Name UEFISecureBootEnabled -ErrorAction Stop
+            $secureBoot = if ([int]$state.UEFISecureBootEnabled -eq 1) { 'Enabled' } else { 'Disabled' }
+        } catch {
+            if (Test-CompatCommand 'Confirm-SecureBootUEFI') {
+                try { $secureBoot = if (Confirm-SecureBootUEFI -ErrorAction Stop) { 'Enabled' } else { 'Disabled' } }
+                catch { $secureBoot = 'Unable to determine' }
+            }
+        }
+    }
+
+    [PSCustomObject]@{ Firmware = $firmware; SecureBoot = $secureBoot }
+}
+
+Export-ModuleMember -Function Test-CompatCommand,Test-CompatPowerShellVersion,Get-CompatRuntimeInfo,Get-CompatInstance,Get-CompatFirmwareState

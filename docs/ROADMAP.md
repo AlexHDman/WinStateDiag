@@ -1,19 +1,12 @@
 # Roadmap
 
-WinStateDiag stays a small, portable, read-only diagnostic utility. No scope expansion is planned beyond the items below.
+WinStateDiag v0.4.0 is feature-complete and frozen.
 
-## Near term
-- Finish the Rust orchestration layer around the existing PowerShell diagnostic engine.
-- Automatic ZIP report assembly in `Reports\<date>\<session>.zip`.
-- Package Hardware Report JSON into the diagnostic ZIP automatically.
-- Ship `WinStateDiag.exe` as the single portable entry point.
+Future work is limited to:
+- confirmed bugs (see `KNOWN_BUGS.md`);
+- compatibility fixes;
+- validated user feedback.
 
-## Planned, not implemented
-- Optional AI Analysis module with pluggable providers: ChatGPT, Claude, Gemini, Grok, DeepSeek, Qwen, local AI, custom.
-  Possible future connection methods: browser/account authorization (where a provider officially allows it), API, local AI endpoint, custom provider.
-  Not implemented, not researched, no SDKs added at this stage.
+Out of scope for WinStateDiag: repair or recovery functionality, Windows Server, x86, Linux/macOS, installer, telemetry, auto-updater.
 
-## Out of scope
-- Repair / recovery functionality.
-- Windows Server, x86, Linux/macOS support.
-- Web server, database, telemetry, auto-updater, installer, CI/CD.
+The machine-readable `manifest.json` in every report is designed so that separate tools can consume WinStateDiag reports in the future; no such integration is part of WinStateDiag today.

@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.0
 [CmdletBinding()]
-param([switch]$NoGui, [switch]$ExportAll, [switch]$GuiSmoke, [string]$GuiScreenshotPath='')
+param([switch]$NoGui, [switch]$ExportAll, [switch]$GuiSmoke, [string]$GuiScreenshotPath='', [switch]$WsdViewer, [string]$ReportFolder='')
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -62,17 +62,23 @@ function New-HardwareReportLines {
     $lines.Add((Format-HardwareLine 'Version' $Passport.Bios.Version))
     $lines.Add((Format-HardwareLine 'Release date' $Passport.Bios.ReleaseDate))
     $lines.Add((Format-HardwareLine 'Firmware mode' $Passport.Bios.FirmwareType))
+    $lines.Add((Format-HardwareLine 'Secure Boot' $Passport.Bios.SecureBoot))
     $lines.Add('')
     $lines.Add('[CPU]')
     $lines.Add((Format-HardwareLine 'Model' ($Passport.Cpu.Models -join '; ')))
     $lines.Add((Format-HardwareLine 'Cores / threads' ("$($Passport.Cpu.PhysicalCores) / $($Passport.Cpu.LogicalProcessors)")))
-    $lines.Add((Format-HardwareLine 'Clock max/current' ("$($Passport.Cpu.MaxClockMHz) / $($Passport.Cpu.CurrentClockMHz) MHz")))
+    $lines.Add((Format-HardwareLine 'Base clock (Windows-reported nominal)' ("$($Passport.Cpu.MaxClockMHz) MHz")))
+    $lines.Add((Format-HardwareLine 'Current clock' ("$($Passport.Cpu.CurrentClockMHz) MHz")))
+    $lines.Add((Format-HardwareLine 'Max Boost' 'Not reliably reported by Windows'))
     $lines.Add((Format-HardwareLine 'Socket' ($Passport.Cpu.Sockets -join '; ')))
     $lines.Add('')
     $lines.Add('[RAM]')
     $lines.Add((Format-HardwareLine 'State' $Passport.Ram.State))
-    $lines.Add((Format-HardwareLine 'Total / modules' ("$($Passport.Ram.Total) / $($Passport.Ram.ModuleCount)")))
-    $lines.Add((Format-HardwareLine 'Declared slots' $Passport.Ram.DeclaredSlots))
+    $lines.Add((Format-HardwareLine 'Total / detected modules' ("$($Passport.Ram.Total) / $($Passport.Ram.ModuleCount)")))
+    $lines.Add((Format-HardwareLine 'SMBIOS declared memory devices/slots' $Passport.Ram.DeclaredSlots))
+    if ($Passport.Ram.ModuleCount -lt $Passport.Ram.DeclaredSlots) {
+        $lines.Add('Note: SMBIOS may not reflect full physical topology (soldered/onboard RAM, incomplete SMBIOS). An unpopulated physical slot is not confirmed.')
+    }
     foreach ($reason in @($Passport.Ram.Reasons)) { $lines.Add("Reason: $reason") }
     foreach ($module in @($Passport.Ram.Modules)) { $lines.Add("- $($module.DeviceLocator): $($module.Manufacturer) $($module.PartNumber), $($module.Capacity) $($module.Type), rated $($module.RatedSpeedMHz) MHz, configured $($module.ConfiguredClockMHz) MHz") }
     $lines.Add('')
@@ -93,7 +99,20 @@ function New-HardwareReportLines {
     $lines.Add('')
     $lines.Add('[BATTERY]')
     $lines.Add((Format-HardwareLine 'Battery' $Passport.Battery.Summary))
-    foreach ($battery in @($Passport.Battery.Batteries)) { $lines.Add("- $($battery.Name); charge $($battery.ChargePercent)%; status code $($battery.StatusCode)") }
+    foreach ($battery in @($Passport.Battery.Batteries)) {
+        $lines.Add("- $($battery.Name); Manufacturer: $($battery.Manufacturer); Model: $($battery.Model); Serial: $($battery.Serial)")
+        $wearText = if ($battery.WearPercent -eq 'N/A') { 'N/A' } else { "$($battery.WearPercent)%" }
+        $lines.Add("  Charge: $($battery.ChargePercent)%; Status code: $($battery.StatusCode); Design capacity: $($battery.DesignCapacity); Full charge capacity: $($battery.FullChargeCapacity); Wear: $wearText; Cycle count: $($battery.CycleCount)")
+    }
+    $lines.Add('')
+    $lines.Add('[NPU]')
+    if ($Passport.Npu.Detected) {
+        foreach ($npu in @($Passport.Npu.Devices)) {
+            $lines.Add("- $($npu.Name); Vendor: $($npu.Vendor); Driver: $($npu.DriverVersion) ($($npu.DriverDate)); Status: $($npu.DeviceStatus)")
+        }
+    } else {
+        $lines.Add((Format-HardwareLine 'NPU' 'Not detected (normal on platforms without an NPU).'))
+    }
     if (@($Passport.CollectionErrors).Count) {
         $lines.Add(''); $lines.Add('[UNAVAILABLE DATA]')
         foreach ($message in @($Passport.CollectionErrors)) { $lines.Add("- $message") }
@@ -236,7 +255,7 @@ function Update-HardwareGui {
     foreach($key in $overview.Keys){$State.OverviewValues[$key].Text=[string]$overview[$key]}
     $State.OverviewValues.Overall.Font=New-Object Drawing.Font('Segoe UI Semibold',13)
     $State.OverviewValues.Overall.ForeColor=$(switch($p.OverallState){'OK'{[Drawing.Color]::FromArgb(44,155,94)}'WARNING'{[Drawing.Color]::FromArgb(205,132,25)}'CRITICAL'{[Drawing.Color]::FromArgb(205,55,55)}default{[Drawing.Color]::FromArgb(92,105,122)}})
-    $cpu=@{Model=$p.Cpu.Models-join '; ';Manufacturer=$p.Cpu.Manufacturers-join '; ';Cores=$p.Cpu.PhysicalCores;Logical=$p.Cpu.LogicalProcessors;Socket=$p.Cpu.Sockets-join '; ';MaxClock="$($p.Cpu.MaxClockMHz) MHz";CurrentClock="$($p.Cpu.CurrentClockMHz) MHz";Architecture=$p.Cpu.Architecture;Cache="L2 $($p.Cpu.L2CacheKB) KB; L3 $($p.Cpu.L3CacheKB) KB"}
+    $cpu=@{Model=$p.Cpu.Models-join '; ';Manufacturer=$p.Cpu.Manufacturers-join '; ';Cores=$p.Cpu.PhysicalCores;Logical=$p.Cpu.LogicalProcessors;Socket=$p.Cpu.Sockets-join '; ';MaxClock="$($p.Cpu.MaxClockMHz) MHz";CurrentClock="$($p.Cpu.CurrentClockMHz) MHz";MaxBoost='Not reliably reported by Windows';Architecture=$p.Cpu.Architecture;Cache="L2 $($p.Cpu.L2CacheKB) KB; L3 $($p.Cpu.L3CacheKB) KB"}
     foreach($key in $cpu.Keys){$State.CpuValues[$key].Text=[string]$cpu[$key]}
     Set-HardwareGridRows $State.RamGrid @($p.Ram.Modules|ForEach-Object{,@($_.DeviceLocator,$_.Manufacturer,$_.PartNumber,$_.Capacity,"$($_.RatedSpeedMHz) MHz","$($_.ConfiguredClockMHz) MHz",$_.Serial,$_.State)})
     $State.RamFooter.Text="Total installed: $($p.Ram.Total) | Type: $(@($p.Ram.Modules|ForEach-Object Type|Sort-Object -Unique)-join '/') | Declared slots: $($p.Ram.DeclaredSlots) | Detected: $($p.Ram.ModuleCount) | State: $($p.Ram.State)`r`n$($p.Ram.Reasons -join '; ')"
@@ -246,7 +265,7 @@ function Update-HardwareGui {
     $State.GpuFooter.Text='Windows does not expose a universal trustworthy GPU hardware-health value.'
     Set-HardwareGridRows $State.NetworkGrid @($p.Network.Adapters|ForEach-Object{,@($_.Name,$_.AdapterType,$_.Manufacturer,$_.MAC,$_.LinkState)})
     $State.NetworkFooter.Text="Physical Ethernet / Wi-Fi adapters: $(@($p.Network.Adapters).Count)."
-    $bios=@{BoardManufacturer=$p.Motherboard.Manufacturer;BoardProduct=$p.Motherboard.Product;BoardVersion=$p.Motherboard.Version;BoardSerial=$p.Motherboard.Serial;BiosManufacturer=$p.Bios.Manufacturer;BiosVersion=$p.Bios.Version;ReleaseDate=$p.Bios.ReleaseDate;FirmwareType=$p.Bios.FirmwareType}
+    $bios=@{BoardManufacturer=$p.Motherboard.Manufacturer;BoardProduct=$p.Motherboard.Product;BoardVersion=$p.Motherboard.Version;BoardSerial=$p.Motherboard.Serial;BiosManufacturer=$p.Bios.Manufacturer;BiosVersion=$p.Bios.Version;ReleaseDate=$p.Bios.ReleaseDate;FirmwareType=$p.Bios.FirmwareType;SecureBoot=$p.Bios.SecureBoot}
     foreach($key in $bios.Keys){$State.BiosValues[$key].Text=[string]$bios[$key]}
     $battery=@($p.Battery.Batteries|Select-Object -First 1)
     $b=if($battery.Count){$battery[0]}else{$null}
@@ -255,11 +274,11 @@ function Update-HardwareGui {
     $State.RawJson.Text=$p|ConvertTo-Json -Depth 10
     $State.StatusLabel.Text=$p.OverallState;$State.StatusLabel.ForeColor=$(switch($p.OverallState){'OK'{[Drawing.Color]::FromArgb(61,180,112)}'WARNING'{[Drawing.Color]::FromArgb(240,175,60)}'CRITICAL'{[Drawing.Color]::FromArgb(220,70,70)}default{[Drawing.Color]::Silver}})
     $generated=[datetime]$p.GeneratedAt;$State.FooterLabel.Text=('Дата: {0:dd.MM.yy}    Время: {0:HH:mm}    Last refresh: {1:HH:mm}    EXPC WinDiagProbe    Design by EXPC' -f $generated,(Get-Date))
-    $State.PathLabel.Text="Reports: $($State.Directory) | Current basename: $($State.BaseName)"
+    if($State.WsdViewer){$State.PathLabel.Text="Папка отчёта: $($State.ReportFolder)"}else{$State.PathLabel.Text="Reports: $($State.Directory) | Current basename: $($State.BaseName)"}
 }
 
 function Show-HardwareDiagnosticsGui {
-    param([object]$Passport,[string]$BaseName,[string]$Directory,[switch]$SmokeTest,[string]$ScreenshotPath='')
+    param([object]$Passport,[string]$BaseName,[string]$Directory,[switch]$SmokeTest,[string]$ScreenshotPath='',[switch]$WsdViewer,[string]$ReportFolder='')
     Add-Type -AssemblyName System.Windows.Forms;Add-Type -AssemblyName System.Drawing
     [Windows.Forms.Application]::EnableVisualStyles()
     $form=New-Object Windows.Forms.Form;$form.Text='EXPC WinDiagProbe — Hardware Diagnostics';$form.Size=New-Object Drawing.Size(1350,850);$form.MinimumSize=New-Object Drawing.Size(1100,700);$form.StartPosition='CenterScreen';$form.BackColor=[Drawing.Color]::FromArgb(244,247,251);$form.KeyPreview=$true
@@ -277,12 +296,12 @@ function Show-HardwareDiagnosticsGui {
     $workspace.Controls.Add($content);$workspace.Controls.Add($footer);$workspace.Controls.Add($actions);$workspace.Controls.Add($header);$form.Controls.Add($workspace);$form.Controls.Add($nav)
 
     $overview=New-HardwareOverviewPage
-    $cpu=New-HardwarePropertyPage 'Процессор' @([PSCustomObject]@{Key='Model';Label='Model'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='Cores';Label='Cores'},[PSCustomObject]@{Key='Logical';Label='Logical processors'},[PSCustomObject]@{Key='Socket';Label='Socket'},[PSCustomObject]@{Key='MaxClock';Label='Maximum clock'},[PSCustomObject]@{Key='CurrentClock';Label='Current clock'},[PSCustomObject]@{Key='Architecture';Label='Architecture'},[PSCustomObject]@{Key='Cache';Label='Cache'})
+    $cpu=New-HardwarePropertyPage 'Процессор' @([PSCustomObject]@{Key='Model';Label='Model'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='Cores';Label='Cores'},[PSCustomObject]@{Key='Logical';Label='Logical processors'},[PSCustomObject]@{Key='Socket';Label='Socket'},[PSCustomObject]@{Key='MaxClock';Label='Base clock (Windows-reported nominal)'},[PSCustomObject]@{Key='CurrentClock';Label='Current clock'},[PSCustomObject]@{Key='MaxBoost';Label='Max Boost'},[PSCustomObject]@{Key='Architecture';Label='Architecture'},[PSCustomObject]@{Key='Cache';Label='Cache'})
     $ram=New-HardwareGridPage 'Память (RAM)' @([PSCustomObject]@{Key='Slot';Label='Slot'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='PartNumber';Label='Part Number'},[PSCustomObject]@{Key='Capacity';Label='Capacity'},[PSCustomObject]@{Key='Speed';Label='Speed'},[PSCustomObject]@{Key='Clock';Label='Configured Clock'},[PSCustomObject]@{Key='Serial';Label='Serial'},[PSCustomObject]@{Key='State';Label='State'})
     $storage=New-HardwareGridPage 'Накопители' @([PSCustomObject]@{Key='Model';Label='Model'},[PSCustomObject]@{Key='Type';Label='Type'},[PSCustomObject]@{Key='Capacity';Label='Capacity'},[PSCustomObject]@{Key='Bus';Label='Bus / Interface'},[PSCustomObject]@{Key='Health';Label='Health'},[PSCustomObject]@{Key='Operational';Label='Operational State'},[PSCustomObject]@{Key='Firmware';Label='Firmware'},[PSCustomObject]@{Key='Serial';Label='Serial'})
     $gpu=New-HardwareGridPage 'Видеоадаптеры' @([PSCustomObject]@{Key='Name';Label='Name'},[PSCustomObject]@{Key='VRAM';Label='VRAM'},[PSCustomObject]@{Key='Driver';Label='Driver version'},[PSCustomObject]@{Key='Pnp';Label='PNP identifier'},[PSCustomObject]@{Key='State';Label='State'})
     $network=New-HardwareGridPage 'Сеть' @([PSCustomObject]@{Key='Adapter';Label='Adapter'},[PSCustomObject]@{Key='Type';Label='Type'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='MAC';Label='MAC'},[PSCustomObject]@{Key='State';Label='Connection state'})
-    $bios=New-HardwarePropertyPage 'BIOS / Плата' @([PSCustomObject]@{Key='BoardManufacturer';Label='Board manufacturer'},[PSCustomObject]@{Key='BoardProduct';Label='Board product'},[PSCustomObject]@{Key='BoardVersion';Label='Board version'},[PSCustomObject]@{Key='BoardSerial';Label='Board serial'},[PSCustomObject]@{Key='BiosManufacturer';Label='BIOS manufacturer'},[PSCustomObject]@{Key='BiosVersion';Label='BIOS version'},[PSCustomObject]@{Key='ReleaseDate';Label='Release date'},[PSCustomObject]@{Key='FirmwareType';Label='UEFI / Legacy'})
+    $bios=New-HardwarePropertyPage 'BIOS / Плата' @([PSCustomObject]@{Key='BoardManufacturer';Label='Board manufacturer'},[PSCustomObject]@{Key='BoardProduct';Label='Board product'},[PSCustomObject]@{Key='BoardVersion';Label='Board version'},[PSCustomObject]@{Key='BoardSerial';Label='Board serial'},[PSCustomObject]@{Key='BiosManufacturer';Label='BIOS manufacturer'},[PSCustomObject]@{Key='BiosVersion';Label='BIOS version'},[PSCustomObject]@{Key='ReleaseDate';Label='Release date'},[PSCustomObject]@{Key='FirmwareType';Label='UEFI / Legacy'},[PSCustomObject]@{Key='SecureBoot';Label='Secure Boot'})
     $battery=New-HardwarePropertyPage 'Батарея' @([PSCustomObject]@{Key='Detected';Label='Battery detected'},[PSCustomObject]@{Key='Summary';Label='Summary'},[PSCustomObject]@{Key='Charge';Label='Charge'},[PSCustomObject]@{Key='Status';Label='Status'},[PSCustomObject]@{Key='Design';Label='Design capacity'},[PSCustomObject]@{Key='Full';Label='Full charge capacity'})
     $rawPage=New-Object Windows.Forms.Panel;$rawPage.Size=New-Object Drawing.Size(1100,650);$rawPage.Dock='Fill';$rawPage.BackColor=[Drawing.Color]::FromArgb(244,247,251)
     $rawHeading=New-Object Windows.Forms.Label;$rawHeading.Text='Raw JSON';$rawHeading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$rawHeading.AutoSize=$true;$rawHeading.Location=New-Object Drawing.Point(24,20)
@@ -292,10 +311,10 @@ function Show-HardwareDiagnosticsGui {
     $navButtons=@{};$navItems=@([PSCustomObject]@{Key='Overview';Label='Обзор'},[PSCustomObject]@{Key='Cpu';Label='Процессор'},[PSCustomObject]@{Key='Ram';Label='Память (RAM)'},[PSCustomObject]@{Key='Storage';Label='Накопители'},[PSCustomObject]@{Key='Gpu';Label='Видеоадаптеры'},[PSCustomObject]@{Key='Network';Label='Сеть'},[PSCustomObject]@{Key='Bios';Label='BIOS / Плата'},[PSCustomObject]@{Key='Battery';Label='Батарея'},[PSCustomObject]@{Key='Raw';Label='Raw JSON'})
     $top=118
     foreach($item in $navItems){$key=$item.Key;$button=New-Object Windows.Forms.Button;$button.Text=$item.Label;$button.FlatStyle='Flat';$button.FlatAppearance.BorderSize=0;$button.TextAlign='MiddleLeft';$button.Padding=New-Object Windows.Forms.Padding(14,0,0,0);$button.Font=New-Object Drawing.Font('Segoe UI',10);$button.ForeColor=[Drawing.Color]::White;$button.BackColor=$nav.BackColor;$button.SetBounds(0,$top,245,43);$nav.Controls.Add($button);$navButtons[$key]=$button;$top+=44}
-    $state=[PSCustomObject]@{Passport=$Passport;BaseName=$BaseName;Directory=$Directory;Pages=$pages;NavButtons=$navButtons;OverviewValues=$overview.Values;CpuValues=$cpu.Values;RamGrid=$ram.Grid;RamFooter=$ram.Footer;StorageGrid=$storage.Grid;StorageFooter=$storage.Footer;GpuGrid=$gpu.Grid;GpuFooter=$gpu.Footer;NetworkGrid=$network.Grid;NetworkFooter=$network.Footer;BiosValues=$bios.Values;BatteryValues=$battery.Values;RawJson=$raw;StatusLabel=$status;FooterLabel=$footer;PathLabel=$null;CurrentPage='Overview'}
+    $state=[PSCustomObject]@{Passport=$Passport;BaseName=$BaseName;Directory=$Directory;Pages=$pages;NavButtons=$navButtons;OverviewValues=$overview.Values;CpuValues=$cpu.Values;RamGrid=$ram.Grid;RamFooter=$ram.Footer;StorageGrid=$storage.Grid;StorageFooter=$storage.Footer;GpuGrid=$gpu.Grid;GpuFooter=$gpu.Footer;NetworkGrid=$network.Grid;NetworkFooter=$network.Footer;BiosValues=$bios.Values;BatteryValues=$battery.Values;RawJson=$raw;StatusLabel=$status;FooterLabel=$footer;PathLabel=$null;CurrentPage='Overview';WsdViewer=[bool]$WsdViewer;ReportFolder=$ReportFolder}
     $showPage={param($key)foreach($name in $state.Pages.Keys){$state.Pages[$name].Visible=($name -eq $key);$state.NavButtons[$name].BackColor=$(if($name -eq $key){[Drawing.Color]::FromArgb(31,119,210)}else{[Drawing.Color]::FromArgb(24,36,51)})};$state.Pages[$key].BringToFront();$state.CurrentPage=$key}.GetNewClosure()
     foreach($key in @($navButtons.Keys)){$localKey=$key;$navButtons[$key].Add_Click(({&$showPage $localKey}.GetNewClosure()))}
-    $buttonSpecs=@([PSCustomObject]@{Text='Обновить (F5)';Width=125},[PSCustomObject]@{Text='Копировать сводку';Width=145},[PSCustomObject]@{Text='Копировать всё';Width=125},[PSCustomObject]@{Text='Сохранить TXT';Width=120},[PSCustomObject]@{Text='Сохранить JSON';Width=125},[PSCustomObject]@{Text='Экспорт HTML';Width=120},[PSCustomObject]@{Text='Открыть папку отчётов';Width=175});$actionButtons=@();$left=12
+    if($WsdViewer){$buttonSpecs=@([PSCustomObject]@{Text='Обновить (F5)';Width=125},[PSCustomObject]@{Text='Копировать сводку';Width=145},[PSCustomObject]@{Text='Открыть папку отчёта';Width=170},[PSCustomObject]@{Text='Закрыть';Width=100})}else{$buttonSpecs=@([PSCustomObject]@{Text='Обновить (F5)';Width=125},[PSCustomObject]@{Text='Копировать сводку';Width=145},[PSCustomObject]@{Text='Копировать всё';Width=125},[PSCustomObject]@{Text='Сохранить TXT';Width=120},[PSCustomObject]@{Text='Сохранить JSON';Width=125},[PSCustomObject]@{Text='Экспорт HTML';Width=120},[PSCustomObject]@{Text='Открыть папку отчётов';Width=175})};$actionButtons=@();$left=12
     foreach($spec in $buttonSpecs){$b=New-Object Windows.Forms.Button;$b.Text=$spec.Text;$b.Width=$spec.Width;$b.Height=34;$b.Left=$left;$b.Top=8;$b.FlatStyle='Flat';$b.BackColor=[Drawing.Color]::FromArgb(31,119,210);$b.ForeColor=[Drawing.Color]::White;$b.FlatAppearance.BorderSize=0;$actions.Controls.Add($b);$actionButtons+=$b;$left+=$b.Width+8}
     $pathLabel=New-Object Windows.Forms.Label;$pathLabel.SetBounds(14,45,1050,20);$pathLabel.AutoEllipsis=$true;$pathLabel.Anchor='Bottom,Left,Right';$actions.Controls.Add($pathLabel);$state.PathLabel=$pathLabel
     $refresh={try{$form.Cursor='WaitCursor';$pathLabel.Text='Collecting hardware passport...';[Windows.Forms.Application]::DoEvents();$state.Passport=New-HardwarePassport;$allocation=Get-UniqueWinDiagReportBaseName Hardware (Get-Date) $state.Directory @('.txt','.json','.html');$state.BaseName=$allocation.BaseName;Update-HardwareGui $state}catch{$pathLabel.Text='Error: '+$_.Exception.Message}finally{$form.Cursor='Default'}}.GetNewClosure()
@@ -305,8 +324,13 @@ function Show-HardwareDiagnosticsGui {
     $saveJson={try{$pathLabel.Text='Saved: '+(Save-HardwareReport $state.Passport $state.BaseName $state.Directory JSON)}catch{$pathLabel.Text='Error: '+$_.Exception.Message}}.GetNewClosure()
     $saveHtml={try{$pathLabel.Text='Saved: '+(Save-HardwareReport $state.Passport $state.BaseName $state.Directory HTML)}catch{$pathLabel.Text='Error: '+$_.Exception.Message}}.GetNewClosure()
     $openReports={try{Start-Process -FilePath explorer.exe -ArgumentList @($state.Directory);$pathLabel.Text='Opened: '+$state.Directory}catch{$pathLabel.Text='Error: '+$_.Exception.Message}}.GetNewClosure()
-    $handlers=@($refresh,$copySummary,$copyAll,$saveTxt,$saveJson,$saveHtml,$openReports);for($i=0;$i -lt $actionButtons.Count;$i++){$actionButtons[$i].Add_Click($handlers[$i])}
-    $form.Add_KeyDown(({if($_.KeyCode -eq [Windows.Forms.Keys]::F5){&$refresh;$_.Handled=$true}}.GetNewClosure()))
+    # WinStateDiag viewer: evidence is persisted automatically by WinStateDiag (no manual save buttons); a refresh writes a new set and announces it.
+    $refreshWsd={try{$form.Cursor='WaitCursor';$pathLabel.Text='Collecting hardware passport...';[Windows.Forms.Application]::DoEvents();$state.Passport=New-HardwarePassport;$allocation=Get-UniqueWinDiagReportBaseName Hardware (Get-Date) $state.Directory @('.txt','.json','.html');$state.BaseName=$allocation.BaseName;foreach($format in @('TXT','JSON','HTML')){[void](Save-HardwareReport $state.Passport $state.BaseName $state.Directory $format)};[Console]::Out.WriteLine('WSD_HW_SAVED|'+$state.BaseName);[Console]::Out.Flush();Update-HardwareGui $state}catch{$pathLabel.Text='Error: '+$_.Exception.Message}finally{$form.Cursor='Default'}}.GetNewClosure()
+    $openReportFolder={try{if(-not (Test-Path -LiteralPath $state.ReportFolder -PathType Container)){throw ('Папка отчёта не найдена: '+$state.ReportFolder)};Invoke-Item -LiteralPath $state.ReportFolder;$pathLabel.Text='Открыто: '+$state.ReportFolder}catch{$pathLabel.Text='Error: '+$_.Exception.Message}}.GetNewClosure()
+    $closeViewer={$form.Close()}.GetNewClosure()
+    if($WsdViewer){$handlers=@($refreshWsd,$copySummary,$openReportFolder,$closeViewer);$refreshAction=$refreshWsd}else{$handlers=@($refresh,$copySummary,$copyAll,$saveTxt,$saveJson,$saveHtml,$openReports);$refreshAction=$refresh};for($i=0;$i -lt $actionButtons.Count;$i++){$actionButtons[$i].Add_Click($handlers[$i])}
+    $form.Add_KeyDown(({if($_.KeyCode -eq [Windows.Forms.Keys]::F5){&$refreshAction;$_.Handled=$true}}.GetNewClosure()))
+    if($WsdViewer){$form.Add_Shown(({$form.TopMost=$true;$form.Activate();$form.TopMost=$false}.GetNewClosure()))}
     Update-HardwareGui $state;&$showPage 'Overview'
     if($SmokeTest){
         $originalClipboard=$null
@@ -365,6 +389,14 @@ try {
             throw ('Hardware GUI interaction smoke did not satisfy all required controls/actions: '+($failed -join ', '))
         }
         Write-Output ('HARDWARE_GUI_SMOKE_PASS: pages={0}; buttons={1}; copy={2}/{3}; refresh={4}; exports={5}; basename={6}; reports={7}' -f $smoke.Pages.Count,$smoke.Buttons.Count,$smoke.SummaryCopied,$smoke.AllCopied,$smoke.RefreshWorked,$smoke.ExportsExist,$smoke.BaseName,$smoke.ReportDirectory)
+    } elseif ($WsdViewer) {
+        # WinStateDiag "Смотреть": save first, let WinStateDiag persist the
+        # evidence into the session report, then show the viewer.
+        [Console]::Out.WriteLine('WSD_HW_PHASE|report');[Console]::Out.Flush()
+        foreach($format in @('TXT','JSON','HTML')) { [void](Save-HardwareReport -Passport $passport -BaseName $baseName -Directory $OutputDirectory -Format $format) }
+        [Console]::Out.WriteLine('WSD_HW_SAVED|'+$baseName);[Console]::Out.Flush()
+        $reply=[string][Console]::In.ReadLine()
+        if($reply.Trim() -eq 'SHOW'){ Show-HardwareDiagnosticsGui -Passport $passport -BaseName $baseName -Directory $OutputDirectory -WsdViewer -ReportFolder $ReportFolder }
     } elseif ($ExportAll -or $NoGui) {
         if ($ExportAll) {
             foreach($format in @('TXT','JSON','HTML')) { Write-Host (Save-HardwareReport -Passport $passport -BaseName $baseName -Directory $OutputDirectory -Format $format) }

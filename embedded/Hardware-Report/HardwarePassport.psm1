@@ -68,23 +68,33 @@ function Get-HardwareSource {
         } catch { $errors.Add("Get-PhysicalDisk: $($_.Exception.Message)") }
     }
 
+    # Единый механизм Firmware/Secure Boot (v0.3.6): Compatibility.psm1's
+    # Get-CompatFirmwareState, the same one EXPC-Diagnostic uses, so the two
+    # modules can never disagree about UEFI/Legacy/Secure Boot again.
     $firmwareType = 'UNKNOWN'
-    if (-not $DisableFirmwareProbe) { try {
-        if (-not ('ExpcHardwareFirmwareNative' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class ExpcHardwareFirmwareNative {
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool GetFirmwareType(out UInt32 firmwareType);
-}
-'@
-        }
-        [uint32]$nativeFirmwareType = 0
-        if ([ExpcHardwareFirmwareNative]::GetFirmwareType([ref]$nativeFirmwareType)) {
-            $firmwareType = switch ($nativeFirmwareType) { 1 { 'Legacy BIOS' } 2 { 'UEFI' } default { 'UNKNOWN' } }
-        } else { $errors.Add("GetFirmwareType: Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())") }
-    } catch { $errors.Add("FirmwareType: $($_.Exception.Message)") } }
+    $secureBootState = 'Unable to determine'
+    if (-not $DisableFirmwareProbe) {
+        try {
+            $firmwareState = Get-CompatFirmwareState
+            $firmwareType = switch ($firmwareState.Firmware) { 'UEFI' { 'UEFI' } 'Legacy' { 'Legacy BIOS' } default { 'UNKNOWN' } }
+            $secureBootState = $firmwareState.SecureBoot
+        } catch { $errors.Add("FirmwareType: $($_.Exception.Message)") }
+    }
+
+    # Battery detail (root\wmi, ACPI-vendor-dependent): each class is
+    # independently optional. Any missing/unsupported class degrades to
+    # "not reported", never an error and never a guess.
+    function Read-WmiLocal {
+        param([string]$ClassName)
+        try {
+            if ($InstanceReader) { return @(& $InstanceReader $ClassName 'root\wmi' '') }
+            return @(Get-CompatInstance -ClassName $ClassName -Namespace 'root\wmi')
+        } catch { return @() }
+    }
+    $batteryStatic = @(Read-WmiLocal 'BatteryStaticData')
+    $batteryFullCharge = @(Read-WmiLocal 'BatteryFullChargedCapacity')
+    $batteryCycleCount = @(Read-WmiLocal 'BatteryCycleCount')
+    $batteryStatus = @(Read-WmiLocal 'BatteryStatus')
 
     [PSCustomObject]@{
         System = @(Read-CimLocal Win32_ComputerSystem | Select-Object -First 1)
@@ -102,7 +112,13 @@ public static class ExpcHardwareFirmwareNative {
         NetworkAdapters = @(Read-CimLocal Win32_NetworkAdapter)
         NetworkConfigurations = @(Read-CimLocal Win32_NetworkAdapterConfiguration)
         Batteries = @(Read-CimLocal Win32_Battery)
+        BatteryStatic = $batteryStatic
+        BatteryFullCharge = $batteryFullCharge
+        BatteryCycleCount = $batteryCycleCount
+        BatteryStatus = $batteryStatus
+        SignedDrivers = @(Read-CimLocal Win32_PnPSignedDriver)
         FirmwareType = $firmwareType
+        SecureBootState = $secureBootState
         Errors = @($errors)
     }
 }
@@ -194,10 +210,70 @@ function New-HardwarePassport {
         $enabled=Get-HardwareValue $adapter 'NetEnabled' (Get-HardwareValue $configuration 'IPEnabled')
         [PSCustomObject]@{ Name=ConvertTo-HardwareText (Get-HardwareValue $adapter 'Name'); Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $adapter 'Manufacturer'); MAC=[string]$mac; LinkState=$(if ($enabled -eq $true) { 'CONNECTED' } elseif ($enabled -eq $false) { 'DISCONNECTED' } else { 'UNKNOWN' }); AdapterType=ConvertTo-HardwareText (Get-HardwareValue $adapter 'AdapterType'); PnpId=ConvertTo-HardwareText (Get-HardwareValue $adapter 'PNPDeviceID') }
     })
+    # Battery Health (v0.3.6): Win32_Battery gives charge/design/full-charge
+    # capacity; root\wmi ACPI classes (independently optional, per device)
+    # add Manufacturer/Model/Serial/Cycle Count where the platform reports
+    # them. A desktop with no battery is normal, not a warning; a missing
+    # Cycle Count is "Not reported", never an error.
+    function ConvertTo-BatteryText {
+        # BatteryStaticData exposes ManufactureName/SerialNumber as a UInt16
+        # array of UTF-16 code units (the ACPI _BIF string form). Any shape
+        # mismatch degrades to $null (-> "Not reported"), never a guess.
+        param([AllowNull()][object]$Codes)
+        if ($null -eq $Codes) { return $null }
+        try {
+            $chars = @($Codes) | ForEach-Object { [char][int]$_ }
+            $text = (-join $chars).Trim([char]0).Trim()
+            if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+            return $text
+        } catch { return $null }
+    }
     $batteries = @($Source.Batteries | ForEach-Object {
-        [PSCustomObject]@{ Name=ConvertTo-HardwareText $_.Name; StatusCode=Get-HardwareValue $_ 'BatteryStatus'; ChargePercent=Get-HardwareValue $_ 'EstimatedChargeRemaining'; DesignCapacity=Get-HardwareValue $_ 'DesignCapacity'; FullChargeCapacity=Get-HardwareValue $_ 'FullChargeCapacity' }
+        $wmiBattery = $_
+        $instanceKey = [string](Get-HardwareValue $wmiBattery 'PNPDeviceID' '')
+        $static = @($Source.BatteryStatic | Where-Object { [string](Get-HardwareValue $_ 'InstanceName' '') -match [regex]::Escape($instanceKey) -or $instanceKey -eq '' } | Select-Object -First 1)[0]
+        $fullChargeRow = @($Source.BatteryFullCharge | Select-Object -First 1)[0]
+        $cycleRow = @($Source.BatteryCycleCount | Select-Object -First 1)[0]
+
+        $designCapacity = Get-HardwareValue $wmiBattery 'DesignCapacity' (Get-HardwareValue $static 'DesignedCapacity')
+        $fullChargeCapacity = Get-HardwareValue $wmiBattery 'FullChargeCapacity' (Get-HardwareValue $fullChargeRow 'FullChargedCapacity')
+        $wearPercent = $null
+        if ($null -ne $designCapacity -and $null -ne $fullChargeCapacity -and [double]$designCapacity -gt 0) {
+            $wearPercent = [Math]::Round(100.0 - ([double]$fullChargeCapacity / [double]$designCapacity * 100.0), 1)
+            if ($wearPercent -lt 0) { $wearPercent = 0.0 }
+        }
+        $cycleCount = Get-HardwareValue $cycleRow 'CycleCount'
+
+        [PSCustomObject]@{
+            Name = ConvertTo-HardwareText $wmiBattery.Name
+            Manufacturer = ConvertTo-HardwareText (ConvertTo-BatteryText (Get-HardwareValue $static 'ManufactureName')) 'Not reported'
+            Model = ConvertTo-HardwareText $wmiBattery.Name 'Not reported'
+            Serial = ConvertTo-HardwareText (ConvertTo-BatteryText (Get-HardwareValue $static 'SerialNumber')) 'Not reported'
+            StatusCode = Get-HardwareValue $wmiBattery 'BatteryStatus'
+            ChargePercent = Get-HardwareValue $wmiBattery 'EstimatedChargeRemaining'
+            DesignCapacity = $designCapacity
+            FullChargeCapacity = $fullChargeCapacity
+            WearPercent = $(if ($null -eq $wearPercent) { 'N/A' } else { $wearPercent })
+            CycleCount = $(if ($null -eq $cycleCount) { 'Not reported' } else { [int]$cycleCount })
+        }
     })
     $batteryState = if (-not $batteries.Count) { 'INFO' } elseif (@($batteries | Where-Object { $null -ne $_.ChargePercent -and [int]$_.ChargePercent -lt 10 }).Count) { 'WARNING' } else { 'INFO' }
+
+    # NPU (v0.3.6): a name-signature match against real, Windows-reported PnP
+    # driver entries — never a guessed spec/TOPS table. Absence is normal.
+    $npus = @($Source.SignedDrivers | Where-Object {
+        [string](Get-HardwareValue $_ 'DeviceName' '') -match '(?i)\bNPU\b|Neural Processing Unit|\bXDNA\b|AI Boost|Intel\(R\) AI Boost|AI Engine'
+    } | ForEach-Object {
+        [PSCustomObject]@{
+            Name = ConvertTo-HardwareText (Get-HardwareValue $_ 'DeviceName')
+            Vendor = ConvertTo-HardwareText (Get-HardwareValue $_ 'Manufacturer')
+            DriverVersion = ConvertTo-HardwareText (Get-HardwareValue $_ 'DriverVersion')
+            DriverDate = Get-HardwareValue $_ 'DriverDate'
+            DeviceStatus = ConvertTo-HardwareText (Get-HardwareValue $_ 'Status') 'UNKNOWN'
+            InstanceId = ConvertTo-HardwareText (Get-HardwareValue $_ 'DeviceID')
+        }
+    })
+
     $storageState = Get-HardwareOverallState @($diskRows | ForEach-Object Health)
     $overall = Get-HardwareOverallState @($ramState, $storageState, $batteryState)
 
@@ -205,13 +281,14 @@ function New-HardwarePassport {
         Tool='EXPC Hardware Diagnostics'; SchemaVersion=1; GeneratedAt=(Get-Date).ToString('o'); ReadOnly=$true; OverallState=$overall
         System=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $system 'Manufacturer'); Model=ConvertTo-HardwareText (Get-HardwareValue $system 'Model'); Hostname=$(if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { ConvertTo-HardwareText (Get-HardwareValue $system 'Name') }); SystemType=ConvertTo-HardwareText (Get-HardwareValue $system 'SystemType'); WindowsEdition=ConvertTo-HardwareText (Get-HardwareValue $operatingSystem 'Caption'); WindowsBuild=ConvertTo-HardwareText (Get-HardwareValue $operatingSystem 'BuildNumber'); WindowsArchitecture=ConvertTo-HardwareText (Get-HardwareValue $operatingSystem 'OSArchitecture' $env:PROCESSOR_ARCHITECTURE); ProductId=ConvertTo-HardwareText (Get-HardwareValue $product 'IdentifyingNumber') }
         Motherboard=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $board 'Manufacturer'); Product=ConvertTo-HardwareText (Get-HardwareValue $board 'Product'); Version=ConvertTo-HardwareText (Get-HardwareValue $board 'Version'); Serial=ConvertTo-HardwareText (Get-HardwareValue $board 'SerialNumber') }
-        Bios=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $bios 'Manufacturer'); Version=ConvertTo-HardwareText (Get-HardwareValue $bios 'SMBIOSBIOSVersion' (Get-HardwareValue $bios 'Version')); ReleaseDate=Get-HardwareValue $bios 'ReleaseDate'; FirmwareType=ConvertTo-HardwareText $Source.FirmwareType 'UNKNOWN' }
+        Bios=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $bios 'Manufacturer'); Version=ConvertTo-HardwareText (Get-HardwareValue $bios 'SMBIOSBIOSVersion' (Get-HardwareValue $bios 'Version')); ReleaseDate=Get-HardwareValue $bios 'ReleaseDate'; FirmwareType=ConvertTo-HardwareText $Source.FirmwareType 'UNKNOWN'; SecureBoot=ConvertTo-HardwareText (Get-HardwareValue $Source 'SecureBootState') 'Unable to determine' }
         Cpu=[PSCustomObject]@{ Models=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Name }); Manufacturers=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Manufacturer }|Sort-Object -Unique); PhysicalCores=[int](($processors | Measure-Object NumberOfCores -Sum).Sum); LogicalProcessors=[int](($processors | Measure-Object NumberOfLogicalProcessors -Sum).Sum); MaxClockMHz=$(($processors | Measure-Object MaxClockSpeed -Maximum).Maximum); CurrentClockMHz=$(($processors | Measure-Object CurrentClockSpeed -Maximum).Maximum); Sockets=@($processors | ForEach-Object SocketDesignation | Where-Object { $_ }); Architecture=$(switch([int](Get-HardwareValue ($processors|Select-Object -First 1) 'Architecture' -1)){0{'x86'}5{'ARM'}9{'x64'}12{'ARM64'}default{'Unknown'}}); L2CacheKB=[int](($processors|Measure-Object L2CacheSize -Sum).Sum); L3CacheKB=[int](($processors|Measure-Object L3CacheSize -Sum).Sum) }
         Ram=[PSCustomObject]@{ State=$ramState; Reasons=$ramReasons; TotalBytes=[uint64](($memory | Measure-Object Capacity -Sum).Sum); Total=ConvertTo-HardwareSize (($memory | Measure-Object Capacity -Sum).Sum); ModuleCount=$ramRows.Count; DeclaredSlots=$declaredSlots; Modules=$ramRows }
         Storage=[PSCustomObject]@{ State=$storageState; Disks=$diskRows }
         Gpu=[PSCustomObject]@{ State=$(if ($gpus.Count) { 'INFO' } else { 'UNKNOWN' }); Controllers=$gpus }
         Network=[PSCustomObject]@{ State=$(if ($networks.Count) { 'INFO' } else { 'UNKNOWN' }); Adapters=$networks }
-        Battery=[PSCustomObject]@{ State=$batteryState; Detected=($batteries.Count -gt 0); Summary=$(if ($batteries.Count) { 'Battery detected.' } else { 'Not applicable / not detected.' }); Batteries=$batteries }
+        Battery=[PSCustomObject]@{ State=$batteryState; Detected=($batteries.Count -gt 0); Summary=$(if ($batteries.Count) { 'Battery detected.' } else { 'Battery: Not present.' }); Batteries=$batteries }
+        Npu=[PSCustomObject]@{ Detected=($npus.Count -gt 0); Devices=$npus }
         CollectionErrors=@($Source.Errors)
     }
 }

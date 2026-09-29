@@ -1,0 +1,9 @@
+{
+  "image_px": [1372, 1106],
+  "canvas_points": [1372, 1106],
+  "content_rect_points": [1372.00, 1106.00],
+  "native_pixels_per_point": 1.0000,
+  "egui_zoom_factor": 1.0000,
+  "pixels_per_point": 1.0000,
+  "frames_until_capture": 8
+}

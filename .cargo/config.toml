@@ -1,0 +1,5 @@
+# Static CRT linking — ensures WinStateDiag.exe is truly portable.
+# Without this, Rust dynamically links VCRUNTIME140.dll + Universal CRT,
+# which are absent on machines without the VC++ Redistributable installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,20 +1,27 @@
 # Rust build
 /target/
 
-# Distribution binaries
+# Distribution binaries (published as GitHub Release assets, not in git)
 /dist/*
 !/dist/.gitkeep
 
-# Diagnostic reports
+# Diagnostic reports / runtime state (real machine data — never commit)
 /Reports/
 /reports/
+**/Reports/
 *.zip
+WinStateDiag.lang
+startup_graphics.log*
+ssd_benchmark_history.log
+WinStateDiag_Log_*.txt
+*.candidate
+*.part
 
 # Internal engineering material
 /docs/AUDIT/
 /legacy-tests/
 
-# Claude working artifacts
+# Assistant / local working artifacts
 /Claude outputs/
 
 # Temporary / backup files
