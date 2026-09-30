@@ -47,6 +47,12 @@ Reports\
 - Each ZIP is written to a temporary file, read back and checked (CRC of every entry) before it replaces the previous one. Only after that verification does the report folder keep just the final ZIP; on any doubt all files are kept.
 - The ZIP can be handed to an engineer or an AI assistant for analysis. WinStateDiag itself performs no AI analysis.
 
+## AI-assisted report analysis
+
+When uploading a WinStateDiag ZIP report to ChatGPT, Claude, Gemini or another AI assistant, use the included **[`AI_ANALYSIS_PROMPT.md`](AI_ANALYSIS_PROMPT.md)**.
+
+The prompt asks the AI to inspect the **entire archive**, correlate evidence between files, distinguish current problems from historical/system noise, reference the source evidence for important findings, and avoid unsupported repair recommendations.
+
 ## Build from source
 
 Requirements: Rust (stable, edition 2024) with the `x86_64-pc-windows-msvc` toolchain.
@@ -84,6 +90,8 @@ Windows 10 / 11 x64, без установки, один файл `WinStateDiag.
 - Интерфейс RU / EN, безопасный запуск графики (резервный программный рендер WARP), журнал сессии.
 
 **Отчёт**: одна накопительная ZIP-папка на компьютер и дату в `Reports\`, внутри — `manifest.json` (машиночитаемое описание модулей, файлов и результатов глубоких проверок). После проверки итогового ZIP в папке отчёта остаётся только он; при любой ошибке все файлы сохраняются.
+
+**Анализ отчёта с помощью ИИ:** при загрузке ZIP в ChatGPT, Claude, Gemini или другой ИИ используйте готовый **[`AI_ANALYSIS_PROMPT.md`](AI_ANALYSIS_PROMPT.md)**. Он задаёт правильный порядок анализа всего архива, сопоставление данных между файлами, отделение актуальных проблем от старых событий и системного шума, а также требует подтверждать существенные выводы конкретными данными отчёта.
 
 ## Real screenshots / Реальные скриншоты
 
