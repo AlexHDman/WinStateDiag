@@ -1,6 +1,6 @@
 [package]
 name = "win_state_diag"
-version = "0.4.0"
+version = "0.4.3"
 edition = "2024"
 authors = ["EXPC Design and Production"]
 description = "Portable Windows state diagnostic center"

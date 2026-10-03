@@ -289,6 +289,62 @@ pub fn from_expc_json(bytes: &[u8]) -> Vec<DeepCheckOutcome> {
     out
 }
 
+/// v0.4.1: one `Checks[]` entry of the EXPC JSON, any step (Defender, PnP,
+/// WHEA, …). Exactly as EXPC classified it; `status` is the raw EXPC
+/// status (OK / ATTENTION / ERROR / INFO / REVIEW / SKIPPED / NOT TESTED /
+/// UNKNOWN), `detail` the raw finding text (may be empty).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpcCheck {
+    pub key: String,
+    pub status: String,
+    pub detail: String,
+}
+
+/// Every `Checks[]` entry of an EXPC JSON evidence file (last write of a
+/// key wins, as in EXPC's own ordered dictionary). Unusable JSON: empty.
+pub fn expc_checks_from_json(bytes: &[u8]) -> Vec<ExpcCheck> {
+    let Ok(text) = std::str::from_utf8(strip_bom(bytes)) else {
+        return Vec::new();
+    };
+    let Some(root) = json::parse(text) else {
+        return Vec::new();
+    };
+    let items = match root.get("Checks") {
+        Some(json::Value::Arr(items)) => items.clone(),
+        Some(obj @ json::Value::Obj(_)) => vec![obj.clone()],
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<ExpcCheck> = Vec::new();
+    for item in &items {
+        let Some(key) = item.get("Check").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let status = item
+            .get("Status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        let detail = item
+            .get("Detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        out.retain(|c| c.key != key);
+        out.push(ExpcCheck {
+            key,
+            status,
+            detail,
+        });
+    }
+    out
+}
+
 /// `GeneratedAt` of an EXPC JSON evidence file, when present.
 pub fn expc_json_generated_at(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(strip_bom(bytes)).ok()?;
@@ -422,6 +478,9 @@ pub struct ExpcRunChecks {
     /// `GeneratedAt` of the EXPC JSON, when available.
     pub generated_at: Option<String>,
     pub outcomes: Vec<DeepCheckOutcome>,
+    /// v0.4.1: every EXPC check of that run (all 14 steps), for the
+    /// EXPC details window. Empty when the run has no JSON.
+    pub checks: Vec<ExpcCheck>,
 }
 
 /// Deep-check results of the newest EXPC run among `files` (name, bytes):
@@ -450,6 +509,7 @@ pub fn from_evidence_files<'a>(
             source_file: name.to_string(),
             generated_at: expc_json_generated_at(bytes),
             outcomes: from_expc_evidence(Some(bytes), txt),
+            checks: expc_checks_from_json(bytes),
         });
     }
     // No JSON (unusual): the newest TXT by name.
@@ -462,6 +522,7 @@ pub fn from_evidence_files<'a>(
         source_file: name.to_string(),
         generated_at: None,
         outcomes: from_expc_evidence(None, Some(b)),
+        checks: Vec::new(),
     })
 }
 

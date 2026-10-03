@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.4.3] - 2026-10-03 - storage health, diagnostic accuracy
+
+Includes all changes of the internal 0.4.2 test build (never published).
+
+### Fixed
+- EXPC Diagnostic Results: INFO steps (e.g. 14 BIOS / drivers / firmware) now have their own "Info" counter; every represented step is counted exactly once (steps without a final result yet are shown as "No result yet" only when present).
+- Hardware Report GPU memory: a saturated 32-bit value (e.g. "4.00 GB" for an 8 GB card) is no longer shown as VRAM. Precedence: display-driver `HardwareInformation.qwMemorySize` (64-bit) → a representable 32-bit value → "Not reliably determined"; raw source values and the source used are kept in the evidence. No GPU-name guessing.
+- Hardware Report GPU memory kind (real iGPU case): an integrated GPU whose driver reports a very large value (e.g. ~28 GB) is no longer shown as "VRAM 28 GB". The Windows DirectX adapter record (`DedicatedVideoMemory` / `SharedSystemMemory`, matched by PCI vendor/device id) separates dedicated video memory from shared system graphics memory; without that record an adapter on PCI bus 0 is "graphics memory reported by driver (dedicated VRAM not confirmed)". Discrete cards keep their reliable 64-bit VRAM. New JSON fields `VRAMKind`, `VRAMKindReason`, `DedicatedVideoMemoryBytes`, `SharedSystemMemoryBytes`, `DriverReportedMemoryBytes`; `VRAMBytes` means dedicated memory only.
+- Hardware Report memory speed: SMBIOS speeds are shown as data rates in MT/s ("rated 7667 MT/s, configured 7667 MT/s (SMBIOS-reported data rate, not measured)"), not MHz. JSON keeps the old fields and adds `RatedSpeedMTs`, `ConfiguredSpeedMTs`, `RatedSpeed`, `ConfiguredSpeed`, `SpeedSource`.
+- Driver Audit, Kernel-PnP 219 (confirmed on several real machines): a historical "driver failed to load" event (e.g. WUDFRd) for a device that exists now with PnP ErrorCode 0 is HISTORICAL / INFO — it stays visible in Details/evidence but no longer raises the audit to WARNING, whatever its count. A current PnP error stays PROBLEM; an unknown current state stays WARNING.
+- `manifest.json` per-disk modules: with several physical disks tested, `ssd_benchmark`, `nvme_health` and `storage_correlation` now list `disks` — per physical disk (`disk_key` = FNV-1a of the physical identity, `physical_disk_index`, `model`, `status`, `evidence`, `latest_evidence`). Grouping uses the physical identity in the evidence, never a drive letter; no serial is written. Schema stays 1.0 (additive).
+
+### Changed
+- Driver Check summary: "Без ошибок / No errors" → "Проверено без замечаний / Checked OK" (it counts audited driver items without findings, not all devices).
+- `manifest.json` (schema 1.0, additive): each module lists `latest_evidence`, the files of its newest completed run, so a repeated same-day package names its current result unambiguously.
+- SSD benchmark JSON (additive): `run_role` (`initial` / `automatic_retest`), `physical_disk_index`, `model`. Benchmark thresholds and measurement logic are unchanged.
+
+### Added
+- **Native NVMe Health reader** (`src/nvme_health.rs`). Read-only SMART / Health Information log (LID 02h) and Error Information log (LID 01h) via `IOCTL_STORAGE_QUERY_PROPERTY` + `STORAGE_PROTOCOL_SPECIFIC_DATA` (`ProtocolTypeNvme`, `NVMeDataTypeLogPage`). Validated on real NVMe drives (Samsung 9100 PRO, Netac, NX-512 2280, Patriot P300) against CrystalDiskInfo and Victoria (validation references only — never bundled, called or parsed). Evidence `NVMe_Health_<date>_<time>_PD<n>.json`.
+- **Storage correlation** (`src/storage_health.rs`), per physical disk: benchmark (first run + retest) + NVMe health (Critical Warning bits individually, media/data integrity errors, Error Log Entries, drive-reported temperature threshold) + Windows storage events (Disk / StorNVMe / StorPort / Ntfs / volmgr, read-only `Get-WinEvent`, bound to a disk only via `\Device\HarddiskN`). States: OK, benchmark OK but no NVMe data, anomaly not confirmed on retest, BENCHMARK ANOMALY / RETEST REQUIRED, benchmark anomaly CHECK (not a failure), STORAGE ATTENTION, STORAGE PROBLEM. Permanent rule: **unstable benchmark ≠ SSD failure**; Error Log Entries / Unsafe Shutdowns / Percentage Used < 100 are facts, never verdicts; event count alone never sets severity. Evidence `Storage_Correlation_<date>_<time>_PD<n>.json`.
+- **Automatic benchmark retest**: an UNSTABLE first run is followed by a short idle (10 s) and exactly ONE confirmation retest of the same physical disk. Both runs are kept in the evidence (`SSD_Benchmark_*_retest.*`), history and Details window; the dashboard shows the first run in its note. No retest after a cancel, a technical failure, a target that is no longer resolvable, a health read that did not arrive in time, or a controller state where more write testing is inappropriate (Critical Warning bits 0–3, media errors) — fail closed.
+- SSD Details window: both runs' passes, the storage assessment with its explained findings, and the NVMe HEALTH facts (RU/EN). The SSD card status colour comes from the correlation, not from a raw counter.
+- `assets\tray-icon.ico`: tray-size frames (16/20/24/32/40) of the existing icon, prepared only — WinStateDiag has no tray implementation; EXE/window/taskbar icons unchanged.
+- `docs\DIAGNOSTIC_FEEDBACK.md`: real-machine lessons (real issue / check / historical-noise / WinStateDiag issue) and the next backlog (Evidence Intelligence / cross-module consistency — documented, not implemented).
+- `docs\WINSTATEDIAG_PRO_AI.md`: design of the future Pro AI analysis (provider presets incl. YandexGPT via Yandex Cloud, custom OpenAI-compatible endpoint, API-key security contract) and the WinRepair Pro handoff. Documentation only.
+
+## [0.4.1] - released - diagnostic UX patch
+
+### Changed
+- Driver Check details: the one-line technical summary is replaced by a compact SUMMARY header with counters (problems, warnings, no errors, devices, total events) and an Info tooltip that explains the status rule. No date/time in the header. The Driver Audit classification and the driver list are unchanged.
+- "Run again" is now the prominent primary action of the Driver Check window (same re-check as before).
+
+### Added
+- Driver Check: "Copy issues" / "Save issues" export one plain-text block of problems and warnings only (device, provider, driver date, INF, service, Hardware ID, evidence, event count, latest event). Save writes UTF-8 to `Reports\Logs\WinStateDiag_DriverIssues_<date>_<time>.txt` and shows the path.
+- EXPC stages card: "Details" button opening the "EXPC Diagnostic Results" window — summary counters, findings first with their stage numbers, explanations from the existing EXPC / deep-check results, suggested repair commands shown as text only (with "Copy command"), Copy / Save / Close. WinStateDiag still never runs repair commands.
+
 ## [0.4.0] - 2026-09-29 - first public release
 
 Portable read-only Windows diagnostic center (Windows 10/11 x64). WinStateDiag diagnoses and reports; it never repairs Windows automatically.

@@ -129,6 +129,9 @@ pub enum EngineEvent {
     /// v0.4.0: diagnostic RESULT of the SFC / DISM / CHKDSK deep checks of
     /// this run, read from its EXPC evidence (separate from progress).
     DeepChecks(Vec<crate::deep_checks::DeepCheckOutcome>),
+    /// v0.4.1: every EXPC check of this run (all steps), as classified by
+    /// EXPC itself — shown in the EXPC details window.
+    ExpcChecks(Vec<crate::deep_checks::ExpcCheck>),
     Finished(Result<PathBuf, String>),
     /// The user stopped the run. `zip_path` is the session package when it
     /// holds evidence (already collected evidence is never discarded).
@@ -316,6 +319,7 @@ fn run_pipeline(
         files.iter().map(|f| (f.name.as_str(), f.bytes.as_slice())),
     ) {
         send(tx, EngineEvent::DeepChecks(run.outcomes));
+        send(tx, EngineEvent::ExpcChecks(run.checks));
     }
     let date = identity_date(crate::ui::sysinfo::local_time());
     let final_zip = lock(&req.package)
@@ -3394,6 +3398,360 @@ mod read_only_contract_tests {
                     "a deep check tool must never be started from Rust"
                 );
             }
+        }
+    }
+}
+
+/// v0.4.2 Hardware Report precision: GPU memory never shown from a capped
+/// 32-bit source or a GPU name; DDR speeds are reported data rates (MT/s),
+/// not measured clocks.
+#[cfg(test)]
+mod hardware_precision_tests {
+    use super::{HARDWARE_DIAGNOSTIC_PS1, HARDWARE_PASSPORT_PSM1};
+    use std::process::Command;
+
+    fn module() -> String {
+        String::from_utf8_lossy(HARDWARE_PASSPORT_PSM1).replace("\r\n", "\n")
+    }
+
+    fn between(s: &str, from: &str, to: &str) -> String {
+        let a = s.find(from).unwrap_or_else(|| panic!("{from}"));
+        let b = a + s[a..].find(to).unwrap_or_else(|| panic!("{to}"));
+        s[a..b].to_string()
+    }
+
+    fn powershell() -> Option<String> {
+        if cfg!(windows) {
+            return Some("powershell.exe".into());
+        }
+        if let Ok(p) = std::env::var("WSD_PWSH") {
+            return Some(p);
+        }
+        Command::new("pwsh")
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| "pwsh".to_string())
+    }
+
+    #[test]
+    fn hardware_report_text_uses_mt_s_and_marks_values_as_reported() {
+        let ps = String::from_utf8_lossy(HARDWARE_DIAGNOSTIC_PS1);
+        assert!(!ps.contains("RatedSpeedMHz) MHz"));
+        assert!(!ps.contains("ConfiguredClockMHz) MHz"));
+        assert!(!ps.contains("+' MHz'}else{'speed unavailable'}"));
+        assert!(ps.contains("(SMBIOS-reported data rate, not measured)"));
+        assert!(ps.contains("+' MT/s'}else{'speed unavailable'}"));
+        let m = module();
+        assert!(m.contains("SpeedSource = 'SMBIOS/WMI (reported, not measured)'"));
+        // VRAM: precedence function only sees raw memory values — no GPU
+        // name, no model table.
+        let f = between(
+            &m,
+            "function Resolve-HardwareGpuMemory {",
+            "# Read-only: the display driver",
+        );
+        assert!(!f.contains("Name"), "no model-name input");
+        assert!(
+            !f.to_ascii_lowercase().contains("rtx") && !f.to_ascii_lowercase().contains("radeon")
+        );
+        assert!(m.contains("VRAM=$mem.Display"));
+    }
+
+    /// v0.4.2 real iGPU case: a ~28 GB driver value on an integrated GPU
+    /// is shared/system graphics memory, never "VRAM 28 GB"; a discrete
+    /// card's 64-bit value stays dedicated VRAM. No model names involved.
+    #[test]
+    fn igpu_shared_memory_is_not_labelled_dedicated_vram() {
+        let m = module();
+        let f = between(
+            &m,
+            "function Resolve-HardwareGpuMemoryKind {",
+            "# Read-only: the DirectX adapter records",
+        );
+        assert!(!f.contains("Name"), "no model-name input");
+        for brand in ["intel", "nvidia", "rtx", "radeon", "uhd", "iris"] {
+            assert!(!f.to_ascii_lowercase().contains(brand), "{brand}");
+        }
+        let Some(host) = powershell() else {
+            eprintln!("no PowerShell host: execution skipped");
+            return;
+        };
+        let mut ps = String::new();
+        ps.push_str("[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture\n");
+        ps.push_str(&between(
+            &m,
+            "function ConvertTo-HardwareSize {",
+            "function Get-HardwareMemoryType {",
+        ));
+        ps.push_str(&between(
+            &m,
+            "function Format-HardwareMemoryRate {",
+            "# Read-only: the DirectX adapter records",
+        ));
+        ps.push_str(&between(
+            &m,
+            "# The DirectX record of one PnP device",
+            "# Read-only: the display driver",
+        ));
+        ps.push_str(
+            "function K($n, $mem, $dx, $loc) { $k = Resolve-HardwareGpuMemoryKind -Memory $mem -DirectX $dx -LocationInfo $loc; Write-Output ($n + '|' + $k.Kind + '|' + [string]$k.DedicatedBytes + '|' + [string]$k.SharedBytes + '|' + $k.Display) }\n\
+             $q8 = Resolve-HardwareGpuMemory -AdapterRam 4293918720 -RegistryQword ([uint64]8589934592)\n\
+             $q28 = Resolve-HardwareGpuMemory -AdapterRam 2147483648 -RegistryQword ([uint64]30064771072)\n\
+             $dxRtx = [PSCustomObject]@{ VendorId = 0x10DE; DeviceId = 0x2D05; DedicatedVideoMemory = [uint64]8546971648; SharedSystemMemory = [uint64]17095983104 }\n\
+             $dxIgpu = [PSCustomObject]@{ VendorId = 0x8086; DeviceId = 0xA7A0; DedicatedVideoMemory = [uint64]134217728; SharedSystemMemory = [uint64]17095983104 }\n\
+             K 'discrete_dx' $q8 $dxRtx 'PCI bus 1, device 0, function 0'\n\
+             K 'discrete_nodx' $q8 $null 'PCI bus 1, device 0, function 0'\n\
+             K 'igpu_dx' $q28 $dxIgpu 'PCI bus 0, device 2, function 0'\n\
+             K 'igpu_nodx' $q28 $null 'PCI bus 0, device 2, function 0'\n\
+             K 'none' (Resolve-HardwareGpuMemory) $null $null\n\
+             $rows = @($dxRtx, $dxIgpu)\n\
+             Write-Output ('sel|' + [string](Select-HardwareGpuDirectX -Rows $rows -PnpDeviceId 'PCI\\VEN_8086&DEV_A7A0&SUBSYS_1&REV_04\\3&1').DedicatedVideoMemory + '|' + [string]($null -eq (Select-HardwareGpuDirectX -Rows @($dxIgpu, $dxIgpu) -PnpDeviceId 'PCI\\VEN_8086&DEV_A7A0')))\n",
+        );
+        let dir = std::env::temp_dir().join(format!("wsd-igpu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.ps1");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(ps.as_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        let out = Command::new(&host)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&file)
+            .output()
+            .expect("PowerShell runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success(),
+            "{text}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let row = |name: &str| -> Vec<String> {
+            text.lines()
+                .find(|l| l.starts_with(&format!("{name}|")))
+                .unwrap_or_else(|| panic!("{name}: {text}"))
+                .trim()
+                .split('|')
+                .map(str::to_string)
+                .collect()
+        };
+        // Discrete card: the reliable 64-bit value stays dedicated VRAM.
+        assert_eq!(
+            row("discrete_dx")[1..5],
+            ["dedicated", "8589934592", "17095983104", "8.00 GB"]
+        );
+        assert_eq!(row("discrete_nodx")[1..3], ["dedicated", "8589934592"]);
+        // Integrated GPU: ~28 GB is never shown as dedicated VRAM.
+        let igpu = row("igpu_dx");
+        assert_eq!(igpu[1..3], ["shared", "134217728"]);
+        assert!(igpu[4].contains("Dedicated video memory 128"), "{igpu:?}");
+        assert!(igpu[4].contains("not dedicated VRAM"), "{igpu:?}");
+        assert!(!igpu[4].starts_with("28"), "{igpu:?}");
+        let nodx = row("igpu_nodx");
+        assert_eq!(nodx[1..3], ["driver_reported", ""]);
+        assert!(nodx[4].contains("Graphics memory reported by driver"));
+        assert_eq!(row("none")[1..3], ["unknown", ""]);
+        assert_eq!(row("none")[4], "Not reliably determined");
+        assert_eq!(row("sel")[1..3], ["134217728", "True"], "unique match only");
+    }
+
+    #[test]
+    fn vram_and_memory_rate_rules_run_in_powershell() {
+        let Some(host) = powershell() else {
+            eprintln!("no PowerShell host: execution skipped");
+            return;
+        };
+        let m = module();
+        let mut ps = String::new();
+        ps.push_str("[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture\n");
+        ps.push_str(&between(
+            &m,
+            "function ConvertTo-HardwareSize {",
+            "function Get-HardwareMemoryType {",
+        ));
+        ps.push_str(&between(
+            &m,
+            "function Format-HardwareMemoryRate {",
+            "# Read-only: the display driver",
+        ));
+        ps.push_str(
+            "function Show($n, $r) { Write-Output ($n + '|' + [string]$r.Bytes + '|' + $r.Source + '|' + $r.Reliable + '|' + $r.Display + '|' + [bool]$r.Note) }\n\
+             Show 'qw_over_capped' (Resolve-HardwareGpuMemory -AdapterRam 4293918720 -RegistryQword ([uint64]8589934592))\n\
+             Show 'qw_bytes' (Resolve-HardwareGpuMemory -AdapterRam $null -RegistryQword ([byte[]](0,0,0,0,2,0,0,0)))\n\
+             Show 'wmi_ok' (Resolve-HardwareGpuMemory -AdapterRam 2147483648)\n\
+             Show 'wmi_capped' (Resolve-HardwareGpuMemory -AdapterRam 4293918720)\n\
+             Show 'wmi_negative' (Resolve-HardwareGpuMemory -AdapterRam -1048576)\n\
+             Show 'none' (Resolve-HardwareGpuMemory)\n\
+             Show 'conflict' (Resolve-HardwareGpuMemory -AdapterRam 2147483648 -RegistryDword 1073741824)\n\
+             Show 'qw_wins' (Resolve-HardwareGpuMemory -AdapterRam 2147483648 -RegistryQword ([uint64]8589934592))\n\
+             Show 'dword_only' (Resolve-HardwareGpuMemory -RegistryDword 1073741824)\n\
+             Write-Output ('rate|' + (Format-HardwareMemoryRate 7667) + '|' + (Format-HardwareMemoryRate 3200) + '|' + (Format-HardwareMemoryRate '1600') + '|' + (Format-HardwareMemoryRate 0) + '|' + (Format-HardwareMemoryRate $null) + '|' + (Format-HardwareMemoryRate 'n/a') + '|' + (Format-HardwareMemoryRate 7667 -Approximate))\n",
+        );
+        let dir = std::env::temp_dir().join(format!("wsd-hwprec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.ps1");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(ps.as_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        let out = Command::new(&host)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&file)
+            .output()
+            .expect("PowerShell runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success(),
+            "{text}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let row = |name: &str| -> Vec<String> {
+            text.lines()
+                .find(|l| l.starts_with(&format!("{name}|")))
+                .unwrap_or_else(|| panic!("{name}: {text}"))
+                .trim()
+                .split('|')
+                .map(str::to_string)
+                .collect()
+        };
+        // 64-bit driver value wins over the saturated 32-bit "4.00 GB".
+        assert_eq!(
+            row("qw_over_capped")[1..5],
+            [
+                "8589934592",
+                "registry:HardwareInformation.qwMemorySize",
+                "True",
+                "8.00 GB"
+            ]
+        );
+        assert_eq!(
+            row("qw_bytes")[1..4],
+            [
+                "8589934592",
+                "registry:HardwareInformation.qwMemorySize",
+                "True"
+            ]
+        );
+        // A representable 32-bit value is shown with its source.
+        assert_eq!(
+            row("wmi_ok")[1..5],
+            [
+                "2147483648",
+                "wmi:Win32_VideoController.AdapterRAM",
+                "True",
+                "2.00 GB"
+            ]
+        );
+        // Saturated / signed-saturated values are never shown as VRAM.
+        for n in ["wmi_capped", "wmi_negative"] {
+            assert_eq!(
+                row(n)[1..6],
+                ["", "none", "False", "Not reliably determined", "True"],
+                "{n}"
+            );
+        }
+        assert_eq!(
+            row("none")[1..5],
+            ["", "none", "False", "Not reliably determined"]
+        );
+        // Two 32-bit sources that disagree: not determined, documented.
+        assert_eq!(
+            row("conflict")[1..6],
+            ["", "conflict", "False", "Not reliably determined", "True"]
+        );
+        // Documented precedence: the 64-bit value, with a note.
+        assert_eq!(
+            row("qw_wins")[1..6],
+            [
+                "8589934592",
+                "registry:HardwareInformation.qwMemorySize",
+                "True",
+                "8.00 GB",
+                "True"
+            ]
+        );
+        assert_eq!(
+            row("dword_only")[1..4],
+            [
+                "1073741824",
+                "registry:HardwareInformation.MemorySize",
+                "True"
+            ]
+        );
+        assert_eq!(
+            row("rate")[1..],
+            [
+                "7667 MT/s",
+                "3200 MT/s",
+                "1600 MT/s",
+                "Unavailable",
+                "Unavailable",
+                "Unavailable",
+                "~7667 MT/s"
+            ]
+        );
+        assert!(!text.contains("MHz"));
+    }
+}
+
+/// v0.4.2 icon isolation: WinStateDiag has no system-tray code; the EXE,
+/// window, taskbar and Alt+Tab icon all come from `assets\icon.ico` via the
+/// Windows resource (build.rs). The prepared tray artwork is a separate,
+/// unwired asset and never replaces that pipeline.
+#[cfg(test)]
+mod icon_isolation_tests {
+    fn ico_sizes(bytes: &[u8]) -> Vec<u32> {
+        let n = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        (0..n)
+            .map(|i| {
+                let w = bytes[6 + 16 * i] as u32;
+                if w == 0 { 256 } else { w }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exe_and_window_icon_pipeline_is_unchanged_and_tray_asset_is_separate() {
+        let build = include_str!("../build.rs");
+        assert!(build.contains("res.set_icon(\"assets/icon.ico\")"));
+        assert!(!build.contains("tray-icon"));
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains("with_icon"),
+            "window icon still from the EXE resource"
+        );
+        assert!(!main.contains("tray"));
+        let app_icon: &[u8] = include_bytes!("../assets/icon.ico");
+        let tray_icon: &[u8] = include_bytes!("../assets/tray-icon.ico");
+        assert_ne!(app_icon, tray_icon);
+        assert_eq!(
+            ico_sizes(app_icon),
+            [256, 128, 96, 72, 64, 48, 32, 24, 16],
+            "application icon untouched"
+        );
+        let mut tray = ico_sizes(tray_icon);
+        tray.sort_unstable();
+        assert_eq!(tray, [16, 20, 24, 32, 40], "tray sizes incl. 125%/150% DPI");
+        // No source file wires the tray asset (no tray implementation).
+        for src in [
+            include_str!("app.rs"),
+            include_str!("main.rs"),
+            include_str!("../build.rs"),
+        ] {
+            assert!(!src.contains(&["tray-icon", ".ico"].concat()));
         }
     }
 }

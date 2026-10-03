@@ -6,15 +6,18 @@
 mod app;
 mod cryptopro;
 mod deep_checks;
+mod details;
 mod driver_audit;
 mod engine;
 mod graphics_startup;
 mod graphics_wgpu;
 pub mod i18n;
 mod manifest;
+mod nvme_health;
 mod report_package;
 pub mod ssd_history;
 pub mod storage_benchmark;
+mod storage_health;
 pub mod storage_topology;
 mod ui;
 

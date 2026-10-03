@@ -14,6 +14,8 @@ WinStateDiag determines and records the current state of a Windows computer. It 
 | Deep-check results | `src/deep_checks.rs` | SFC / DISM / CHKDSK result state (OK / ATTENTION / ERROR / UNKNOWN / SKIPPED) read from the EXPC JSON, then the TXT, then conservative classification of the tool output. Separate from progress. |
 | Driver Audit | `src/driver_audit.rs`, `embedded/WinStateDiag/DriverAudit.ps1` | Read-only driver inventory and classification (see `DRIVER_AUDIT.md`). |
 | SSD / NVMe | `src/storage_topology.rs`, `src/storage_benchmark.rs`, `src/ssd_history.rs` | Physical disk enumeration (SSD/NVMe only), benchmark, per-disk history. |
+| NVMe Health | `src/nvme_health.rs` | Read-only NVMe SMART / Health + Error Information log pages via `IOCTL_STORAGE_QUERY_PROPERTY` (real Windows validated), bound to the benchmark's physical-disk identity; evidence `NVMe_Health_*.json`. |
+| Storage correlation | `src/storage_health.rs` | Per physical disk: benchmark + automatic retest + NVMe health + storage System events (read-only `Get-WinEvent`). Conservative states; "unstable benchmark ≠ SSD failure"; evidence `Storage_Correlation_*.json`. |
 | CryptoPro | `src/cryptopro.rs` | HASH status and confirmed ReHash. |
 | Report package | `src/report_package.rs`, `src/manifest.rs` | Cumulative per-PC/per-date ZIP with `manifest.json`. |
 
@@ -23,3 +25,16 @@ WinStateDiag determines and records the current state of a Windows computer. It 
 2. Each update rebuilds the ZIP from all evidence plus a generated `manifest.json`, writes a candidate file, re-reads and CRC-checks every entry, then atomically replaces the final ZIP. On failure the previous ZIP and every file are kept.
 3. When nothing is running and the last diagnostic run neither failed nor was stopped, the final ZIP is verified again; only if every loose file is inside it byte for byte are the loose files removed (SSD history lines are first copied to `Reports\History\`). The folder then holds only the ZIP.
 4. A later update of the same package (another module, a same-day rerun) first restores the evidence from the ZIP, so nothing earlier is lost.
+
+## Repeated runs (v0.4.2 audit)
+
+One package per PC and date is cumulative by design: a repeated same-day run of a module adds its evidence next to the earlier run (never overwriting; colliding names get `_02`, `_03`, …). `manifest.json` lists every file per module in `evidence` and, since v0.4.2, the files of the newest completed run in `latest_evidence`; the SFC/DISM/CHKDSK `checks` are read from that same run. Readers interpret `latest_evidence` as the current result; earlier runs remain as history.
+
+## Icons
+
+The EXE, window, taskbar and Alt+Tab icon all come from `assets\icon.ico` through the Windows resource (`build.rs`); no window icon is set in code. WinStateDiag has no system-tray implementation. `assets\tray-icon.ico` (16/20/24/32/40 px, derived from `icon.ico`) is prepared for a future tray and is not wired.
+
+## Future
+
+See `WINSTATEDIAG_PRO_AI.md` (AI analysis and WinRepair Pro handoff — design only).
+

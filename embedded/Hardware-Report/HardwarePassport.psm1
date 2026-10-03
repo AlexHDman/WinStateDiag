@@ -28,6 +28,193 @@ function Get-HardwareMemoryType {
     switch ([int]$Code) { 20 { 'DDR' } 21 { 'DDR2' } 24 { 'DDR3' } 26 { 'DDR4' } 30 { 'LPDDR4' } 34 { 'DDR5' } 35 { 'LPDDR5' } default { 'Unknown' } }
 }
 
+# v0.4.2: SMBIOS memory speeds (Win32_PhysicalMemory.Speed /
+# ConfiguredClockSpeed) are data rates in MT/s for DDR memory (SMBIOS 3.1+),
+# not a measured clock in MHz. Shown as reported, never as a measurement;
+# an inferred value is marked approximate.
+function Format-HardwareMemoryRate {
+    param([AllowNull()][object]$Value, [switch]$Approximate)
+    if ($null -eq $Value) { return 'Unavailable' }
+    $rate = 0
+    if (-not [int]::TryParse(([string]$Value).Trim(), [ref]$rate) -or $rate -le 0) { return 'Unavailable' }
+    if ($Approximate) { return ('~{0} MT/s' -f $rate) }
+    return ('{0} MT/s' -f $rate)
+}
+
+# v0.4.2: GPU memory with documented precedence; never a capped/guessed
+# value presented as authoritative, never derived from the GPU name.
+#   1. Display class key HardwareInformation.qwMemorySize (64-bit, written
+#      by the display driver) - used when > 0.
+#   2. Win32_VideoController.AdapterRAM / HardwareInformation.MemorySize
+#      (32-bit) - used only when below the 32-bit ceiling (0xFFF00000);
+#      at/above it the value is a saturated field (e.g. "4.00 GB" for an
+#      8 GB card) and is NOT shown as VRAM.
+#   3. Otherwise: not reliably determined.
+# Raw source values are kept for evidence.
+function Resolve-HardwareGpuMemory {
+    param([AllowNull()][object]$AdapterRam, [AllowNull()][object]$RegistryQword, [AllowNull()][object]$RegistryDword)
+    $toUInt64 = {
+        param($v)
+        if ($null -eq $v) { return $null }
+        if ($v -is [byte[]]) {
+            if ($v.Length -ge 8) { return [BitConverter]::ToUInt64($v, 0) }
+            if ($v.Length -ge 4) { return [uint64][BitConverter]::ToUInt32($v, 0) }
+            return $null
+        }
+        $n = [uint64]0
+        if ([uint64]::TryParse(([string]$v).Trim(), [ref]$n)) { return $n }
+        $i = [int64]0
+        if ([int64]::TryParse(([string]$v).Trim(), [ref]$i)) { return [uint64]($i -band [int64]4294967295) }
+        return $null
+    }
+    $ceiling = [uint64]4293918720
+    $wmi = & $toUInt64 $AdapterRam
+    $qw = & $toUInt64 $RegistryQword
+    $dw = & $toUInt64 $RegistryDword
+    $bytes = $null; $source = 'none'; $note = ''
+    if ($null -ne $qw -and $qw -gt 0) {
+        $bytes = $qw; $source = 'registry:HardwareInformation.qwMemorySize'
+        if ($null -ne $wmi -and $wmi -gt 0 -and $wmi -lt $ceiling -and [math]::Abs([double]$wmi - [double]$qw) -gt 1MB) {
+            $note = 'WMI AdapterRAM differs (32-bit field); the 64-bit driver value is used.'
+        }
+    } elseif ($null -ne $wmi -and $wmi -gt 0 -and $wmi -lt $ceiling) {
+        $bytes = $wmi; $source = 'wmi:Win32_VideoController.AdapterRAM'
+        if ($null -ne $dw -and $dw -gt 0 -and $dw -lt $ceiling -and [math]::Abs([double]$wmi - [double]$dw) -gt 1MB) {
+            $bytes = $null; $source = 'conflict'
+            $note = 'WMI AdapterRAM and registry MemorySize disagree; not reliably determined.'
+        }
+    } elseif ($null -ne $dw -and $dw -gt 0 -and $dw -lt $ceiling) {
+        $bytes = $dw; $source = 'registry:HardwareInformation.MemorySize'
+    } elseif (($null -ne $wmi -and $wmi -ge $ceiling) -or ($null -ne $dw -and $dw -ge $ceiling)) {
+        $note = 'Only a saturated 32-bit value (about 4 GB) is available; the real size is larger or unknown.'
+    }
+    [PSCustomObject]@{
+        Bytes = $bytes
+        Reliable = ($null -ne $bytes)
+        Display = $(if ($null -ne $bytes) { ConvertTo-HardwareSize $bytes } else { 'Not reliably determined' })
+        Source = $source
+        Note = $note
+        RawAdapterRam = $wmi
+        RawRegistryQword = $qw
+        RawRegistryDword = $dw
+    }
+}
+
+# v0.4.2 (real iGPU case): what KIND of graphics memory a value is. An
+# integrated GPU's driver can report a very large value (e.g. ~28 GB) that
+# is shared/system graphics memory, not dedicated VRAM. Evidence used, in
+# order (never the GPU name):
+#   1. The DirectX adapter record (HKLM\SOFTWARE\Microsoft\DirectX\<id>,
+#      written by Windows for each adapter): DedicatedVideoMemory and
+#      SharedSystemMemory, matched by PCI vendor/device id (unique match only).
+#      A driver value far above DedicatedVideoMemory is not dedicated VRAM.
+#   2. Without that record: an adapter on PCI bus 0 (the root complex, i.e.
+#      an integrated adapter) is never labelled dedicated VRAM.
+#   3. Otherwise the 64-bit/32-bit driver value keeps its v0.4.2 meaning.
+function Resolve-HardwareGpuMemoryKind {
+    param([object]$Memory, [AllowNull()][object]$DirectX, [AllowNull()][string]$LocationInfo)
+    $mb = [uint64]1048576
+    $dedicatedDx = $null; $sharedDx = $null
+    if ($null -ne $DirectX) {
+        try { if ($null -ne $DirectX.DedicatedVideoMemory) { $dedicatedDx = [uint64]$DirectX.DedicatedVideoMemory } } catch { }
+        try { if ($null -ne $DirectX.SharedSystemMemory) { $sharedDx = [uint64]$DirectX.SharedSystemMemory } } catch { }
+    }
+    $driver = $null
+    if ($null -ne $Memory -and $Memory.Reliable) { $driver = [uint64]$Memory.Bytes }
+    $integratedBus = ([string]$LocationInfo) -match '^\s*PCI bus 0\s*,'
+    $kind = 'unknown'; $dedicated = $null; $reported = $driver; $why = ''
+    if ($null -ne $dedicatedDx -and $dedicatedDx -gt 0) {
+        $tolerance = [math]::Max([double](64 * $mb), [double]$dedicatedDx * 0.05)
+        if ($null -eq $driver -or [math]::Abs([double]$driver - [double]$dedicatedDx) -le $tolerance) {
+            $kind = 'dedicated'; $dedicated = $(if ($null -ne $driver) { $driver } else { $dedicatedDx })
+            $why = 'DirectX DedicatedVideoMemory confirms the driver value.'
+            if ($null -eq $driver) { $why = 'DirectX DedicatedVideoMemory.' }
+        } elseif ($driver -gt $dedicatedDx) {
+            $kind = 'shared'; $dedicated = $dedicatedDx
+            $why = 'Driver value exceeds DirectX DedicatedVideoMemory: it includes shared/system graphics memory.'
+        } else {
+            $kind = 'driver_reported'
+            $why = 'Driver value and DirectX DedicatedVideoMemory disagree.'
+        }
+    } elseif ($null -ne $driver) {
+        if ($integratedBus) {
+            $kind = 'driver_reported'
+            $why = 'Integrated adapter (PCI bus 0) without a DirectX dedicated-memory record: not classified as dedicated VRAM.'
+        } else {
+            $kind = 'dedicated'; $dedicated = $driver
+            $why = 'Driver-reported dedicated memory.'
+        }
+    }
+    $display = switch ($kind) {
+        'dedicated' { ConvertTo-HardwareSize $dedicated }
+        'shared' {
+            $parts = @('Dedicated video memory ' + (ConvertTo-HardwareSize $dedicated))
+            if ($null -ne $sharedDx -and $sharedDx -gt 0) { $parts += 'shared system graphics memory ' + (ConvertTo-HardwareSize $sharedDx) }
+            $parts += 'driver-reported graphics memory ' + (ConvertTo-HardwareSize $driver) + ' (not dedicated VRAM)'
+            $parts -join '; '
+        }
+        'driver_reported' { 'Graphics memory reported by driver ' + (ConvertTo-HardwareSize $driver) + ' (dedicated VRAM not confirmed)' }
+        default { if ($null -ne $Memory) { $Memory.Display } else { 'Not reliably determined' } }
+    }
+    [PSCustomObject]@{
+        Kind = $kind
+        DedicatedBytes = $dedicated
+        SharedBytes = $sharedDx
+        DriverReportedBytes = $reported
+        DirectXDedicatedBytes = $dedicatedDx
+        Display = $display
+        Reason = $why
+    }
+}
+
+# Read-only: the DirectX adapter records (one per adapter Windows started).
+function Get-HardwareGpuDirectXMemory {
+    $rows = @()
+    try {
+        foreach ($key in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\DirectX' -ErrorAction Stop)) {
+            try {
+                $v = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+                if ($null -eq $v.PSObject.Properties['VendorId'] -or $null -eq $v.PSObject.Properties['DeviceId']) { continue }
+                $rows += [PSCustomObject]@{
+                    VendorId = [uint32]$v.VendorId; DeviceId = [uint32]$v.DeviceId
+                    DedicatedVideoMemory = $(if ($v.PSObject.Properties['DedicatedVideoMemory']) { $v.DedicatedVideoMemory } else { $null })
+                    SharedSystemMemory = $(if ($v.PSObject.Properties['SharedSystemMemory']) { $v.SharedSystemMemory } else { $null })
+                }
+            } catch { }
+        }
+    } catch { }
+    return $rows
+}
+
+# The DirectX record of one PnP device: matched by PCI VEN/DEV; only a
+# unique match is used (two identical adapters stay unresolved).
+function Select-HardwareGpuDirectX {
+    param([AllowNull()][object[]]$Rows, [string]$PnpDeviceId)
+    if ([string]$PnpDeviceId -notmatch '(?i)VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})') { return $null }
+    $ven = [Convert]::ToUInt32($Matches[1], 16); $dev = [Convert]::ToUInt32($Matches[2], 16)
+    $hits = @(@($Rows) | Where-Object { $null -ne $_ -and [uint32]$_.VendorId -eq $ven -and [uint32]$_.DeviceId -eq $dev })
+    if ($hits.Count -eq 1) { return $hits[0] }
+    return $null
+}
+
+# Read-only: the display driver's memory values for one PnP device
+# (Enum\<PnP id>\Driver -> Control\Class\<driver key>) and its bus location.
+function Get-HardwareGpuRegistryMemory {
+    param([string]$PnpDeviceId)
+    $result = [PSCustomObject]@{ Qword = $null; Dword = $null; Location = $null }
+    if ([string]::IsNullOrWhiteSpace($PnpDeviceId)) { return $result }
+    try {
+        $enum = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Enum\" + $PnpDeviceId) -ErrorAction Stop
+        if ($enum.PSObject.Properties['LocationInformation']) { $result.Location = [string]$enum.LocationInformation }
+        $class = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Control\Class\" + $enum.Driver) -ErrorAction Stop
+        $q = $class.PSObject.Properties['HardwareInformation.qwMemorySize']
+        $d = $class.PSObject.Properties['HardwareInformation.MemorySize']
+        if ($q) { $result.Qword = $q.Value }
+        if ($d) { $result.Dword = $d.Value }
+    } catch { }
+    return $result
+}
+
 function Get-HardwareOverallState {
     param([object[]]$States)
     $values = @($States | Where-Object { $_ -in @('OK','WARNING','CRITICAL','UNKNOWN') })
@@ -96,6 +283,18 @@ function Get-HardwareSource {
     $batteryCycleCount = @(Read-WmiLocal 'BatteryCycleCount')
     $batteryStatus = @(Read-WmiLocal 'BatteryStatus')
 
+    $videoControllers = @(Read-CimLocal Win32_VideoController)
+    $gpuRegistry = @()
+    $gpuDirectX = @()
+    if (-not $InstanceReader) {
+        $gpuRegistry = @($videoControllers | ForEach-Object {
+            $pnp = [string](Get-HardwareValue $_ 'PNPDeviceID' '')
+            $mem = Get-HardwareGpuRegistryMemory -PnpDeviceId $pnp
+            [PSCustomObject]@{ PnpId = $pnp; Qword = $mem.Qword; Dword = $mem.Dword; Location = $mem.Location }
+        })
+        $gpuDirectX = @(Get-HardwareGpuDirectXMemory)
+    }
+
     [PSCustomObject]@{
         System = @(Read-CimLocal Win32_ComputerSystem | Select-Object -First 1)
         OperatingSystem = @(Read-CimLocal Win32_OperatingSystem | Select-Object -First 1)
@@ -105,7 +304,9 @@ function Get-HardwareSource {
         Processors = @(Read-CimLocal Win32_Processor)
         MemoryModules = @(Read-CimLocal Win32_PhysicalMemory)
         MemoryArrays = @(Read-CimLocal Win32_PhysicalMemoryArray)
-        VideoControllers = @(Read-CimLocal Win32_VideoController)
+        VideoControllers = $videoControllers
+        GpuRegistryMemory = $gpuRegistry
+        GpuDirectXMemory = $gpuDirectX
         Disks = @(Read-CimLocal Win32_DiskDrive)
         PhysicalDisks = $physicalDisks
         Reliability = $reliability
@@ -149,8 +350,15 @@ function New-HardwarePassport {
             CapacityBytes = Get-HardwareValue $_ 'Capacity'
             Capacity = ConvertTo-HardwareSize (Get-HardwareValue $_ 'Capacity')
             Type = Get-HardwareMemoryType (Get-HardwareValue $_ 'SMBIOSMemoryType' 0)
+            # Kept for parser compatibility: these SMBIOS values are data
+            # rates in MT/s despite the historical "MHz" field names.
             RatedSpeedMHz = $speed
             ConfiguredClockMHz = $configured
+            RatedSpeedMTs = $speed
+            ConfiguredSpeedMTs = $configured
+            RatedSpeed = Format-HardwareMemoryRate $speed
+            ConfiguredSpeed = Format-HardwareMemoryRate $configured
+            SpeedSource = 'SMBIOS/WMI (reported, not measured)'
             DeviceLocator = ConvertTo-HardwareText (Get-HardwareValue $_ 'DeviceLocator')
             BankLabel = ConvertTo-HardwareText (Get-HardwareValue $_ 'BankLabel')
             Serial = ConvertTo-HardwareText (Get-HardwareValue $_ 'SerialNumber')
@@ -195,8 +403,16 @@ function New-HardwarePassport {
     }
 
     $gpus = @($Source.VideoControllers | Where-Object { $_.Name -notmatch '(?i)Remote Display Adapter|Virtual Display|Microsoft Basic Display' } | ForEach-Object {
-        $vram = Get-HardwareValue $_ 'AdapterRAM'
-        [PSCustomObject]@{ Name=ConvertTo-HardwareText $_.Name; DriverVersion=ConvertTo-HardwareText $_.DriverVersion; VRAMBytes=$vram; VRAM=$(if ($vram) { ConvertTo-HardwareSize $vram } else { 'Unavailable' }); PnpId=ConvertTo-HardwareText $_.PNPDeviceID }
+        $pnp = [string](Get-HardwareValue $_ 'PNPDeviceID' '')
+        $reg = @(@(Get-HardwareValue $Source 'GpuRegistryMemory' @()) | Where-Object { [string]$_.PnpId -eq $pnp } | Select-Object -First 1)[0]
+        $mem = Resolve-HardwareGpuMemory -AdapterRam (Get-HardwareValue $_ 'AdapterRAM') -RegistryQword (Get-HardwareValue $reg 'Qword') -RegistryDword (Get-HardwareValue $reg 'Dword')
+        $dx = Select-HardwareGpuDirectX -Rows @(Get-HardwareValue $Source 'GpuDirectXMemory' @()) -PnpDeviceId $pnp
+        $kind = Resolve-HardwareGpuMemoryKind -Memory $mem -DirectX $dx -LocationInfo ([string](Get-HardwareValue $reg 'Location' ''))
+        # VRAM* keeps its meaning: dedicated video memory only.
+        $mem.Display = $kind.Display
+        $mem.Bytes = $kind.DedicatedBytes
+        $mem.Reliable = ($kind.Kind -in @('dedicated','shared'))
+        [PSCustomObject]@{ Name=ConvertTo-HardwareText $_.Name; DriverVersion=ConvertTo-HardwareText $_.DriverVersion; VRAMBytes=$mem.Bytes; VRAM=$mem.Display; VRAMReliable=$mem.Reliable; VRAMSource=$mem.Source; VRAMNote=$mem.Note; VRAMKind=$kind.Kind; VRAMKindReason=$kind.Reason; DedicatedVideoMemoryBytes=$kind.DedicatedBytes; SharedSystemMemoryBytes=$kind.SharedBytes; DriverReportedMemoryBytes=$kind.DriverReportedBytes; VRAMRawAdapterRAM=$mem.RawAdapterRam; VRAMRawRegistryQword=$mem.RawRegistryQword; VRAMRawRegistryDword=$mem.RawRegistryDword; PnpId=ConvertTo-HardwareText $_.PNPDeviceID }
     })
     $networkConfigurations=@(Get-HardwareValue $Source 'NetworkConfigurations' @())
     $networks = @($Source.NetworkAdapters | Where-Object {
@@ -293,4 +509,4 @@ function New-HardwarePassport {
     }
 }
 
-Export-ModuleMember -Function New-HardwarePassport,Get-HardwareOverallState,ConvertTo-HardwareSize
+Export-ModuleMember -Function New-HardwarePassport,Get-HardwareOverallState,ConvertTo-HardwareSize,Format-HardwareMemoryRate,Resolve-HardwareGpuMemory,Resolve-HardwareGpuMemoryKind,Select-HardwareGpuDirectX

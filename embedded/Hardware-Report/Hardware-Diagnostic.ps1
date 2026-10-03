@@ -80,7 +80,7 @@ function New-HardwareReportLines {
         $lines.Add('Note: SMBIOS may not reflect full physical topology (soldered/onboard RAM, incomplete SMBIOS). An unpopulated physical slot is not confirmed.')
     }
     foreach ($reason in @($Passport.Ram.Reasons)) { $lines.Add("Reason: $reason") }
-    foreach ($module in @($Passport.Ram.Modules)) { $lines.Add("- $($module.DeviceLocator): $($module.Manufacturer) $($module.PartNumber), $($module.Capacity) $($module.Type), rated $($module.RatedSpeedMHz) MHz, configured $($module.ConfiguredClockMHz) MHz") }
+    foreach ($module in @($Passport.Ram.Modules)) { $lines.Add("- $($module.DeviceLocator): $($module.Manufacturer) $($module.PartNumber), $($module.Capacity) $($module.Type), rated $(Format-HardwareMemoryRate $module.RatedSpeedMHz), configured $(Format-HardwareMemoryRate $module.ConfiguredClockMHz) (SMBIOS-reported data rate, not measured)") }
     $lines.Add('')
     $lines.Add('[STORAGE]')
     $lines.Add((Format-HardwareLine 'State' $Passport.Storage.State))
@@ -92,7 +92,7 @@ function New-HardwareReportLines {
     }
     $lines.Add('')
     $lines.Add('[GPU]')
-    foreach ($gpu in @($Passport.Gpu.Controllers)) { $lines.Add("- $($gpu.Name); driver $($gpu.DriverVersion); VRAM $($gpu.VRAM); PNP $($gpu.PnpId)") }
+    foreach ($gpu in @($Passport.Gpu.Controllers)) { $memLabel = $(if ($gpu.PSObject.Properties['VRAMKind'] -and $gpu.VRAMKind -ne 'dedicated') { 'graphics memory' } else { 'VRAM' }); $lines.Add("- $($gpu.Name); driver $($gpu.DriverVersion); $memLabel $($gpu.VRAM); PNP $($gpu.PnpId)"); if ($gpu.PSObject.Properties['VRAMKindReason'] -and $gpu.VRAMKindReason) { $lines.Add("  Memory kind: $($gpu.VRAMKind) - $($gpu.VRAMKindReason)") }; if ($gpu.PSObject.Properties['VRAMNote'] -and $gpu.VRAMNote) { $lines.Add("  VRAM note: $($gpu.VRAMNote)") }; if ($gpu.PSObject.Properties['VRAMSource']) { $lines.Add("  VRAM source: $($gpu.VRAMSource); raw AdapterRAM: $($gpu.VRAMRawAdapterRAM); raw qwMemorySize: $($gpu.VRAMRawRegistryQword)") } }
     $lines.Add('')
     $lines.Add('[NETWORK]')
     foreach ($adapter in @($Passport.Network.Adapters)) { $lines.Add("- $($adapter.Name); $($adapter.Manufacturer); $($adapter.MAC); $($adapter.LinkState)") }
@@ -223,7 +223,7 @@ function Get-HardwareOverviewValues {
     $types=@($Passport.Ram.Modules|ForEach-Object Type|Where-Object{$_ -and $_ -ne 'Unavailable'}|Sort-Object -Unique)
     $speeds=@($Passport.Ram.Modules|ForEach-Object ConfiguredClockMHz|Where-Object{$_}|Sort-Object -Unique)
     $ramType=$(if($types.Count){$types -join '/'}else{'Type unavailable'})
-    $ramSpeed=$(if($speeds.Count){($speeds -join '/')+' MHz'}else{'speed unavailable'})
+    $ramSpeed=$(if($speeds.Count){($speeds -join '/')+' MT/s'}else{'speed unavailable'})
     $gpus=@($Passport.Gpu.Controllers|ForEach-Object Name|Where-Object{$_})
     $disks=@($Passport.Storage.Disks|ForEach-Object{"$($_.Model) — $($_.Capacity) — $($_.MediaType)/$($_.BusType) — $($_.Health)"})
     return [ordered]@{
@@ -257,7 +257,7 @@ function Update-HardwareGui {
     $State.OverviewValues.Overall.ForeColor=$(switch($p.OverallState){'OK'{[Drawing.Color]::FromArgb(44,155,94)}'WARNING'{[Drawing.Color]::FromArgb(205,132,25)}'CRITICAL'{[Drawing.Color]::FromArgb(205,55,55)}default{[Drawing.Color]::FromArgb(92,105,122)}})
     $cpu=@{Model=$p.Cpu.Models-join '; ';Manufacturer=$p.Cpu.Manufacturers-join '; ';Cores=$p.Cpu.PhysicalCores;Logical=$p.Cpu.LogicalProcessors;Socket=$p.Cpu.Sockets-join '; ';MaxClock="$($p.Cpu.MaxClockMHz) MHz";CurrentClock="$($p.Cpu.CurrentClockMHz) MHz";MaxBoost='Not reliably reported by Windows';Architecture=$p.Cpu.Architecture;Cache="L2 $($p.Cpu.L2CacheKB) KB; L3 $($p.Cpu.L3CacheKB) KB"}
     foreach($key in $cpu.Keys){$State.CpuValues[$key].Text=[string]$cpu[$key]}
-    Set-HardwareGridRows $State.RamGrid @($p.Ram.Modules|ForEach-Object{,@($_.DeviceLocator,$_.Manufacturer,$_.PartNumber,$_.Capacity,"$($_.RatedSpeedMHz) MHz","$($_.ConfiguredClockMHz) MHz",$_.Serial,$_.State)})
+    Set-HardwareGridRows $State.RamGrid @($p.Ram.Modules|ForEach-Object{,@($_.DeviceLocator,$_.Manufacturer,$_.PartNumber,$_.Capacity,(Format-HardwareMemoryRate $_.RatedSpeedMHz),(Format-HardwareMemoryRate $_.ConfiguredClockMHz),$_.Serial,$_.State)})
     $State.RamFooter.Text="Total installed: $($p.Ram.Total) | Type: $(@($p.Ram.Modules|ForEach-Object Type|Sort-Object -Unique)-join '/') | Declared slots: $($p.Ram.DeclaredSlots) | Detected: $($p.Ram.ModuleCount) | State: $($p.Ram.State)`r`n$($p.Ram.Reasons -join '; ')"
     Set-HardwareGridRows $State.StorageGrid @($p.Storage.Disks|ForEach-Object{,@($_.Model,$_.MediaType,$_.Capacity,$_.BusType,$_.Health,($_.OperationalStatus-join ', '),$_.Firmware,$_.Serial)})
     $State.StorageFooter.Text="Overall storage state: $($p.Storage.State). UNKNOWN means Windows did not expose trustworthy health data."
@@ -297,9 +297,9 @@ function Show-HardwareDiagnosticsGui {
 
     $overview=New-HardwareOverviewPage
     $cpu=New-HardwarePropertyPage 'Процессор' @([PSCustomObject]@{Key='Model';Label='Model'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='Cores';Label='Cores'},[PSCustomObject]@{Key='Logical';Label='Logical processors'},[PSCustomObject]@{Key='Socket';Label='Socket'},[PSCustomObject]@{Key='MaxClock';Label='Base clock (Windows-reported nominal)'},[PSCustomObject]@{Key='CurrentClock';Label='Current clock'},[PSCustomObject]@{Key='MaxBoost';Label='Max Boost'},[PSCustomObject]@{Key='Architecture';Label='Architecture'},[PSCustomObject]@{Key='Cache';Label='Cache'})
-    $ram=New-HardwareGridPage 'Память (RAM)' @([PSCustomObject]@{Key='Slot';Label='Slot'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='PartNumber';Label='Part Number'},[PSCustomObject]@{Key='Capacity';Label='Capacity'},[PSCustomObject]@{Key='Speed';Label='Speed'},[PSCustomObject]@{Key='Clock';Label='Configured Clock'},[PSCustomObject]@{Key='Serial';Label='Serial'},[PSCustomObject]@{Key='State';Label='State'})
+    $ram=New-HardwareGridPage 'Память (RAM)' @([PSCustomObject]@{Key='Slot';Label='Slot'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='PartNumber';Label='Part Number'},[PSCustomObject]@{Key='Capacity';Label='Capacity'},[PSCustomObject]@{Key='Speed';Label='Rated speed (SMBIOS)'},[PSCustomObject]@{Key='Clock';Label='Configured speed (SMBIOS)'},[PSCustomObject]@{Key='Serial';Label='Serial'},[PSCustomObject]@{Key='State';Label='State'})
     $storage=New-HardwareGridPage 'Накопители' @([PSCustomObject]@{Key='Model';Label='Model'},[PSCustomObject]@{Key='Type';Label='Type'},[PSCustomObject]@{Key='Capacity';Label='Capacity'},[PSCustomObject]@{Key='Bus';Label='Bus / Interface'},[PSCustomObject]@{Key='Health';Label='Health'},[PSCustomObject]@{Key='Operational';Label='Operational State'},[PSCustomObject]@{Key='Firmware';Label='Firmware'},[PSCustomObject]@{Key='Serial';Label='Serial'})
-    $gpu=New-HardwareGridPage 'Видеоадаптеры' @([PSCustomObject]@{Key='Name';Label='Name'},[PSCustomObject]@{Key='VRAM';Label='VRAM'},[PSCustomObject]@{Key='Driver';Label='Driver version'},[PSCustomObject]@{Key='Pnp';Label='PNP identifier'},[PSCustomObject]@{Key='State';Label='State'})
+    $gpu=New-HardwareGridPage 'Видеоадаптеры' @([PSCustomObject]@{Key='Name';Label='Name'},[PSCustomObject]@{Key='VRAM';Label='Video memory'},[PSCustomObject]@{Key='Driver';Label='Driver version'},[PSCustomObject]@{Key='Pnp';Label='PNP identifier'},[PSCustomObject]@{Key='State';Label='State'})
     $network=New-HardwareGridPage 'Сеть' @([PSCustomObject]@{Key='Adapter';Label='Adapter'},[PSCustomObject]@{Key='Type';Label='Type'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='MAC';Label='MAC'},[PSCustomObject]@{Key='State';Label='Connection state'})
     $bios=New-HardwarePropertyPage 'BIOS / Плата' @([PSCustomObject]@{Key='BoardManufacturer';Label='Board manufacturer'},[PSCustomObject]@{Key='BoardProduct';Label='Board product'},[PSCustomObject]@{Key='BoardVersion';Label='Board version'},[PSCustomObject]@{Key='BoardSerial';Label='Board serial'},[PSCustomObject]@{Key='BiosManufacturer';Label='BIOS manufacturer'},[PSCustomObject]@{Key='BiosVersion';Label='BIOS version'},[PSCustomObject]@{Key='ReleaseDate';Label='Release date'},[PSCustomObject]@{Key='FirmwareType';Label='UEFI / Legacy'},[PSCustomObject]@{Key='SecureBoot';Label='Secure Boot'})
     $battery=New-HardwarePropertyPage 'Батарея' @([PSCustomObject]@{Key='Detected';Label='Battery detected'},[PSCustomObject]@{Key='Summary';Label='Summary'},[PSCustomObject]@{Key='Charge';Label='Charge'},[PSCustomObject]@{Key='Status';Label='Status'},[PSCustomObject]@{Key='Design';Label='Design capacity'},[PSCustomObject]@{Key='Full';Label='Full charge capacity'})

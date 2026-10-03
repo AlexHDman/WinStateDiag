@@ -141,6 +141,9 @@ pub mod layout {
     pub const STAGES_CARD: R = [19.0, 463.0, 539.0, 223.0];
     pub const STAGE_VISIBLE_ROWS: usize = 5;
     pub const STAGES_TITLE_BASELINE: f32 = 490.5;
+    /// v0.4.1 "Детали" in the stages card header (same family as the
+    /// Driver Check "Подробнее"; clear of the first stage row at 502).
+    pub const STAGES_DETAILS_BUTTON: R = [440.0, 470.0, 98.0, 27.0];
     pub const STAGE_ROW_FIRST_Y: f32 = 502.0;
     pub const STAGE_ROW_PITCH: f32 = 30.0;
     pub const STAGE_ROW_X: f32 = 30.0;

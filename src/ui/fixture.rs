@@ -98,6 +98,8 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
             tone: Tone::Success,
         },
         ssd: SsdVm::Done {
+            status: None,
+            note: None,
             read_current: "7027".into(),
             read_previous: Some("6943".into()),
             read_delta: Some(1.2),

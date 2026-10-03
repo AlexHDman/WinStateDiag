@@ -134,8 +134,17 @@ pub enum SsdVm {
         fraction: f32,
         status: String,
         elapsed: String,
+        /// v0.4.2: note lines during the automatic retest (first run kept
+        /// visible); `None` = the usual temp-file note.
+        note: Option<[String; 2]>,
     },
     Done {
+        /// v0.4.2 storage correlation result for the status line (text,
+        /// tone); `None` until it is known.
+        status: Option<(String, Tone)>,
+        /// Two note lines replacing the temp-file note when an automatic
+        /// retest was involved (first run kept visible).
+        note: Option<[String; 2]>,
         read_current: String,
         read_previous: Option<String>,
         read_delta: Option<f64>,
@@ -293,6 +302,8 @@ pub enum Action {
     OpenJournal,
     ShowRawPasses,
     ShowDrivers,
+    /// v0.4.1: open the EXPC diagnostic results window.
+    ShowExpcDetails,
 }
 
 // Stage short labels / descriptions moved to `crate::i18n::Dict` (v0.3.6

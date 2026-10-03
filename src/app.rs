@@ -1,16 +1,19 @@
 use crate::cryptopro;
 use crate::deep_checks::{self, CheckResult, DeepCheck, DeepCheckOutcome};
+use crate::details;
 use crate::driver_audit::{self, AuditReport, Category, Severity};
 use crate::engine::{
     self, DeepChecks, DiagnosticMode, EXPC_DEEP_FLAGS, EXPC_STEP_COUNT, EXPC_STEP_LABELS,
     EXPC_WEIGHTS, EngineEvent, HardwareEvent, HardwareViewRequest, SessionRequest, Stage,
 };
 use crate::i18n::{self, Language};
+use crate::nvme_health;
 use crate::report_package::{
     self, EvidenceFile, SessionPackage, SharedPackage, evidence_stamp, identity_date,
 };
 use crate::ssd_history::{self, HistoryEntry};
 use crate::storage_benchmark::{self, DiagnosticProgress, StorageDiagnosticSummary};
+use crate::storage_health;
 use crate::storage_topology::{self, DiskCandidate};
 use crate::ui::capture::ReferenceMode;
 use crate::ui::dashboard::{self, Controls};
@@ -21,6 +24,7 @@ use crate::ui::vm::{
     StageFinding, StageRow, StartVm, Tone,
 };
 use crate::ui::{self, fixture, fonts, sysinfo};
+use egui::RichText;
 use egui::{Rect, vec2};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -181,6 +185,171 @@ enum JournalViewerStatus {
     Saved(PathBuf),
     SaveFailed(String),
     Copied,
+}
+
+/// Export destination of a details window (one text, two targets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExportAction {
+    Copy,
+    Save,
+}
+
+/// Outcome line under a details window (localized when drawn).
+#[derive(Debug)]
+enum ExportStatus {
+    Copied,
+    Saved(PathBuf),
+    Failed(String),
+}
+
+impl ExportStatus {
+    fn text(&self, d: &i18n::Dict) -> (String, egui::Color32) {
+        match self {
+            ExportStatus::Copied => (d.export_copied.to_string(), c::TEXT_PRIMARY),
+            ExportStatus::Saved(p) => (
+                format!("{}: {}", d.export_saved, p.display()),
+                c::TEXT_PRIMARY,
+            ),
+            ExportStatus::Failed(e) => (format!("{}: {e}", d.export_save_failed), c::RED_ERROR),
+        }
+    }
+}
+
+/// v0.4.1 Driver Check summary header + action row. Returns (run again,
+/// export action).
+pub(crate) fn driver_summary_header(
+    ui: &mut egui::Ui,
+    d: &i18n::Dict,
+    report: &AuditReport,
+    status: Option<&(String, egui::Color32)>,
+) -> (bool, Option<ExportAction>) {
+    let s = details::driver_summary(report);
+    let mut rerun = false;
+    let mut export = None;
+    details::card_frame().show(ui, |ui| {
+        details::section_title(ui, d.driver_summary_title);
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            details::counter_chip(
+                ui,
+                d.driver_sum_problems,
+                &s.problems.to_string(),
+                c::DRIVER_STATUS_PROBLEM_TEXT,
+            );
+            details::counter_chip(
+                ui,
+                d.driver_sum_warnings,
+                &s.warnings.to_string(),
+                c::YELLOW_WARNING,
+            );
+            details::counter_chip(ui, d.driver_sum_ok, &s.ok.to_string(), c::GREEN_SUCCESS);
+            details::counter_chip(
+                ui,
+                d.driver_sum_devices,
+                &s.devices.to_string(),
+                c::TEXT_SUBTITLE,
+            );
+            details::counter_chip(
+                ui,
+                d.driver_sum_events,
+                &s.events.to_string(),
+                c::TEXT_SUBTITLE,
+            );
+            let info = details::counter_chip(ui, d.driver_sum_info, "i", c::BLUE_ACCENT);
+            details::dark_tooltip(info, &[d.driver_info_tooltip, d.driver_info_tooltip_age]);
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            rerun = details::primary_button(ui, d.driver_action_rerun, true).clicked();
+            ui.add_space(4.0);
+            let has_issues = s.problems + s.warnings > 0;
+            if details::secondary_button(ui, d.driver_copy_issues, true).clicked() {
+                export = Some(ExportAction::Copy);
+            }
+            if details::secondary_button(ui, d.driver_save_issues, true).clicked() {
+                export = Some(ExportAction::Save);
+            }
+            if !has_issues {
+                ui.label(RichText::new(d.driver_issues_none).color(c::TEXT_MUTED));
+            }
+        });
+        if let Some((text, color)) = status {
+            ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
+        }
+    });
+    (rerun, export)
+}
+
+/// One step of the EXPC details window.
+pub(crate) fn expc_stage_card(
+    ui: &mut egui::Ui,
+    d: &i18n::Dict,
+    det: &details::StageDetail,
+    drive: &str,
+    copy_command: &mut Option<String>,
+) {
+    let color = det.state.color();
+    egui::Frame::new()
+        .fill(c::BG_CARD_INNER)
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.45)))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{:02}", det.number))
+                        .color(c::TEXT_SECONDARY)
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(d.stage_short[det.number - 1])
+                        .color(c::TEXT_PRIMARY)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(d.expc_state_labels[det.state.index()])
+                            .color(color)
+                            .strong(),
+                    );
+                });
+            });
+            let ex = details::explain(det, d, drive);
+            if let Some(e) = &ex.explanation {
+                ui.add(egui::Label::new(RichText::new(e).color(c::TEXT_BODY)).wrap());
+            }
+            for f in &det.findings {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{}: {f}", d.expc_result_label))
+                            .color(c::TEXT_SECONDARY),
+                    )
+                    .wrap(),
+                );
+            }
+            if let Some(cmd) = &ex.suggested_command {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(d.expc_suggested_action)
+                        .color(c::TEXT_TITLE)
+                        .strong(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(cmd).monospace().color(c::TEXT_PRIMARY));
+                    // Copies the TEXT only; there is no run/repair action.
+                    if ui.small_button(d.expc_copy_command).clicked() {
+                        *copy_command = Some(cmd.clone());
+                    }
+                });
+                ui.label(
+                    RichText::new(d.expc_not_executed)
+                        .color(c::TEXT_MUTED)
+                        .italics(),
+                );
+            }
+        });
+    ui.add_space(4.0);
 }
 
 /// Default (opening) size of the journal viewer, in points.
@@ -781,6 +950,149 @@ fn disk_identity_label(physical_identity: Option<&str>) -> String {
     }
 }
 
+/// Label/value rows of the NVMe Health facts shown in the SSD Details
+/// popup. Raw controller values only (temperatures converted from Kelvin,
+/// data units shown in TB next to nothing else); anything not read is
+/// "n/a" — never 0 — and no row carries a verdict.
+fn nvme_health_rows(h: &nvme_health::NvmeHealth, d: &i18n::Dict) -> Vec<(String, String)> {
+    use nvme_health::ProbeStatus;
+    let na = || d.nvme_value_unknown.to_string();
+    let status = match h.status {
+        ProbeStatus::Ok => "OK".to_string(),
+        ProbeStatus::Unsupported => d.nvme_status_unsupported.to_string(),
+        ProbeStatus::AccessDenied => d.nvme_status_access_denied.to_string(),
+        ProbeStatus::Error => d.nvme_status_error.to_string(),
+    };
+    let mut rows = vec![(d.nvme_status_label.to_string(), status)];
+    let Some(s) = h.smart.as_ref() else {
+        if let Some(detail) = &h.status_detail {
+            rows.push((String::new(), detail.clone()));
+        }
+        return rows;
+    };
+    let tb = |units: u128| {
+        nvme_health::data_units_to_bytes(units)
+            .map(|b| format!("{:.2} {}", b as f64 / 1e12, d.nvme_tb_unit))
+            .unwrap_or_else(na)
+    };
+    let flags = nvme_health::critical_warning_flags(s.critical_warning);
+    let warning = if flags.is_empty() {
+        s.critical_warning.to_string()
+    } else {
+        format!("0x{:02X} ({})", s.critical_warning, flags.join(", "))
+    };
+    rows.push((d.nvme_critical_warning.into(), warning));
+    rows.push((
+        d.nvme_temperature.into(),
+        s.composite_temperature_c()
+            .map(|t| format!("{t} °C"))
+            .unwrap_or_else(na),
+    ));
+    let sensors = s.temperature_sensors_c();
+    if !sensors.is_empty() {
+        let list: Vec<String> = sensors
+            .iter()
+            .map(|(n, t)| format!("#{n} {t} °C"))
+            .collect();
+        rows.push((d.nvme_temp_sensors.into(), list.join(", ")));
+    }
+    rows.push((
+        d.nvme_available_spare.into(),
+        format!("{} %", s.available_spare_percent),
+    ));
+    rows.push((
+        d.nvme_spare_threshold.into(),
+        format!("{} %", s.available_spare_threshold_percent),
+    ));
+    rows.push((
+        d.nvme_percentage_used.into(),
+        format!("{} %", s.percentage_used),
+    ));
+    rows.push((d.nvme_data_read.into(), tb(s.data_units_read)));
+    rows.push((d.nvme_data_written.into(), tb(s.data_units_written)));
+    rows.push((d.nvme_power_cycles.into(), s.power_cycles.to_string()));
+    rows.push((d.nvme_power_on_hours.into(), s.power_on_hours.to_string()));
+    rows.push((
+        d.nvme_unsafe_shutdowns.into(),
+        s.unsafe_shutdowns.to_string(),
+    ));
+    rows.push((
+        d.nvme_media_errors.into(),
+        s.media_and_data_integrity_errors.to_string(),
+    ));
+    rows.push((
+        d.nvme_error_log_entries.into(),
+        s.error_information_log_entries.to_string(),
+    ));
+    let error_log = match (&h.error_log_status, &h.error_log) {
+        (ProbeStatus::Ok, Some(list)) => d
+            .nvme_error_log_read_fmt
+            .replace("{n}", &list.len().to_string()),
+        (ProbeStatus::Unsupported, _) => d.nvme_status_unsupported.to_string(),
+        (ProbeStatus::AccessDenied, _) => d.nvme_status_access_denied.to_string(),
+        _ => d.nvme_status_error.to_string(),
+    };
+    rows.push((d.nvme_error_log.into(), error_log));
+    rows
+}
+
+fn section_title(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).strong().color(c::TEXT_SECONDARY));
+}
+
+/// The per-pass table of one benchmark run (Details window).
+fn pass_grid(ui: &mut egui::Ui, id: &str, result: &StorageDiagnosticSummary) {
+    egui::Grid::new(id)
+        .striped(true)
+        .spacing(vec2(12.0, 6.0))
+        .show(ui, |ui| {
+            for heading in [
+                "PASS", "READ", "WRITE", "R IOPS", "W IOPS", "R LAT", "W LAT", "R TIME", "W TIME",
+            ] {
+                ui.label(
+                    egui::RichText::new(heading)
+                        .strong()
+                        .color(c::TEXT_SECONDARY),
+                );
+            }
+            ui.end_row();
+            for pass in &result.raw_passes {
+                ui.label(pass.pass_number.to_string());
+                ui.label(format!(
+                    "{:.1} MB/s",
+                    pass.run.read.mb_per_second * 1.048576
+                ));
+                ui.label(format!(
+                    "{:.1} MB/s",
+                    pass.run.write.mb_per_second * 1.048576
+                ));
+                ui.label(format!("{:.0}", pass.run.read.iops));
+                ui.label(format!("{:.0}", pass.run.write.iops));
+                ui.label(format!(
+                    "{:.3} ms",
+                    pass.run.read.average_latency.as_secs_f64() * 1000.0
+                ));
+                ui.label(format!(
+                    "{:.3} ms",
+                    pass.run.write.average_latency.as_secs_f64() * 1000.0
+                ));
+                ui.label(format!("{:.3} s", pass.run.read.elapsed.as_secs_f64()));
+                ui.label(format!("{:.3} s", pass.run.write.elapsed.as_secs_f64()));
+                ui.end_row();
+            }
+        });
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` local time (NVMe Health `captured_at`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn local_iso(t: sysinfo::LocalTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+
+#[cfg(test)]
 fn ssd_benchmark_evidence(
     result: &StorageDiagnosticSummary,
     test_dir: &Path,
@@ -788,14 +1100,61 @@ fn ssd_benchmark_evidence(
     previous: Option<&HistoryEntry>,
     disk_label: String,
 ) -> Vec<EvidenceFile> {
+    ssd_benchmark_evidence_for(
+        result,
+        test_dir,
+        duration_seconds,
+        previous,
+        disk_label,
+        None,
+        RunRole::Initial,
+    )
+}
+
+/// v0.4.2: which run of the benchmark workflow produced the evidence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunRole {
+    Initial,
+    AutomaticRetest,
+}
+
+impl RunRole {
+    fn code(self) -> &'static str {
+        match self {
+            RunRole::Initial => "initial",
+            RunRole::AutomaticRetest => "automatic_retest",
+        }
+    }
+}
+
+/// Benchmark evidence. Additive v0.4.2 JSON fields: `physical_disk_index`,
+/// `model` (per-disk manifest grouping) and `run_role`; the automatic
+/// retest gets its own `_retest` file so both runs are always kept.
+fn ssd_benchmark_evidence_for(
+    result: &StorageDiagnosticSummary,
+    test_dir: &Path,
+    duration_seconds: f64,
+    previous: Option<&HistoryEntry>,
+    disk_label: String,
+    disk: Option<&storage_topology::PhysicalDiskInfo>,
+    role: RunRole,
+) -> Vec<EvidenceFile> {
     let t = sysinfo::local_time();
-    let stem = format!("SSD_Benchmark_{}", evidence_stamp(t));
+    let stem = match role {
+        RunRole::Initial => format!("SSD_Benchmark_{}", evidence_stamp(t)),
+        RunRole::AutomaticRetest => format!("SSD_Benchmark_{}_retest", evidence_stamp(t)),
+    };
     let mb = |mib: f64| mib * 1.048576;
     let mut text = String::new();
     text.push_str("WinStateDiag — SSD / NVMe benchmark\r\n");
     text.push_str(&format!("Дата: {} {}\r\n", t.date_dmy(), t.hms()));
     text.push_str(&format!("Папка теста: {}\r\n", test_dir.display()));
     text.push_str(&format!("Диск: {disk_label}\r\n"));
+    if role == RunRole::AutomaticRetest {
+        text.push_str(
+            "Замер: автоматический контрольный повтор после нестабильного первого замера\r\n",
+        );
+    }
     text.push_str(&format!(
         "Профиль: блок {} байт, QD{}, файл {} байт, проходов {}\r\n",
         result.profile.block_size,
@@ -871,7 +1230,12 @@ fn ssd_benchmark_evidence(
         out
     };
     let json = format!(
-        "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"test_dir\":{},\"disk\":{},\"block_size\":{},\"queue_depth\":{},\"test_file_size\":{},\"pass_count\":{},\"duration_s\":{:.3},\"read_mb_s\":{:.3},\"write_mb_s\":{:.3},\"read_variation_percent\":{:.3},\"write_variation_percent\":{:.3},\"stability\":{},\"stable\":{},\"passes\":[{}]}}",
+        "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"run_role\":{},\"physical_disk_index\":{},\"model\":{},\"test_dir\":{},\"disk\":{},\"block_size\":{},\"queue_depth\":{},\"test_file_size\":{},\"pass_count\":{},\"duration_s\":{:.3},\"read_mb_s\":{:.3},\"write_mb_s\":{:.3},\"read_variation_percent\":{:.3},\"write_variation_percent\":{:.3},\"stability\":{},\"stable\":{},\"passes\":[{}]}}",
+        json_str(role.code()),
+        disk.map(|d| d.index.to_string())
+            .unwrap_or_else(|| "null".into()),
+        disk.map(|d| json_str(d.model.trim()))
+            .unwrap_or_else(|| "null".into()),
         json_str(&test_dir.display().to_string()),
         json_str(&disk_label),
         result.profile.block_size,
@@ -952,6 +1316,79 @@ enum CryptoEvent {
     Rehashed(cryptopro::RehashOutcome),
 }
 
+/// Short, safe idle between an UNSTABLE first run and its retest.
+const RETEST_IDLE: Duration = Duration::from_secs(10);
+/// Extra time the retest waits for the health read before failing closed.
+const RETEST_HEALTH_WAIT: Duration = Duration::from_secs(45);
+
+/// Messages of the background health/event probe (sent on Windows only).
+#[cfg_attr(not(windows), allow(dead_code))]
+enum ProbeMsg {
+    Health(nvme_health::NvmeHealth),
+    Events(String, storage_health::EventsInput),
+}
+
+/// One physical disk's storage correlation (first run, retest, health,
+/// events). The first run is never discarded.
+struct StorageAssessment {
+    disk: Option<storage_topology::PhysicalDiskInfo>,
+    first: StorageDiagnosticSummary,
+    first_duration: f64,
+    first_previous: Option<HistoryEntry>,
+    second: Option<StorageDiagnosticSummary>,
+    retest: storage_health::RetestOutcome,
+    benchmark_files: Vec<String>,
+    health_file: Option<String>,
+    events: storage_health::EventsInput,
+    health_pending: bool,
+    events_pending: bool,
+    classification: Option<storage_health::Classification>,
+}
+
+fn bench_facts(r: &StorageDiagnosticSummary) -> storage_health::BenchmarkFacts {
+    let level =
+        stability_level(r.read_variation_percent).max(stability_level(r.write_variation_percent));
+    storage_health::BenchmarkFacts {
+        stability: match level {
+            StabilityLevel::Stable => storage_health::BenchStability::Stable,
+            StabilityLevel::Acceptable => storage_health::BenchStability::Accept,
+            StabilityLevel::Unstable => storage_health::BenchStability::Unstable,
+        },
+        read_variation_percent: r.read_variation_percent,
+        write_variation_percent: r.write_variation_percent,
+    }
+}
+
+/// "UNSTABLE (WRITE 18.40%)": a run's overall level and its worst spread.
+fn run_brief_long(r: &StorageDiagnosticSummary) -> String {
+    let level =
+        stability_level(r.read_variation_percent).max(stability_level(r.write_variation_percent));
+    let (axis, v) = if r.write_variation_percent >= r.read_variation_percent {
+        ("WRITE", r.write_variation_percent)
+    } else {
+        ("READ", r.read_variation_percent)
+    };
+    format!("{} ({axis} {v:.2}%)", stability_text(level))
+}
+
+/// "UNSTABLE 18.4%": compact form for the dashboard note lines.
+fn run_brief(r: &StorageDiagnosticSummary) -> String {
+    let level =
+        stability_level(r.read_variation_percent).max(stability_level(r.write_variation_percent));
+    let v = r.read_variation_percent.max(r.write_variation_percent);
+    format!("{} {v:.1}%", stability_text(level))
+}
+
+fn storage_tone(state: storage_health::StorageState) -> Tone {
+    use storage_health::StorageState as S;
+    match state {
+        S::Ok | S::AnomalyNotConfirmed => Tone::Success,
+        S::InsufficientData => Tone::Idle,
+        S::BenchmarkAnomalyRetest | S::BenchmarkAnomalyCheck | S::StorageAttention => Tone::Warning,
+        S::StorageProblem => Tone::Error,
+    }
+}
+
 enum BenchmarkEvent {
     Progress(DiagnosticProgress),
     Finished(Result<StorageDiagnosticSummary, String>),
@@ -959,6 +1396,16 @@ enum BenchmarkEvent {
 
 enum BenchmarkUiState {
     Idle,
+    /// v0.4.2: the first run was UNSTABLE — a short idle before the ONE
+    /// automatic confirmation retest. The first result is kept (it is what
+    /// a cancel/skip returns to) and stays in evidence/history.
+    RetestWaiting {
+        identity: String,
+        result: StorageDiagnosticSummary,
+        until: Instant,
+        /// Latest moment to wait for the health read before failing closed.
+        deadline: Instant,
+    },
     Running {
         progress: DiagnosticProgress,
         rx: Receiver<BenchmarkEvent>,
@@ -996,6 +1443,13 @@ pub struct WinStateDiagApp {
     journal_viewer_status: Option<JournalViewerStatus>,
     /// v0.4.0: SFC / DISM / CHKDSK results of the last EXPC run.
     deep_check_results: Vec<DeepCheckOutcome>,
+    /// v0.4.1: every EXPC check of the last run (details window).
+    expc_checks: Vec<deep_checks::ExpcCheck>,
+    expc_details_open: bool,
+    expc_export_status: Option<ExportStatus>,
+    driver_export_status: Option<ExportStatus>,
+    #[cfg(test)]
+    driver_rerun_requests: usize,
     theme_ready: bool,
     benchmark_path: String,
     benchmark_state: BenchmarkUiState,
@@ -1044,6 +1498,23 @@ pub struct WinStateDiagApp {
     /// single shared `benchmark_state` pointed at whichever disk ran last.
     ssd_results:
         std::collections::HashMap<String, (StorageDiagnosticSummary, f64, Option<HistoryEntry>)>,
+    /// Native NVMe Health (experimental, read-only): the latest health
+    /// record per physical disk, keyed by the SAME
+    /// `storage_topology::physical_disk_identity` the benchmark uses —
+    /// never by drive letter. Facts only; no severity is derived from it.
+    nvme_health: std::collections::HashMap<String, nvme_health::NvmeHealth>,
+    /// Pending background health + storage-event read (started after a
+    /// completed first benchmark run).
+    nvme_rx: Option<Receiver<ProbeMsg>>,
+    /// v0.4.2 storage correlation, per physical disk identity.
+    assessments: std::collections::HashMap<String, StorageAssessment>,
+    /// Identity whose automatic retest run is executing (one at most).
+    retest_identity: Option<String>,
+    /// Idle before the automatic retest (tests shorten it).
+    retest_idle: Duration,
+    /// Test seam: lets tests drive a "running" benchmark without I/O.
+    #[cfg(test)]
+    bench_test_tx: Option<std::sync::mpsc::Sender<BenchmarkEvent>>,
     /// Active UI language (v0.3.6 bilingual pass). Loaded once at startup
     /// from the portable-safe preference file next to the EXE; switching it
     /// live never rebuilds the window, only the next frame's `DashboardVm`.
@@ -1094,6 +1565,12 @@ impl Default for WinStateDiagApp {
             journal_viewer_open: false,
             journal_viewer_status: None,
             deep_check_results: Vec::new(),
+            expc_checks: Vec::new(),
+            expc_details_open: false,
+            expc_export_status: None,
+            driver_export_status: None,
+            #[cfg(test)]
+            driver_rerun_requests: 0,
             theme_ready: false,
             benchmark_path: std::env::temp_dir().display().to_string(),
             benchmark_state: BenchmarkUiState::Idle,
@@ -1118,6 +1595,13 @@ impl Default for WinStateDiagApp {
             ssd_candidates: Vec::new(),
             ssd_selected: 0,
             ssd_results: std::collections::HashMap::new(),
+            nvme_health: std::collections::HashMap::new(),
+            nvme_rx: None,
+            assessments: std::collections::HashMap::new(),
+            retest_identity: None,
+            retest_idle: RETEST_IDLE,
+            #[cfg(test)]
+            bench_test_tx: None,
             // Reading the preference is best-effort and must never block
             // startup: `i18n::load` itself falls back to `Language::Ru` on
             // any I/O error, missing file, or corrupted content.
@@ -1167,7 +1651,10 @@ impl WinStateDiagApp {
     }
 
     fn benchmark_is_running(&self) -> bool {
-        matches!(self.benchmark_state, BenchmarkUiState::Running { .. })
+        matches!(
+            self.benchmark_state,
+            BenchmarkUiState::Running { .. } | BenchmarkUiState::RetestWaiting { .. }
+        )
     }
 
     /// Physical disk currently targeted by the selector (v0.3.6), if any
@@ -1245,6 +1732,14 @@ impl WinStateDiagApp {
         if self.benchmark_is_running() || self.is_running() {
             return;
         }
+        // A user-started run is always an initial run.
+        self.retest_identity = None;
+        self.launch_benchmark();
+    }
+
+    /// Starts one benchmark run on the selected disk. Returns false when
+    /// the target is not resolvable (nothing is started).
+    fn launch_benchmark(&mut self) -> bool {
         // Never silently fall back to C: — if candidates were enumerated
         // but the selected one has no writable volume, refuse rather than
         // benchmarking whatever benchmark_path happened to still hold.
@@ -1256,7 +1751,7 @@ impl WinStateDiagApp {
         {
             let msg = i18n::t(self.language).journal_ssd_target_unavailable;
             push_journal(&mut self.journal, msg.to_string());
-            return;
+            return false;
         }
         // benchmark_path is still the single source of truth for where the
         // temp file goes (Action::SelectSsdDisk keeps it in sync with the
@@ -1268,20 +1763,27 @@ impl WinStateDiagApp {
         let path = PathBuf::from(self.benchmark_path.trim());
         let test_dir = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let progress_tx = tx.clone();
-            let result = storage_benchmark::run_diagnostic_summary_with_progress(
-                path,
-                &worker_cancel,
-                move |progress| {
-                    let _ = progress_tx.send(BenchmarkEvent::Progress(progress));
-                },
-            )
-            .map_err(|error| error.to_string());
-            let _ = tx.send(BenchmarkEvent::Finished(result));
-        });
+        // Tests drive the run through this sender instead (no disk I/O).
+        #[cfg(test)]
+        {
+            self.bench_test_tx = Some(tx.clone());
+        }
+        if !cfg!(test) {
+            let worker_cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let progress_tx = tx.clone();
+                let result = storage_benchmark::run_diagnostic_summary_with_progress(
+                    path,
+                    &worker_cancel,
+                    move |progress| {
+                        let _ = progress_tx.send(BenchmarkEvent::Progress(progress));
+                    },
+                )
+                .map_err(|error| error.to_string());
+                let _ = tx.send(BenchmarkEvent::Finished(result));
+            });
+        }
         self.benchmark_state = BenchmarkUiState::Running {
             progress: DiagnosticProgress::Preparation,
             rx,
@@ -1290,11 +1792,22 @@ impl WinStateDiagApp {
             test_dir,
             physical_identity,
         };
+        true
     }
 
     fn poll_benchmark(&mut self) {
         let mut next_state = None;
         let mut history_log: Option<String> = None;
+        let mut finished: Option<(String, StorageDiagnosticSummary, f64, Option<HistoryEntry>)> =
+            None;
+        let mut finished_err = false;
+        let mut was_cancelled = false;
+        let role = if self.retest_identity.is_some() {
+            RunRole::AutomaticRetest
+        } else {
+            RunRole::Initial
+        };
+        let disk = self.selected_ssd_candidate().map(|c| c.disk.clone());
         let mut ssd_evidence: Option<Vec<EvidenceFile>> = None;
         if let BenchmarkUiState::Running {
             progress,
@@ -1316,7 +1829,8 @@ impl WinStateDiagApp {
                         // report folder of today keeps its session copy for
                         // the ZIP (restored from the ZIP first when the
                         // folder was already finalized). Comparison reads
-                        // both, each run counted once.
+                        // both, each run counted once. v0.4.2: the automatic
+                        // retest is recorded exactly like the first run.
                         let reports_root = self.reports_root.clone();
                         let history_path = report_package::lock(&self.package)
                             .open_for_update(
@@ -1361,12 +1875,14 @@ impl WinStateDiagApp {
                             );
                         }
                         let duration_seconds = started.elapsed().as_secs_f64();
-                        ssd_evidence = Some(ssd_benchmark_evidence(
+                        ssd_evidence = Some(ssd_benchmark_evidence_for(
                             &result,
                             test_dir,
                             duration_seconds,
                             previous.as_ref(),
                             disk_identity_label(physical_identity.as_deref()),
+                            disk.as_ref(),
+                            role,
                         ));
                         // v0.3.6 §10: cache this disk's own result by its
                         // identity so selecting away and back (without a
@@ -1376,6 +1892,12 @@ impl WinStateDiagApp {
                             disk_identity.clone(),
                             (result.clone(), duration_seconds, previous.clone()),
                         );
+                        finished = Some((
+                            disk_identity,
+                            result.clone(),
+                            duration_seconds,
+                            previous.clone(),
+                        ));
                         next_state = Some(BenchmarkUiState::Done {
                             result,
                             duration_seconds,
@@ -1383,7 +1905,9 @@ impl WinStateDiagApp {
                         });
                     }
                     BenchmarkEvent::Finished(Err(message)) => {
-                        next_state = Some(if cancel.load(Ordering::Relaxed) {
+                        finished_err = true;
+                        was_cancelled = cancel.load(Ordering::Relaxed);
+                        next_state = Some(if was_cancelled {
                             BenchmarkUiState::Cancelled
                         } else {
                             BenchmarkUiState::Failed(message)
@@ -1399,10 +1923,365 @@ impl WinStateDiagApp {
             push_journal(&mut self.journal, line);
         }
         // The completed benchmark joins the session report automatically.
+        let names: Vec<String> = ssd_evidence
+            .as_ref()
+            .map(|f| f.iter().map(|e| e.name.clone()).collect())
+            .unwrap_or_default();
         if let Some(files) = ssd_evidence {
             let module = i18n::t(self.language).ssd_module_name;
             self.contribute_evidence(module, files);
         }
+        if let Some((identity, result, duration, previous)) = finished {
+            match self.retest_identity.take() {
+                Some(id) => {
+                    // The automatic retest finished: both runs are kept.
+                    if let Some(a) = self.assessments.get_mut(&id) {
+                        a.retest = storage_health::RetestOutcome::Completed(bench_facts(&result));
+                        a.second = Some(result);
+                        a.benchmark_files.extend(names);
+                    }
+                    self.finalize_assessment(&id);
+                }
+                None => self.begin_assessment(identity, result, duration, previous, names, disk),
+            }
+        } else if finished_err {
+            if let Some(id) = self.retest_identity.take() {
+                // A cancelled/failed retest never hides the first result.
+                let outcome = if was_cancelled {
+                    storage_health::RetestOutcome::Cancelled
+                } else {
+                    storage_health::RetestOutcome::Failed
+                };
+                self.end_retest(&id, outcome);
+            }
+        }
+    }
+
+    /// First run of a user-started benchmark: opens this disk's storage
+    /// assessment, starts the read-only health/event probe and — when the
+    /// run is UNSTABLE — schedules the ONE automatic confirmation retest.
+    fn begin_assessment(
+        &mut self,
+        identity: String,
+        result: StorageDiagnosticSummary,
+        duration: f64,
+        previous: Option<HistoryEntry>,
+        files: Vec<String>,
+        disk: Option<storage_topology::PhysicalDiskInfo>,
+    ) {
+        let probing = self.start_nvme_health_probe(&identity);
+        let unstable = bench_facts(&result).stability == storage_health::BenchStability::Unstable;
+        self.assessments.insert(
+            identity.clone(),
+            StorageAssessment {
+                disk,
+                first: result.clone(),
+                first_duration: duration,
+                first_previous: previous,
+                second: None,
+                retest: if unstable {
+                    storage_health::RetestOutcome::Pending
+                } else {
+                    storage_health::RetestOutcome::NotNeeded
+                },
+                benchmark_files: files,
+                health_file: None,
+                events: storage_health::EventsInput::NotCollected,
+                health_pending: probing,
+                events_pending: probing,
+                classification: None,
+            },
+        );
+        if unstable {
+            let now = Instant::now();
+            let d = i18n::t(self.language);
+            push_journal(
+                &mut self.journal,
+                d.journal_retest_scheduled_fmt
+                    .replace("{s}", &self.retest_idle.as_secs().to_string()),
+            );
+            self.benchmark_state = BenchmarkUiState::RetestWaiting {
+                identity: identity.clone(),
+                result,
+                until: now + self.retest_idle,
+                deadline: now + self.retest_idle + RETEST_HEALTH_WAIT,
+            };
+        }
+        self.finalize_assessment(&identity);
+    }
+
+    /// Drives the idle → retest step. Fails closed: no retest when the
+    /// target is gone, the health read did not arrive in time, or the
+    /// controller state makes more write testing inappropriate.
+    fn poll_retest(&mut self) {
+        let BenchmarkUiState::RetestWaiting {
+            identity,
+            until,
+            deadline,
+            ..
+        } = &self.benchmark_state
+        else {
+            return;
+        };
+        let now = Instant::now();
+        if now < *until {
+            return;
+        }
+        let identity = identity.clone();
+        let health_pending = self
+            .assessments
+            .get(&identity)
+            .is_some_and(|a| a.health_pending);
+        if health_pending && now < *deadline {
+            return;
+        }
+        let skip = if health_pending {
+            Some(storage_health::RetestSkip::HealthPending)
+        } else if !storage_health::retest_allowed(self.nvme_health.get(&identity)) {
+            Some(storage_health::RetestSkip::HealthForbidsWrites)
+        } else if !self.retest_target_ok(&identity) {
+            Some(storage_health::RetestSkip::TargetUnavailable)
+        } else {
+            None
+        };
+        if let Some(why) = skip {
+            self.end_retest(&identity, storage_health::RetestOutcome::Skipped(why));
+            return;
+        }
+        self.retest_identity = Some(identity.clone());
+        if self.launch_benchmark() {
+            let d = i18n::t(self.language);
+            push_journal(&mut self.journal, d.journal_retest_started.to_string());
+        } else {
+            self.retest_identity = None;
+            self.end_retest(
+                &identity,
+                storage_health::RetestOutcome::Skipped(
+                    storage_health::RetestSkip::TargetUnavailable,
+                ),
+            );
+        }
+    }
+
+    /// The retest target must still be the same, resolvable disk.
+    fn retest_target_ok(&self, identity: &str) -> bool {
+        let path_ok = Path::new(self.benchmark_path.trim()).is_dir();
+        if self.ssd_candidates.is_empty() {
+            return path_ok;
+        }
+        self.selected_ssd_candidate().is_some_and(|c| {
+            storage_topology::physical_disk_identity(&c.disk) == identity
+                && storage_topology::benchmark_target_dir(c).is_ok()
+        }) && path_ok
+    }
+
+    /// Ends the retest phase without a second result: the first run is
+    /// shown again (never hidden) and the outcome is recorded.
+    fn end_retest(&mut self, identity: &str, outcome: storage_health::RetestOutcome) {
+        let d = i18n::t(self.language);
+        let line = storage_health::Finding::RetestNotRun(outcome.clone())
+            .text(self.language == Language::Ru);
+        if let Some(a) = self.assessments.get_mut(identity) {
+            a.retest = outcome;
+            self.benchmark_state = BenchmarkUiState::Done {
+                result: a.first.clone(),
+                duration_seconds: a.first_duration,
+                previous: a.first_previous.clone(),
+            };
+            self.ssd_results.insert(
+                identity.to_string(),
+                (a.first.clone(), a.first_duration, a.first_previous.clone()),
+            );
+        } else {
+            self.benchmark_state = BenchmarkUiState::Idle;
+        }
+        push_journal(&mut self.journal, format!("{}: {line}", d.ssd_module_name));
+        self.finalize_assessment(identity);
+    }
+
+    /// Classifies a disk once every input is in (retest done/skipped,
+    /// health and events read or failed) and records the evidence.
+    fn finalize_assessment(&mut self, identity: &str) {
+        let Some(a) = self.assessments.get(identity) else {
+            return;
+        };
+        if a.classification.is_some()
+            || a.health_pending
+            || a.events_pending
+            || a.retest == storage_health::RetestOutcome::Pending
+        {
+            return;
+        }
+        let now = sysinfo::local_time();
+        let inputs = storage_health::StorageHealthInputs {
+            physical_identity: identity.to_string(),
+            disk_index: a.disk.as_ref().map(|d| d.index),
+            benchmark: Some(bench_facts(&a.first)),
+            retest: a.retest.clone(),
+            nvme: self.nvme_health.get(identity).cloned(),
+            events: a.events.clone(),
+            assessed_at: local_iso(now),
+        };
+        let c = storage_health::classify(&inputs);
+        let model = a
+            .disk
+            .as_ref()
+            .map(|d| d.model.trim().to_string())
+            .unwrap_or_default();
+        let json = storage_health::to_json(
+            &inputs,
+            &c,
+            &model,
+            a.health_file.as_deref(),
+            &a.benchmark_files,
+        );
+        let name = storage_health::evidence_file_name(&evidence_stamp(now), inputs.disk_index);
+        let d = i18n::t(self.language);
+        let disk = inputs
+            .disk_index
+            .map(|n| format!("PhysicalDrive{n}"))
+            .unwrap_or_else(|| model.clone());
+        push_journal(
+            &mut self.journal,
+            d.journal_storage_assessment_fmt
+                .replace("{disk}", &disk)
+                .replace("{state}", c.state.text(self.language == Language::Ru)),
+        );
+        if let Some(a) = self.assessments.get_mut(identity) {
+            a.classification = Some(c);
+        }
+        self.contribute_evidence(
+            d.ssd_module_name,
+            vec![EvidenceFile::new(name, json.into_bytes())],
+        );
+    }
+
+    /// Native NVMe Health + storage events: reads the SMART / Health and
+    /// Error Information log pages and the storage System events for the
+    /// benchmarked physical disk on a background thread. Windows only,
+    /// never in tests/QA reference mode; any failure becomes a status,
+    /// never a crash. Returns whether a probe was started.
+    fn start_nvme_health_probe(&mut self, identity: &str) -> bool {
+        #[cfg(windows)]
+        if self.reference.is_none() && !cfg!(test) && self.nvme_rx.is_none() {
+            if let Some(candidate) = self.selected_ssd_candidate() {
+                let disk = candidate.disk.clone();
+                let identity = identity.to_string();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let captured_at = local_iso(sysinfo::local_time());
+                    let health = nvme_health::collect(
+                        &nvme_health::windows_source::WindowsNvmeReader,
+                        &disk,
+                        &captured_at,
+                    );
+                    let _ = tx.send(ProbeMsg::Health(health));
+                    let events = storage_health::collect_events("powershell.exe");
+                    let _ = tx.send(ProbeMsg::Events(identity, events));
+                });
+                self.nvme_rx = Some(rx);
+                return true;
+            }
+        }
+        let _ = identity;
+        false
+    }
+
+    fn poll_nvme_health(&mut self) {
+        let Some(rx) = &self.nvme_rx else {
+            return;
+        };
+        let mut msgs = Vec::new();
+        let mut done = false;
+        loop {
+            match rx.try_recv() {
+                Ok(m) => msgs.push(m),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.nvme_rx = None;
+            // A probe thread that ended early never leaves an assessment
+            // waiting forever: missing inputs become "not collected".
+            let open: Vec<String> = self
+                .assessments
+                .iter()
+                .filter(|(_, a)| a.health_pending || a.events_pending)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for m in msgs.drain(..) {
+                self.accept_probe_msg(m);
+            }
+            for id in open {
+                if let Some(a) = self.assessments.get_mut(&id) {
+                    a.health_pending = false;
+                    a.events_pending = false;
+                }
+                self.finalize_assessment(&id);
+            }
+            return;
+        }
+        for m in msgs {
+            self.accept_probe_msg(m);
+        }
+    }
+
+    fn accept_probe_msg(&mut self, m: ProbeMsg) {
+        match m {
+            ProbeMsg::Health(h) => self.accept_nvme_health(h),
+            ProbeMsg::Events(id, events) => self.accept_storage_events(&id, events),
+        }
+    }
+
+    /// Stores a health record under its physical identity and adds its
+    /// evidence (`NVMe_Health_<stamp>_PD<n>.json`) to the session package.
+    fn accept_nvme_health(&mut self, health: nvme_health::NvmeHealth) {
+        let name = nvme_health::evidence_file_name(
+            &evidence_stamp(sysinfo::local_time()),
+            health.disk_index,
+        );
+        let file = EvidenceFile::new(&name, nvme_health::to_json(&health).into_bytes());
+        let d = i18n::t(self.language);
+        push_journal(
+            &mut self.journal,
+            d.journal_nvme_health_fmt
+                .replace("{disk}", &format!("PhysicalDrive{}", health.disk_index))
+                .replace("{status}", health.status.as_str()),
+        );
+        let identity = health.physical_identity.clone();
+        self.nvme_health.insert(identity.clone(), health);
+        self.contribute_evidence(d.nvme_module_name, vec![file]);
+        if let Some(a) = self.assessments.get_mut(&identity) {
+            a.health_pending = false;
+            a.health_file = Some(name);
+        }
+        self.finalize_assessment(&identity);
+    }
+
+    fn accept_storage_events(&mut self, identity: &str, events: storage_health::EventsInput) {
+        if let Some(a) = self.assessments.get_mut(identity) {
+            a.events = events;
+            a.events_pending = false;
+        }
+        self.finalize_assessment(identity);
+    }
+
+    /// Health record of the currently selected physical disk, if read.
+    fn selected_nvme_health(&self) -> Option<&nvme_health::NvmeHealth> {
+        let candidate = self.selected_ssd_candidate()?;
+        self.nvme_health
+            .get(&storage_topology::physical_disk_identity(&candidate.disk))
+    }
+
+    /// Storage assessment of the currently selected physical disk.
+    fn selected_assessment(&self) -> Option<&StorageAssessment> {
+        let candidate = self.selected_ssd_candidate()?;
+        self.assessments
+            .get(&storage_topology::physical_disk_identity(&candidate.disk))
     }
 
     /// Adds evidence to the session package (UI-thread modules) and
@@ -1458,6 +2337,7 @@ impl WinStateDiagApp {
         self.journal.clear_view();
         self.expc_tracker.reset();
         self.deep_check_results.clear();
+        self.expc_checks.clear();
         self.session_started = Some(Instant::now());
         self.stopped_elapsed = None;
         self.ring_smoothed = 0.0;
@@ -1499,6 +2379,7 @@ impl WinStateDiagApp {
                         push_journal(&mut self.journal, line);
                     }
                     EngineEvent::DeepChecks(outcomes) => deep = Some(outcomes),
+                    EngineEvent::ExpcChecks(checks) => self.expc_checks = checks,
                     EngineEvent::DriverAudit(result) => {
                         // Keep the earlier result if the in-session run failed.
                         match result {
@@ -1611,6 +2492,7 @@ impl WinStateDiagApp {
     fn finalize_report_if_idle(&mut self) {
         let busy = self.is_running()
             || self.benchmark_is_running()
+            || self.nvme_rx.is_some()
             || !matches!(self.hardware, HardwareViewState::Idle)
             || matches!(self.driver_audit, DriverAuditState::Running(_));
         if busy
@@ -2148,6 +3030,18 @@ impl WinStateDiagApp {
             BenchmarkUiState::Idle => SsdVm::Idle,
             BenchmarkUiState::Cancelled => SsdVm::Cancelled,
             BenchmarkUiState::Failed(msg) => SsdVm::Failed(msg.clone()),
+            BenchmarkUiState::RetestWaiting { until, result, .. } => {
+                let left = until.saturating_duration_since(Instant::now()).as_secs();
+                SsdVm::Running {
+                    fraction: 0.0,
+                    status: d.ssd_retest_waiting_fmt.replace("{s}", &left.to_string()),
+                    elapsed: String::new(),
+                    note: Some([
+                        d.ssd_retest_note_fmt.replace("{first}", &run_brief(result)),
+                        d.ssd_unstable_rule_note.to_string(),
+                    ]),
+                }
+            }
             BenchmarkUiState::Running {
                 progress, started, ..
             } => {
@@ -2163,10 +3057,24 @@ impl WinStateDiagApp {
                     ),
                     DiagnosticProgress::Complete => (1.0, d.ssd_finishing.to_string()),
                 };
+                // The automatic retest says so (with the kept first run)
+                // in the note lines; the status line stays the pass.
+                let note = self
+                    .retest_identity
+                    .as_ref()
+                    .and_then(|id| self.assessments.get(id))
+                    .map(|a| {
+                        [
+                            d.ssd_retest_note_fmt
+                                .replace("{first}", &run_brief(&a.first)),
+                            d.ssd_unstable_rule_note.to_string(),
+                        ]
+                    });
                 SsdVm::Running {
                     fraction,
                     status,
                     elapsed: format!("{:.1} s", started.elapsed().as_secs_f64()),
+                    note,
                 }
             }
             BenchmarkUiState::Done {
@@ -2179,7 +3087,34 @@ impl WinStateDiagApp {
                 let read_level = stability_level(result.read_variation_percent);
                 let write_level = stability_level(result.write_variation_percent);
                 let overall = read_level.max(write_level);
+                // v0.4.2: the storage correlation decides the status colour
+                // (never a raw counter); the first UNSTABLE run of a retest
+                // stays visible in the note.
+                let assessment = self.selected_assessment();
+                let ru = self.language == Language::Ru;
+                let status = assessment
+                    .and_then(|a| a.classification.as_ref())
+                    .map(|c| (c.state.short(ru).to_string(), storage_tone(c.state)));
+                let note = assessment
+                    .filter(|a| a.retest != storage_health::RetestOutcome::NotNeeded)
+                    .map(|a| {
+                        let second = match (&a.second, &a.retest) {
+                            (Some(r), _) => run_brief(r),
+                            (None, storage_health::RetestOutcome::Pending) => {
+                                d.ssd_retest_pending.to_string()
+                            }
+                            _ => d.ssd_retest_not_run.to_string(),
+                        };
+                        [
+                            d.ssd_runs_note_fmt
+                                .replace("{first}", &run_brief(&a.first))
+                                .replace("{second}", &second),
+                            d.ssd_unstable_rule_note.to_string(),
+                        ]
+                    });
                 SsdVm::Done {
+                    status,
+                    note,
                     read_current: mb(result.summary_read_mib_s),
                     read_previous: previous.as_ref().map(|p| mb(p.read_mib_s)),
                     read_delta: previous.as_ref().and_then(|p| {
@@ -2344,6 +3279,7 @@ impl WinStateDiagApp {
                 self.state = RunState::Idle;
                 self.expc_tracker.reset();
                 self.deep_check_results.clear();
+                self.expc_checks.clear();
                 self.session_started = None;
                 self.ring_smoothed = 0.0;
                 self.deep_check_smoothed = [0.0; 14];
@@ -2354,6 +3290,12 @@ impl WinStateDiagApp {
             Action::BenchmarkCancel => {
                 if let BenchmarkUiState::Running { cancel, .. } = &self.benchmark_state {
                     cancel.store(true, Ordering::Relaxed);
+                } else if let BenchmarkUiState::RetestWaiting { identity, .. } =
+                    &self.benchmark_state
+                {
+                    // Stop during the idle: no retest, first result kept.
+                    let id = identity.clone();
+                    self.end_retest(&id, storage_health::RetestOutcome::Cancelled);
                 }
             }
             Action::Stop => self.request_stop(),
@@ -2379,6 +3321,7 @@ impl WinStateDiagApp {
             Action::OpenJournal => self.journal_viewer_open = true,
             Action::ShowRawPasses => self.raw_passes_open = true,
             Action::ShowDrivers => self.drivers_open = true,
+            Action::ShowExpcDetails => self.expc_details_open = true,
         }
     }
 
@@ -2453,8 +3396,11 @@ impl WinStateDiagApp {
         }
         let mut open = self.drivers_open;
         let mut rerun = false;
+        let mut export: Option<ExportAction> = None;
         let d = i18n::t(self.language);
+        let export_status = self.driver_export_status.as_ref().map(|s| s.text(d));
         egui::Window::new(d.driver_details_title)
+            .id(egui::Id::new("wsd_driver_details"))
             .open(&mut open)
             .default_size(vec2(760.0, 560.0))
             .collapsible(false)
@@ -2467,20 +3413,13 @@ impl WinStateDiagApp {
                     rerun = ui.button(d.driver_popup_retry).clicked();
                 }
                 DriverAuditState::Done(report) => {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            d.driver_popup_summary_fmt
-                                .replace("{status}", driver_status_label(d, report.overall))
-                                .replace("{problems}", &report.count(Severity::Problem).to_string())
-                                .replace("{warnings}", &report.count(Severity::Warning).to_string())
-                                .replace("{ok}", &report.count(Severity::Ok).to_string())
-                                .replace("{devices}", &report.devices_scanned.to_string())
-                                .replace("{days}", &report.window_days.to_string())
-                                .replace("{generated}", &report.generated),
-                        );
-                    });
-                    ui.label(egui::RichText::new(d.driver_popup_note).color(c::TEXT_MUTED));
-                    rerun = ui.button(d.driver_popup_rerun).clicked();
+                    // v0.4.1 summary header: application UI, not a log line
+                    // (no date/time); the rule text lives in the Info tip.
+                    let (header_rerun, header_export) =
+                        driver_summary_header(ui, d, report, export_status.as_ref());
+                    rerun = header_rerun;
+                    export = header_export;
+                    ui.add_space(4.0);
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (n, it) in report.items.iter().enumerate() {
@@ -2603,8 +3542,224 @@ impl WinStateDiagApp {
                 }
             });
         self.drivers_open = open;
+        if let Some(action) = export {
+            self.driver_issues_export(ctx, action);
+        }
         if rerun && !matches!(self.driver_audit, DriverAuditState::Running(_)) {
-            self.driver_audit = start_driver_audit();
+            self.driver_export_status = None;
+            // Unchanged re-check; unit tests never start the collector.
+            #[cfg(not(test))]
+            {
+                self.driver_audit = start_driver_audit();
+            }
+            #[cfg(test)]
+            {
+                self.driver_rerun_requests += 1;
+            }
+        }
+    }
+
+    /// The canonical Driver Check issues text of the current audit.
+    fn driver_issues_text(&self) -> Option<String> {
+        let DriverAuditState::Done(report) = &self.driver_audit else {
+            return None;
+        };
+        let d = i18n::t(self.language);
+        Some(details::driver_issues_text(report, d, &|l| {
+            localized_driver_label(d, l)
+        }))
+    }
+
+    /// Copy issues / Save issues: one text, two destinations. Save goes to
+    /// `Reports\Logs` (never a ZIP-only report folder); failures are shown
+    /// and journaled, never fatal.
+    fn driver_issues_export(&mut self, ctx: &egui::Context, action: ExportAction) {
+        let Some(text) = self.driver_issues_text() else {
+            return;
+        };
+        self.driver_export_status = Some(self.export_text(ctx, action, "DriverIssues", &text));
+    }
+
+    fn export_text(
+        &mut self,
+        ctx: &egui::Context,
+        action: ExportAction,
+        kind: &str,
+        text: &str,
+    ) -> ExportStatus {
+        let d = i18n::t(self.language);
+        match action {
+            ExportAction::Copy => {
+                ctx.copy_text(text.to_string());
+                ExportStatus::Copied
+            }
+            ExportAction::Save => {
+                let name = details::export_file_name(kind, sysinfo::local_time());
+                let dir = journal_logs_dir(&self.reports_root);
+                match save_journal_text(&dir, &name, text) {
+                    Ok(path) => {
+                        let line = format!("{}: {}", d.export_saved, path.display());
+                        push_journal(&mut self.journal, line);
+                        ExportStatus::Saved(path)
+                    }
+                    Err(err) => {
+                        let line = format!("[ERROR] {}: {err}", d.export_save_failed);
+                        push_journal(&mut self.journal, line);
+                        ExportStatus::Failed(err)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-step execution state for the EXPC details window.
+    fn expc_step_progress(&self) -> Vec<details::StepProgress> {
+        use details::StepProgress as P;
+        self.expc_tracker
+            .status
+            .iter()
+            .map(|s| match (&self.state, s) {
+                (RunState::Idle, _) => P::Waiting,
+                (RunState::Cancelled { .. }, SubStageStatus::Running) => P::Waiting,
+                (_, SubStageStatus::Pending) => P::Waiting,
+                (_, SubStageStatus::Running) => P::Running,
+                (_, SubStageStatus::Done) => P::Done,
+                (_, SubStageStatus::Skipped) => P::Skipped,
+                (_, SubStageStatus::Error) => P::Failed,
+            })
+            .collect()
+    }
+
+    fn expc_stage_details(&self) -> Vec<details::StageDetail> {
+        // EXPC evidence (its JSON/TXT) exists once the run left the EXPC
+        // stage; before that, completed steps show "result pending".
+        let evidence_ready = !self.expc_checks.is_empty()
+            || !self.deep_check_results.is_empty()
+            || !self.is_running();
+        details::build_stage_details(
+            &self.expc_step_progress(),
+            evidence_ready,
+            &self.expc_checks,
+            &self.deep_check_results,
+        )
+    }
+
+    /// v0.4.1: EXPC diagnostic results — explanation of the 14 steps
+    /// (dashboard = status, this window = explanation, ZIP = evidence).
+    fn expc_details_window(&mut self, ctx: &egui::Context) {
+        if !self.expc_details_open {
+            return;
+        }
+        let d = i18n::t(self.language);
+        let entries = self.expc_stage_details();
+        let never_ran = matches!(self.state, RunState::Idle)
+            && entries
+                .iter()
+                .all(|e| e.state == details::StageState::Waiting);
+        let counts = details::expc_counts(&entries);
+        let drive = system_drive();
+        let status = self.expc_export_status.as_ref().map(|s| s.text(d));
+        let mut open = true;
+        let mut action: Option<ExportAction> = None;
+        let mut close = false;
+        let mut copy_command: Option<String> = None;
+        let screen = ctx.content_rect();
+        egui::Window::new(d.expc_details_title)
+            .id(egui::Id::new("wsd_expc_details"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .constrain(true)
+            .default_size(vec2(
+                620.0_f32.min(screen.width()),
+                600.0_f32.min(screen.height()),
+            ))
+            .min_size(vec2(380.0, 260.0))
+            .show(ctx, |ui| {
+                details::section_title(ui, d.expc_details_summary);
+                ui.horizontal_wrapped(|ui| {
+                    details::counter_chip(
+                        ui,
+                        d.expc_sum_problems,
+                        &counts.problems.to_string(),
+                        c::DRIVER_STATUS_PROBLEM_TEXT,
+                    );
+                    details::counter_chip(
+                        ui,
+                        d.expc_sum_attention,
+                        &counts.attention.to_string(),
+                        c::YELLOW_WARNING,
+                    );
+                    details::counter_chip(
+                        ui,
+                        d.expc_sum_ok,
+                        &counts.ok.to_string(),
+                        c::GREEN_SUCCESS,
+                    );
+                    details::counter_chip(
+                        ui,
+                        d.expc_sum_info,
+                        &counts.info.to_string(),
+                        c::BLUE_STATUS,
+                    );
+                    details::counter_chip(
+                        ui,
+                        d.expc_sum_skipped,
+                        &counts.skipped.to_string(),
+                        c::TEXT_MUTED,
+                    );
+                    if counts.other > 0 {
+                        details::counter_chip(
+                            ui,
+                            d.expc_sum_other,
+                            &counts.other.to_string(),
+                            c::TEXT_SECONDARY,
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                let footer = if status.is_some() { 70.0 } else { 46.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_expc_details_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - footer).max(80.0))
+                    .show(ui, |ui| {
+                        if never_ran {
+                            ui.label(RichText::new(d.expc_not_started).color(c::TEXT_MUTED));
+                            return;
+                        }
+                        for det in details::findings_first(&entries) {
+                            expc_stage_card(ui, d, det, &drive, &mut copy_command);
+                        }
+                    });
+                ui.separator();
+                if let Some((text, color)) = &status {
+                    ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Right-to-left: shown as [Copy] [Save] [Close].
+                    if details::secondary_button(ui, d.journal_viewer_close, true).clicked() {
+                        close = true;
+                    }
+                    if details::secondary_button(ui, d.journal_viewer_save, !never_ran).clicked() {
+                        action = Some(ExportAction::Save);
+                    }
+                    if details::secondary_button(ui, d.journal_viewer_copy, !never_ran).clicked() {
+                        action = Some(ExportAction::Copy);
+                    }
+                });
+            });
+        if let Some(cmd) = copy_command {
+            ctx.copy_text(cmd);
+            self.expc_export_status = Some(ExportStatus::Copied);
+        }
+        if let Some(action) = action {
+            let text = details::expc_details_text(&entries, d, &drive);
+            self.expc_export_status = Some(self.export_text(ctx, action, "EXPC_Results", &text));
+        }
+        if !open || close {
+            self.expc_details_open = false;
+            self.expc_export_status = None;
         }
     }
 
@@ -2617,52 +3772,77 @@ impl WinStateDiagApp {
             return;
         };
         let mut open = self.raw_passes_open;
-        let raw_passes_title = i18n::t(self.language).ssd_raw_passes_title;
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let health = self.selected_nvme_health();
+        let assessment = self.selected_assessment();
+        let raw_passes_title = d.ssd_raw_passes_title;
         egui::Window::new(raw_passes_title)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                egui::Grid::new("benchmark_raw_passes")
-                    .striped(true)
-                    .spacing(vec2(12.0, 6.0))
-                    .show(ui, |ui| {
-                        for heading in [
-                            "PASS", "READ", "WRITE", "R IOPS", "W IOPS", "R LAT", "W LAT",
-                            "R TIME", "W TIME",
-                        ] {
-                            ui.label(
-                                egui::RichText::new(heading)
-                                    .strong()
-                                    .color(c::TEXT_SECONDARY),
-                            );
-                        }
-                        ui.end_row();
-                        for pass in &result.raw_passes {
-                            ui.label(pass.pass_number.to_string());
-                            ui.label(format!(
-                                "{:.1} MB/s",
-                                pass.run.read.mb_per_second * 1.048576
-                            ));
-                            ui.label(format!(
-                                "{:.1} MB/s",
-                                pass.run.write.mb_per_second * 1.048576
-                            ));
-                            ui.label(format!("{:.0}", pass.run.read.iops));
-                            ui.label(format!("{:.0}", pass.run.write.iops));
-                            ui.label(format!(
-                                "{:.3} ms",
-                                pass.run.read.average_latency.as_secs_f64() * 1000.0
-                            ));
-                            ui.label(format!(
-                                "{:.3} ms",
-                                pass.run.write.average_latency.as_secs_f64() * 1000.0
-                            ));
-                            ui.label(format!("{:.3} s", pass.run.read.elapsed.as_secs_f64()));
-                            ui.label(format!("{:.3} s", pass.run.write.elapsed.as_secs_f64()));
-                            ui.end_row();
-                        }
-                    });
+                // v0.4.2: with an automatic retest both runs are
+                // shown — the first UNSTABLE run never disappears.
+                let retested = assessment.and_then(|a| a.second.as_ref().map(|_| a));
+                if let Some(a) = retested {
+                    section_title(
+                        ui,
+                        &format!("{} — {}", d.ssd_retest_run_title, run_brief_long(result)),
+                    );
+                    pass_grid(ui, "benchmark_raw_passes", result);
+                    ui.add_space(6.0);
+                    section_title(
+                        ui,
+                        &format!("{} — {}", d.ssd_first_run_title, run_brief_long(&a.first)),
+                    );
+                    pass_grid(ui, "benchmark_first_run_passes", &a.first);
+                } else {
+                    pass_grid(ui, "benchmark_raw_passes", result);
+                }
+                // Storage correlation: state colour comes from here.
+                if let Some(c) = assessment.and_then(|a| a.classification.as_ref()) {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    section_title(ui, d.storage_assessment_title);
+                    ui.label(egui::RichText::new(c.state.text(ru)).strong().color(
+                        match storage_tone(c.state) {
+                            Tone::Success => c::GREEN_SUCCESS,
+                            Tone::Warning => c::YELLOW_WARNING,
+                            Tone::Error => c::RED_ERROR,
+                            _ => c::TEXT_PRIMARY,
+                        },
+                    ));
+                    for f in &c.findings {
+                        ui.label(
+                            egui::RichText::new(format!("• {}", f.text(ru)))
+                                .small()
+                                .color(c::TEXT_SECONDARY),
+                        );
+                    }
+                }
+                // Native NVMe Health: facts for the SAME physical
+                // disk, uncoloured — no verdict from a counter.
+                if let Some(health) = health {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    section_title(ui, d.nvme_health_title);
+                    egui::Grid::new("nvme_health_facts")
+                        .striped(true)
+                        .spacing(vec2(12.0, 4.0))
+                        .show(ui, |ui| {
+                            for (label, value) in nvme_health_rows(health, d) {
+                                ui.label(label);
+                                ui.label(value);
+                                ui.end_row();
+                            }
+                        });
+                    ui.label(
+                        egui::RichText::new(d.nvme_health_note)
+                            .small()
+                            .color(c::TEXT_SECONDARY),
+                    );
+                }
             });
         self.raw_passes_open = open;
     }
@@ -2804,6 +3984,8 @@ impl eframe::App for WinStateDiagApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_engine();
         self.poll_benchmark();
+        self.poll_nvme_health();
+        self.poll_retest();
         self.poll_driver_audit();
         self.poll_hardware();
         self.poll_crypto();
@@ -2814,6 +3996,7 @@ impl eframe::App for WinStateDiagApp {
             || self.crypto_rx.is_some()
             || matches!(self.hardware, HardwareViewState::Collecting { .. })
             || self.benchmark_is_running()
+            || self.nvme_rx.is_some()
             || matches!(self.driver_audit, DriverAuditState::Running(_))
         {
             ctx.request_repaint();
@@ -2891,6 +4074,7 @@ impl eframe::App for WinStateDiagApp {
         self.raw_passes_window(&ctx);
         self.drivers_window(&ctx);
         self.journal_window(&ctx);
+        self.expc_details_window(&ctx);
         self.hardware_progress_window(&ctx);
     }
 }
@@ -3496,6 +4680,7 @@ mod multi_ssd_ui_tests {
                 write_previous,
                 write_delta,
                 meta,
+                ..
             } => {
                 let mut v = vec![
                     read_current,
@@ -5015,5 +6200,1243 @@ mod v040_tests {
         app.finalize_report_if_idle();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+}
+
+/// v0.4.1: Driver Check summary/actions/export and the EXPC details window.
+#[cfg(test)]
+mod v041_tests {
+    use super::*;
+    use crate::deep_checks::ResultSource;
+    use crate::ui::tokens::{CANVAS_ORIGIN_IN_MASTER, layout as l};
+
+    fn app_in(tag: &str) -> (WinStateDiagApp, PathBuf) {
+        let exe = std::env::temp_dir()
+            .join(format!("wsd-v041-{tag}-{}", std::process::id()))
+            .join("WinStateDiag");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        std::fs::create_dir_all(&exe).unwrap();
+        let mut app = WinStateDiagApp::default();
+        app.reports_root = exe.join("Reports");
+        app.language_pref_dir = exe.clone();
+        app.language = Language::Ru;
+        app.package = Arc::new(Mutex::new(SessionPackage::new(exe.join("Reports"), None)));
+        app.driver_audit = DriverAuditState::Done(Box::new(details::tests::report()));
+        (app, exe)
+    }
+
+    struct Frame {
+        texts: Vec<(String, Rect)>,
+        copied: Vec<String>,
+    }
+
+    fn run(ctx: &egui::Context, events: Vec<egui::Event>, f: impl FnMut(&mut egui::Ui)) -> Frame {
+        run_at(ctx, events, None, f)
+    }
+
+    fn run_at(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+        f: impl FnMut(&mut egui::Ui),
+    ) -> Frame {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1400.0, 1200.0))),
+            events,
+            time,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, f);
+        out.textures_delta.clear();
+        fn walk(shape: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => acc.push((
+                    t.galley.text().to_string(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut texts);
+        }
+        let copied = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        Frame { texts, copied }
+    }
+
+    fn click(at: egui::Pos2) -> Vec<Vec<egui::Event>> {
+        let b = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![
+            vec![egui::Event::PointerMoved(at)],
+            vec![b(true)],
+            vec![b(false)],
+            vec![],
+        ]
+    }
+
+    fn has(f: &Frame, t: &str) -> bool {
+        f.texts.iter().any(|(x, _)| x == t)
+    }
+
+    fn find(f: &Frame, t: &str) -> Rect {
+        f.texts
+            .iter()
+            .find(|(x, _)| x == t)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("{t} not drawn"))
+    }
+
+    fn render_drivers(app: &mut WinStateDiagApp, ctx: &egui::Context) -> Frame {
+        let mut last = run(ctx, vec![], |ui| app.drivers_window(ui.ctx()));
+        for _ in 0..2 {
+            last = run(ctx, vec![], |ui| app.drivers_window(ui.ctx()));
+        }
+        last
+    }
+
+    #[test]
+    fn driver_header_shows_counters_not_a_log_line() {
+        for (lang, d) in [(Language::Ru, &i18n::RU), (Language::En, &i18n::EN)] {
+            let (mut app, exe) = app_in("hdr");
+            app.language = lang;
+            app.drivers_open = true;
+            let ctx = egui::Context::default();
+            let f = render_drivers(&mut app, &ctx);
+            for label in [
+                d.driver_summary_title,
+                d.driver_sum_problems,
+                d.driver_sum_warnings,
+                d.driver_sum_ok,
+                d.driver_sum_devices,
+                d.driver_sum_events,
+                d.driver_sum_info,
+                d.driver_action_rerun,
+                d.driver_copy_issues,
+                d.driver_save_issues,
+            ] {
+                assert!(has(&f, label), "{lang:?}: {label}");
+            }
+            // Actual runtime values of the report.
+            for v in ["1", "159", "11", "i"] {
+                assert!(has(&f, v), "{v}");
+            }
+            // No old technical summary line, no date/time in the header.
+            assert!(
+                !f.texts
+                    .iter()
+                    .any(|(t, _)| t.contains("10:11:12") || t.contains("2026-09-30"))
+            );
+            assert!(
+                !f.texts
+                    .iter()
+                    .any(|(t, _)| t.starts_with("Итог:") || t.starts_with("Summary:"))
+            );
+            // The driver list below is preserved.
+            assert!(f.texts.iter().any(|(t, _)| t.contains("BadDev")));
+            // Run again is the primary, larger button.
+            let run_again = find(&f, d.driver_action_rerun);
+            let copy = find(&f, d.driver_copy_issues);
+            assert!(run_again.center().y <= copy.center().y + 2.0);
+            let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn info_tooltip_text_is_localized() {
+        assert_eq!(
+            i18n::RU.driver_info_tooltip,
+            "Статус ставится только по конкретным признакам (ошибка PnP, сбой в модуле драйвера, Code Integrity, отказ загрузки)."
+        );
+        assert_eq!(
+            i18n::RU.driver_info_tooltip_age,
+            "Возраст драйвера сам по себе не считается проблемой."
+        );
+        assert_eq!(
+            i18n::EN.driver_info_tooltip,
+            "Status is assigned only from specific evidence (PnP error, driver module failure, Code Integrity, or driver load failure)."
+        );
+        assert_eq!(
+            i18n::EN.driver_info_tooltip_age,
+            "Driver age by itself is not considered a problem."
+        );
+        // Shown on hover of the Info chip (dark, wrapped tooltip).
+        let (mut app, exe) = app_in("tip");
+        app.drivers_open = true;
+        let ctx = egui::Context::default();
+        let f = render_drivers(&mut app, &ctx);
+        let info = find(&f, "i").center();
+        let mut shown = false;
+        for i in 0..40 {
+            let events = if i == 0 {
+                vec![egui::Event::PointerMoved(info)]
+            } else {
+                vec![]
+            };
+            let f = run_at(&ctx, events, Some(10.0 + f64::from(i) * 0.1), |ui| {
+                app.drivers_window(ui.ctx())
+            });
+            if has(&f, i18n::RU.driver_info_tooltip) {
+                shown = true;
+                assert!(has(&f, i18n::RU.driver_info_tooltip_age));
+                break;
+            }
+        }
+        assert!(shown, "tooltip appears on hover");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn run_again_keeps_the_existing_recheck_behavior() {
+        let (mut app, exe) = app_in("rerun");
+        app.drivers_open = true;
+        app.driver_export_status = Some(ExportStatus::Copied);
+        let ctx = egui::Context::default();
+        let f = render_drivers(&mut app, &ctx);
+        let at = find(&f, i18n::RU.driver_action_rerun).center();
+        for ev in click(at) {
+            run(&ctx, ev, |ui| app.drivers_window(ui.ctx()));
+        }
+        assert_eq!(app.driver_rerun_requests, 1, "one re-check request");
+        assert!(app.driver_export_status.is_none());
+        assert!(app.drivers_open, "window stays open");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn copy_and_save_issues_use_the_same_canonical_text() {
+        let (mut app, exe) = app_in("export");
+        app.drivers_open = true;
+        let expected = app.driver_issues_text().unwrap();
+        assert!(expected.contains("BadDev") && expected.contains("WarnDev"));
+        assert!(!expected.contains("GoodDev"));
+        let ctx = egui::Context::default();
+        // Copy issues: clicked in the window → clipboard.
+        let f = render_drivers(&mut app, &ctx);
+        let at = find(&f, i18n::RU.driver_copy_issues).center();
+        let mut copied = Vec::new();
+        for ev in click(at) {
+            copied.extend(run(&ctx, ev, |ui| app.drivers_window(ui.ctx())).copied);
+        }
+        assert_eq!(copied, [expected.clone()]);
+        assert!(matches!(
+            app.driver_export_status,
+            Some(ExportStatus::Copied)
+        ));
+        // Save issues: same bytes (UTF-8 BOM) under Reports\Logs.
+        let f = render_drivers(&mut app, &ctx);
+        let at = find(&f, i18n::RU.driver_save_issues).center();
+        for ev in click(at) {
+            run(&ctx, ev, |ui| app.drivers_window(ui.ctx()));
+        }
+        let path = match &app.driver_export_status {
+            Some(ExportStatus::Saved(p)) => p.clone(),
+            other => panic!("saved: {other:?}"),
+        };
+        assert_eq!(path.parent().unwrap(), app.reports_root.join("Logs"));
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("WinStateDiag_DriverIssues_") && name.ends_with(".txt"));
+        assert_eq!(
+            name.len(),
+            "WinStateDiag_DriverIssues_YYYY-MM-DD_HH-MM-SS.txt".len()
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        assert_eq!(std::str::from_utf8(&bytes[3..]).unwrap(), expected);
+        // The saved path is shown and journaled; no report folder touched.
+        let f = render_drivers(&mut app, &ctx);
+        let shown = format!("{}: {}", i18n::RU.export_saved, path.display());
+        assert!(has(&f, &shown));
+        assert_eq!(app.journal.last().unwrap().message, shown);
+        let root: Vec<_> = std::fs::read_dir(&app.reports_root)
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(root.len(), 1, "only Reports\\Logs");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn save_issues_failure_is_reported_and_journaled() {
+        let (mut app, exe) = app_in("savefail");
+        std::fs::write(&app.reports_root, "a file, not a folder").unwrap();
+        let ctx = egui::Context::default();
+        run(&ctx, vec![], |ui| {
+            app.driver_issues_export(ui.ctx(), ExportAction::Save)
+        });
+        assert!(matches!(
+            app.driver_export_status,
+            Some(ExportStatus::Failed(_))
+        ));
+        assert!(
+            app.journal
+                .last()
+                .unwrap()
+                .message
+                .starts_with("[ERROR] Не удалось сохранить файл")
+        );
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    fn dashboard_frame(
+        app: &mut WinStateDiagApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> (Frame, Vec<Action>) {
+        let vm = app.build_vm(0.0, 0.0);
+        let mut actions = Vec::new();
+        let (mut client, mut mode, mut deep, mut hw, mut bench) = (
+            app.client_name.clone(),
+            app.mode,
+            app.deep_checks,
+            app.include_hardware,
+            app.benchmark_path.clone(),
+        );
+        let f = run(ctx, events, |ui| {
+            let mut controls = Controls {
+                client_name: &mut client,
+                mode: &mut mode,
+                deep_checks: &mut deep,
+                include_hardware: &mut hw,
+                benchmark_path: &mut bench,
+            };
+            dashboard::draw(ui, egui::Pos2::ZERO, &vm, &mut controls, &mut actions);
+        });
+        (f, actions)
+    }
+
+    #[test]
+    fn details_button_in_the_stages_card_opens_the_results_window() {
+        for (lang, d) in [(Language::Ru, &i18n::RU), (Language::En, &i18n::EN)] {
+            let (mut app, exe) = app_in("btn");
+            app.language = lang;
+            let ctx = egui::Context::default();
+            fonts::install(&ctx);
+            let (f, _) = dashboard_frame(&mut app, &ctx, vec![]);
+            let (f, _) = if has(&f, d.expc_details_button) {
+                (f, vec![])
+            } else {
+                dashboard_frame(&mut app, &ctx, vec![])
+            };
+            assert!(has(&f, d.expc_details_button), "{lang:?}");
+            // Inside the stages card header, right of the title, above row 1.
+            let b = l::STAGES_DETAILS_BUTTON;
+            let card = l::STAGES_CARD;
+            assert!(b[0] + b[2] <= card[0] + card[2] - 12.0);
+            assert!(b[1] >= card[1] && b[1] + b[3] < l::STAGE_ROW_FIRST_Y);
+            let at = egui::pos2(
+                b[0] - CANVAS_ORIGIN_IN_MASTER[0] + b[2] / 2.0,
+                b[1] - CANVAS_ORIGIN_IN_MASTER[1] + b[3] / 2.0,
+            );
+            let mut all = Vec::new();
+            for ev in click(at) {
+                all.extend(dashboard_frame(&mut app, &ctx, ev).1);
+            }
+            assert!(
+                all.iter().any(|a| matches!(a, Action::ShowExpcDetails)),
+                "{all:?}"
+            );
+            assert!(
+                !all.iter()
+                    .any(|a| matches!(a, Action::Start | Action::Reset))
+            );
+            let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        }
+    }
+
+    fn finished_run(app: &mut WinStateDiagApp) {
+        for s in app.expc_tracker.status.iter_mut() {
+            *s = SubStageStatus::Done;
+        }
+        app.state = RunState::Done {
+            zip_path: PathBuf::from("x.zip"),
+        };
+        app.apply_deep_checks(vec![
+            DeepCheckOutcome {
+                check: DeepCheck::Sfc,
+                result: CheckResult::Ok,
+                detail: String::new(),
+                source: ResultSource::ExpcJson,
+            },
+            DeepCheckOutcome {
+                check: DeepCheck::Dism,
+                result: CheckResult::Attention,
+                detail: "The component store is repairable.".into(),
+                source: ResultSource::ExpcJson,
+            },
+        ]);
+        app.expc_checks = vec![deep_checks::ExpcCheck {
+            key: "Defender".into(),
+            status: "OK".into(),
+            detail: "всё включено".into(),
+        }];
+    }
+
+    fn render_expc(app: &mut WinStateDiagApp, ctx: &egui::Context) -> Frame {
+        let mut last = run(ctx, vec![], |ui| app.expc_details_window(ui.ctx()));
+        for _ in 0..2 {
+            last = run(ctx, vec![], |ui| app.expc_details_window(ui.ctx()));
+        }
+        last
+    }
+
+    #[test]
+    fn expc_details_window_explains_findings_in_ru_and_en() {
+        for (lang, d) in [(Language::Ru, &i18n::RU), (Language::En, &i18n::EN)] {
+            let (mut app, exe) = app_in("expc");
+            app.language = lang;
+            finished_run(&mut app);
+            app.apply(Action::ShowExpcDetails);
+            let ctx = egui::Context::default();
+            let f = render_expc(&mut app, &ctx);
+            for t in [
+                d.expc_details_title,
+                d.expc_details_summary,
+                d.expc_sum_problems,
+                d.expc_sum_attention,
+                d.expc_sum_ok,
+                d.expc_sum_skipped,
+                d.stage_short[11],
+                d.expc_state_labels[1],
+                d.deep_check_findings[1][1],
+                d.expc_suggested_action,
+                "DISM /Online /Cleanup-Image /RestoreHealth",
+                d.expc_not_executed,
+                d.expc_copy_command,
+                d.journal_viewer_copy,
+                d.journal_viewer_save,
+                d.journal_viewer_close,
+            ] {
+                assert!(has(&f, t), "{lang:?}: {t}");
+            }
+            assert!(has(
+                &f,
+                &format!(
+                    "{}: The component store is repairable.",
+                    d.expc_result_label
+                )
+            ));
+            // The DISM finding is listed before the OK steps.
+            assert!(find(&f, d.stage_short[11]).top() < find(&f, d.stage_short[9]).top());
+            let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn expc_details_copy_uses_actual_results_and_commands_stay_text() {
+        let (mut app, exe) = app_in("expccopy");
+        finished_run(&mut app);
+        app.apply(Action::ShowExpcDetails);
+        let ctx = egui::Context::default();
+        let f = render_expc(&mut app, &ctx);
+        let expected =
+            details::expc_details_text(&app.expc_stage_details(), &i18n::RU, &system_drive());
+        let at = find(&f, i18n::RU.journal_viewer_copy).center();
+        let mut copied = Vec::new();
+        for ev in click(at) {
+            copied.extend(run(&ctx, ev, |ui| app.expc_details_window(ui.ctx())).copied);
+        }
+        assert_eq!(copied, [expected.clone()]);
+        assert!(expected.contains("DISM /Online /Cleanup-Image /RestoreHealth"));
+        assert!(expected.contains("всё включено"));
+        // "Copy command" copies the command TEXT only.
+        let f = render_expc(&mut app, &ctx);
+        let at = find(&f, i18n::RU.expc_copy_command).center();
+        let mut copied = Vec::new();
+        for ev in click(at) {
+            copied.extend(run(&ctx, ev, |ui| app.expc_details_window(ui.ctx())).copied);
+        }
+        assert_eq!(
+            copied,
+            ["DISM /Online /Cleanup-Image /RestoreHealth".to_string()]
+        );
+        // No UI string offers to run / repair / fix anything.
+        for d in [&i18n::RU, &i18n::EN] {
+            for word in [
+                "Исправить",
+                "Выполнить команду",
+                "Восстановить",
+                "Repair",
+                "Fix",
+                "Execute",
+                "Run command",
+            ] {
+                assert!(!format!("{d:?}").contains(word), "{word}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn opening_and_closing_details_keeps_the_diagnostic_state() {
+        let (mut app, exe) = app_in("state");
+        finished_run(&mut app);
+        let before_rows: Vec<(RowState, Option<StageFinding>, String)> = app
+            .build_vm(0.0, 0.0)
+            .stages
+            .iter()
+            .map(|r| (r.state, r.finding, r.right_text.clone()))
+            .collect();
+        let journal = app.journal.len();
+        app.apply(Action::ShowExpcDetails);
+        let ctx = egui::Context::default();
+        let f = render_expc(&mut app, &ctx);
+        let at = find(&f, i18n::RU.journal_viewer_close).center();
+        for ev in click(at) {
+            run(&ctx, ev, |ui| app.expc_details_window(ui.ctx()));
+        }
+        assert!(!app.expc_details_open);
+        assert!(matches!(app.state, RunState::Done { .. }));
+        assert_eq!(app.deep_check_results.len(), 2);
+        assert_eq!(app.expc_checks.len(), 1);
+        assert_eq!(app.journal.len(), journal);
+        let after: Vec<(RowState, Option<StageFinding>, String)> = app
+            .build_vm(0.0, 0.0)
+            .stages
+            .iter()
+            .map(|r| (r.state, r.finding, r.right_text.clone()))
+            .collect();
+        assert_eq!(before_rows, after);
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn running_session_shows_only_available_information() {
+        let (mut app, exe) = app_in("live");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.state = RunState::Running {
+            stage: Stage::SystemDiagnostics,
+            step_done: 20,
+            step_total: 100,
+            stage_message: String::new(),
+            rx,
+        };
+        app.expc_tracker.status[0] = SubStageStatus::Done;
+        app.expc_tracker.status[1] = SubStageStatus::Running;
+        let det = app.expc_stage_details();
+        assert_eq!(det[0].state, details::StageState::Completed);
+        assert!(det[0].pending);
+        assert_eq!(det[1].state, details::StageState::Running);
+        assert!(
+            det[2..]
+                .iter()
+                .all(|d| d.state == details::StageState::Waiting)
+        );
+        assert!(
+            det.iter()
+                .all(|d| d.findings.is_empty() && d.deep.is_none())
+        );
+        // Never ran at all: the window says so.
+        let (mut idle, exe2) = app_in("idle");
+        idle.apply(Action::ShowExpcDetails);
+        let ctx = egui::Context::default();
+        let f = render_expc(&mut idle, &ctx);
+        assert!(has(&f, i18n::RU.expc_not_started));
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        let _ = std::fs::remove_dir_all(exe2.parent().unwrap());
+    }
+}
+
+/// Native NVMe Health (experimental phase): identity binding, evidence and
+/// the facts-only Details section. The benchmark itself is untouched.
+#[cfg(test)]
+mod nvme_health_tests {
+    use super::*;
+    use crate::nvme_health::tests::{disk, smart_bytes};
+    use crate::nvme_health::{LogRead, NvmeLogSource, ProbeError, ProbeStatus, collect};
+    use crate::report_package::read_zip;
+    use crate::storage_benchmark::{BenchmarkRun, DiagnosticPass, IoMeasurement};
+    use crate::storage_topology::{DiskCandidate, VolumeInfo};
+
+    struct Src(Result<Vec<u8>, ProbeError>);
+    impl NvmeLogSource for Src {
+        fn read_log_page(&self, _: u32, lid: u8, _: usize) -> Result<LogRead, ProbeError> {
+            if lid == crate::nvme_health::LID_SMART_HEALTH {
+                self.0.clone().map(|data| LogRead {
+                    data,
+                    via: "StorageDeviceProtocolSpecificProperty",
+                })
+            } else {
+                Ok(LogRead {
+                    data: vec![0u8; 1024],
+                    via: "StorageDeviceProtocolSpecificProperty",
+                })
+            }
+        }
+    }
+
+    fn cand(index: u32, model: &str, serial: &str, letter: &str, system: bool) -> DiskCandidate {
+        DiskCandidate {
+            disk: disk(index, model, serial, "NVMe"),
+            is_system: system,
+            volume: Some(VolumeInfo {
+                mount_point: letter.into(),
+                physical_disk_index: index,
+                writable: true,
+                label: String::new(),
+            }),
+            label: model.into(),
+        }
+    }
+
+    fn app(tag: &str) -> (WinStateDiagApp, PathBuf) {
+        let exe = std::env::temp_dir()
+            .join(format!("wsd-nvme-{tag}-{}", std::process::id()))
+            .join("WinStateDiag");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        std::fs::create_dir_all(&exe).unwrap();
+        let mut app = WinStateDiagApp::default();
+        app.client_name = "Алексей".into();
+        app.computer_name = "MSI".into();
+        app.reports_root = exe.join("Reports");
+        app.language = Language::En;
+        app.package = Arc::new(Mutex::new(SessionPackage::new(exe.join("Reports"), None)));
+        app.ssd_candidates = vec![
+            cand(1, "Samsung SSD 9100 PRO 2TB", "S7XXNOTREAL", "C:\\", true),
+            cand(0, "Netac NVMe SSD 1TB", "", "D:\\", false),
+        ];
+        app.ssd_selected = 0;
+        (app, exe)
+    }
+
+    fn summary() -> StorageDiagnosticSummary {
+        let m = |mb: f64| IoMeasurement {
+            bytes: 0,
+            operations: 0,
+            elapsed: Duration::from_secs(1),
+            mb_per_second: mb,
+            iops: 0.0,
+            average_latency: Duration::from_millis(1),
+        };
+        StorageDiagnosticSummary {
+            profile: crate::storage_benchmark::StorageDiagnosticProfile {
+                block_size: 1024 * 1024,
+                queue_depth: 4,
+                test_file_size: 512 * 1024 * 1024,
+                pass_count: 1,
+                stable_spread_limit_percent: 10.0,
+            },
+            preparation_method: "test",
+            preparation_elapsed: Duration::from_secs(0),
+            summary_read_mib_s: 500.0,
+            summary_write_mib_s: 400.0,
+            read_min_mib_s: 480.0,
+            read_max_mib_s: 520.0,
+            write_min_mib_s: 380.0,
+            write_max_mib_s: 420.0,
+            read_variation_percent: 2.0,
+            write_variation_percent: 3.0,
+            stable: true,
+            raw_passes: vec![DiagnosticPass {
+                pass_number: 1,
+                run: BenchmarkRun {
+                    block_size: 1024 * 1024,
+                    read: m(500.0),
+                    write: m(400.0),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn health_binds_to_the_benchmark_identity_and_joins_the_package() {
+        let (mut app, exe) = app("bind");
+        let samsung = app.ssd_candidates[0].disk.clone();
+        let health = collect(&Src(Ok(smart_bytes())), &samsung, "2026-10-03T12:00:00");
+        // Same key as the benchmark/history (never a drive letter).
+        let bench_identity = ssd_history::disk_identity_with_physical(
+            Path::new("C:\\"),
+            Some(storage_topology::physical_disk_identity(&samsung).as_str()),
+        );
+        assert_eq!(health.physical_identity, bench_identity);
+        assert!(!health.physical_identity.contains("C:"));
+        app.accept_nvme_health(health);
+        assert!(app.selected_nvme_health().is_some());
+        // The other physical disk never inherits this record.
+        app.ssd_selected = 1;
+        assert!(app.selected_nvme_health().is_none());
+
+        let zip = report_package::lock(&app.package).final_zip().unwrap();
+        let names: Vec<String> = read_zip(&zip)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        let file = names
+            .iter()
+            .find(|n| n.starts_with("NVMe_Health_") && n.ends_with("_PD1.json"))
+            .expect("health evidence in the package");
+        assert!(names.contains(&"manifest.json".to_string()));
+        let manifest = read_zip(&zip)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "manifest.json")
+            .map(|e| String::from_utf8(e.bytes).unwrap())
+            .unwrap();
+        assert!(manifest.contains("\"nvme_health\""));
+        assert!(manifest.contains(file.as_str()));
+        assert!(manifest.contains("\"schema_version\": \"1.0\""));
+        assert!(
+            app.journal
+                .iter()
+                .any(|e| e.message.contains("NVMe Health (PhysicalDrive1): OK"))
+        );
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn unsupported_health_is_recorded_without_values() {
+        let (mut app, exe) = app("unsup");
+        let netac = app.ssd_candidates[1].disk.clone();
+        let h = collect(&Src(Err(ProbeError::InvalidFunction)), &netac, "t");
+        assert_eq!(h.status, ProbeStatus::Unsupported);
+        let rows = nvme_health_rows(&h, i18n::t(Language::En));
+        assert_eq!(rows[0], ("Status".to_string(), "Not supported".to_string()));
+        assert!(
+            rows.iter().all(|(_, v)| !v.contains(" %")),
+            "no fabricated values"
+        );
+        app.accept_nvme_health(h);
+        app.ssd_selected = 1;
+        assert_eq!(
+            app.selected_nvme_health().map(|h| h.status),
+            Some(ProbeStatus::Unsupported)
+        );
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn details_rows_are_facts_without_verdicts() {
+        let samsung = disk(1, "Samsung SSD 9100 PRO 2TB", "S", "NVMe");
+        let mut b = smart_bytes();
+        b[160] = 2; // media errors: shown as a raw count, not a verdict
+        let h = collect(&Src(Ok(b)), &samsung, "t");
+        for lang in [Language::En, Language::Ru] {
+            let rows = nvme_health_rows(&h, i18n::t(lang));
+            let text: String = rows.iter().map(|(l, v)| format!("{l}={v};")).collect();
+            for verdict in ["HEALTHY", "BAD", "FAIL", "GOOD", "ИСПРАВ", "НЕИСПРАВ"] {
+                assert!(
+                    !text.to_uppercase().contains(verdict),
+                    "{verdict} in {text}"
+                );
+            }
+            assert!(text.contains("42 °C"));
+            assert!(text.contains("#1 45 °C, #2 52 °C"));
+        }
+        let rows = nvme_health_rows(&h, i18n::t(Language::En));
+        let get = |k: &str| rows.iter().find(|(l, _)| l == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("Critical Warning"), Some("0"));
+        assert_eq!(get("Available Spare"), Some("100 %"));
+        assert_eq!(get("Spare Threshold"), Some("10 %"));
+        assert_eq!(get("Percentage Used"), Some("3 %"));
+        assert_eq!(get("Unsafe Shutdowns"), Some("37"));
+        assert_eq!(get("Media and Data Integrity Errors"), Some("2"));
+        assert_eq!(get("Error Log Entries"), Some("12"));
+        assert_eq!(get("Power On Hours"), Some("4321"));
+        assert_eq!(get("Data Written"), Some("26.80 TB"));
+        assert_eq!(get("Error Information Log"), Some("0 entries read"));
+    }
+
+    #[test]
+    fn details_popup_shows_the_health_section_for_the_selected_disk_only() {
+        let (mut app, exe) = app("ui");
+        let samsung = app.ssd_candidates[0].disk.clone();
+        app.accept_nvme_health(collect(&Src(Ok(smart_bytes())), &samsung, "t"));
+        app.benchmark_state = BenchmarkUiState::Done {
+            result: summary(),
+            duration_seconds: 10.0,
+            previous: None,
+        };
+        app.raw_passes_open = true;
+        let render = |app: &mut WinStateDiagApp| -> String {
+            let ctx = egui::Context::default();
+            let mut texts = String::new();
+            for _ in 0..12 {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(1400.0, 1000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.raw_passes_window(ui.ctx());
+                    },
+                );
+                out.textures_delta.clear();
+                fn walk(shape: &egui::Shape, acc: &mut String) {
+                    match shape {
+                        egui::Shape::Text(t) => {
+                            acc.push_str(t.galley.text());
+                            acc.push('\n');
+                        }
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
+                        _ => {}
+                    }
+                }
+                texts.clear();
+                for c in &out.shapes {
+                    walk(&c.shape, &mut texts);
+                }
+            }
+            texts
+        };
+        let shown = render(&mut app);
+        assert!(shown.contains("NVMe HEALTH"), "health section rendered");
+        assert!(shown.contains("Critical Warning"));
+        assert!(shown.contains("Controller facts, not a verdict"), "{shown}");
+        app.ssd_selected = 1;
+        let other = render(&mut app);
+        assert!(other.contains("PASS"), "benchmark passes still shown");
+        assert!(!other.contains("NVMe HEALTH"), "no cross-disk health");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    /// The benchmark, its thresholds and its evidence are unchanged by the
+    /// health phase (the probe is a separate step after contribution).
+    #[test]
+    fn benchmark_logic_and_evidence_are_unchanged() {
+        assert_eq!(stability_level(5.0), StabilityLevel::Stable);
+        assert_eq!(stability_level(5.01), StabilityLevel::Acceptable);
+        assert_eq!(stability_level(12.0), StabilityLevel::Acceptable);
+        assert_eq!(stability_level(12.01), StabilityLevel::Unstable);
+        let files = ssd_benchmark_evidence(&summary(), Path::new("C:\\"), 1.0, None, "x".into());
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.name.starts_with("SSD_Benchmark_")));
+        let bench_src = include_str!("storage_benchmark.rs");
+        assert!(!bench_src.contains("nvme_health"));
+        assert!(!bench_src.to_lowercase().contains("smart"));
+        // No storage severity is derived from health yet.
+        // Storage severity comes only from storage_health::classify.
+    }
+}
+
+/// v0.4.2 storage correlation + automatic retest workflow (driven through
+/// the test seam: no real disk I/O).
+#[cfg(test)]
+mod storage_correlation_tests {
+    use super::*;
+    use crate::nvme_health::collect;
+    use crate::report_package::read_zip;
+    use crate::storage_benchmark::{BenchmarkRun, DiagnosticPass, IoMeasurement};
+    use crate::storage_health::tests::{netac_page, samsung_page, smart_page};
+    use crate::storage_health::{RetestOutcome, RetestSkip, StorageState};
+    use crate::storage_topology::{DiskCandidate, VolumeInfo};
+
+    struct Src(Vec<u8>);
+    impl nvme_health::NvmeLogSource for Src {
+        fn read_log_page(
+            &self,
+            _: u32,
+            lid: u8,
+            _: usize,
+        ) -> Result<nvme_health::LogRead, nvme_health::ProbeError> {
+            if lid == nvme_health::LID_SMART_HEALTH {
+                Ok(nvme_health::LogRead {
+                    data: self.0.clone(),
+                    via: "test",
+                })
+            } else {
+                Err(nvme_health::ProbeError::InvalidFunction)
+            }
+        }
+    }
+
+    fn summary(write_spread: f64) -> StorageDiagnosticSummary {
+        let m = |mb: f64| IoMeasurement {
+            bytes: 0,
+            operations: 0,
+            elapsed: Duration::from_secs(1),
+            mb_per_second: mb,
+            iops: 0.0,
+            average_latency: Duration::from_millis(1),
+        };
+        StorageDiagnosticSummary {
+            profile: crate::storage_benchmark::StorageDiagnosticProfile {
+                block_size: 1024 * 1024,
+                queue_depth: 4,
+                test_file_size: 512 * 1024 * 1024,
+                pass_count: 3,
+                stable_spread_limit_percent: 10.0,
+            },
+            preparation_method: "test",
+            preparation_elapsed: Duration::from_secs(0),
+            summary_read_mib_s: 6500.0,
+            // Distinct per run (history lines are de-duplicated by content).
+            summary_write_mib_s: 5600.0 - write_spread,
+            read_min_mib_s: 6400.0,
+            read_max_mib_s: 6600.0,
+            write_min_mib_s: 5000.0,
+            write_max_mib_s: 6000.0,
+            read_variation_percent: 1.5,
+            write_variation_percent: write_spread,
+            stable: write_spread <= 5.0,
+            raw_passes: (1..=3)
+                .map(|n| DiagnosticPass {
+                    pass_number: n,
+                    run: BenchmarkRun {
+                        block_size: 1024 * 1024,
+                        read: m(6500.0),
+                        write: m(5600.0),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn new_app(tag: &str) -> (WinStateDiagApp, PathBuf) {
+        let root = std::env::temp_dir().join(format!("wsd-corr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = root.join("WinStateDiag");
+        let target = root.join("target");
+        std::fs::create_dir_all(&exe).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let mut app = WinStateDiagApp::default();
+        app.client_name = "Алексей".into();
+        app.computer_name = "MSI".into();
+        app.language = Language::En;
+        app.reports_root = exe.join("Reports");
+        app.package = Arc::new(Mutex::new(SessionPackage::new(exe.join("Reports"), None)));
+        app.retest_idle = Duration::ZERO;
+        let mk = |index: u32, model: &str, system: bool| DiskCandidate {
+            disk: crate::nvme_health::tests::disk(index, model, "", "NVMe"),
+            is_system: system,
+            volume: Some(VolumeInfo {
+                mount_point: target.display().to_string(),
+                physical_disk_index: index,
+                writable: true,
+                label: String::new(),
+            }),
+            label: model.into(),
+        };
+        app.ssd_candidates = vec![
+            mk(3, "Samsung SSD 9100 PRO 1TB", true),
+            mk(4, "Netac NVMe SSD 1TB", false),
+        ];
+        app.ssd_selected = 0;
+        app.benchmark_path = target.display().to_string();
+        (app, root)
+    }
+
+    fn identity(app: &WinStateDiagApp) -> String {
+        storage_topology::physical_disk_identity(&app.selected_ssd_candidate().unwrap().disk)
+    }
+
+    fn finish(app: &mut WinStateDiagApp, r: Result<StorageDiagnosticSummary, String>) {
+        app.bench_test_tx
+            .as_ref()
+            .expect("a run was launched")
+            .send(BenchmarkEvent::Finished(r))
+            .unwrap();
+        app.poll_benchmark();
+    }
+
+    fn package_names(app: &WinStateDiagApp) -> Vec<String> {
+        let zip = report_package::lock(&app.package).final_zip().unwrap();
+        read_zip(&zip)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    }
+
+    fn state(app: &WinStateDiagApp) -> StorageState {
+        app.selected_assessment()
+            .and_then(|a| a.classification.as_ref())
+            .map(|c| c.state)
+            .expect("classified")
+    }
+
+    /// Real Samsung/Netac-equivalent case: run 1 WRITE spread above the
+    /// UNSTABLE threshold, ONE automatic retest back in range, clean health
+    /// -> anomaly not confirmed, never a storage failure; both runs kept.
+    #[test]
+    fn unstable_then_normal_retest_keeps_both_runs_and_is_not_a_failure() {
+        let (mut app, root) = new_app("normalized");
+        let id = identity(&app);
+        let samsung = app.ssd_candidates[0].disk.clone();
+        app.nvme_health
+            .insert(id.clone(), collect(&Src(samsung_page()), &samsung, "t"));
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(18.4)));
+        assert!(matches!(
+            app.benchmark_state,
+            BenchmarkUiState::RetestWaiting { .. }
+        ));
+        assert!(
+            app.benchmark_is_running(),
+            "UI shows the confirmation phase"
+        );
+        let vm = app.build_vm(0.0, 0.0);
+        match &vm.ssd {
+            SsdVm::Running { status, note, .. } => {
+                assert!(status.starts_with("Retest in"), "{status}");
+                let note = note.clone().expect("retest note");
+                assert!(
+                    note[0].contains("Confirmation retest: run 1 UNSTABLE 18.4%"),
+                    "{note:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            app.assessments[&id].retest,
+            RetestOutcome::Pending,
+            "not classified before the retest"
+        );
+        app.poll_retest();
+        assert!(app.retest_identity.is_some(), "retest launched");
+        match &app.build_vm(0.0, 0.0).ssd {
+            SsdVm::Running { note, .. } => {
+                assert!(
+                    note.as_ref()
+                        .is_some_and(|n| n[0].contains("Confirmation retest"))
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        finish(&mut app, Ok(summary(6.2)));
+        assert!(matches!(app.benchmark_state, BenchmarkUiState::Done { .. }));
+        assert!(app.retest_identity.is_none());
+        // Only ONE automatic retest: nothing else is scheduled.
+        app.poll_retest();
+        assert!(!app.benchmark_is_running());
+        assert_eq!(state(&app), StorageState::AnomalyNotConfirmed);
+        let a = app.selected_assessment().unwrap();
+        assert!(a.first.write_variation_percent > 12.0, "first run kept");
+        assert!(a.second.is_some(), "second run kept");
+        // Evidence: both benchmark runs + the correlation, history ×2.
+        let names = package_names(&app);
+        let bench_json: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with("SSD_Benchmark_") && n.ends_with(".json"))
+            .collect();
+        assert_eq!(bench_json.len(), 2, "{names:?}");
+        assert!(bench_json.iter().any(|n| n.ends_with("_retest.json")));
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("Storage_Correlation_") && n.ends_with("_PD3.json"))
+        );
+        assert_eq!(ssd_history::load_all_history(&app.reports_root).len(), 2);
+        // Dashboard: correlation colour + the first UNSTABLE run in the note.
+        match &app.build_vm(0.0, 0.0).ssd {
+            SsdVm::Done { status, note, .. } => {
+                let (text, tone) = status.clone().expect("status");
+                assert_eq!(text, "Retest normal");
+                assert_eq!(tone, Tone::Success);
+                let note = note.clone().expect("note");
+                assert_eq!(note[0], "Run 1 UNSTABLE 18.4%, retest ACCEPT 6.2%");
+                assert!(note[1].contains("not an SSD failure"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unstable_twice_with_clean_health_is_check_not_failure() {
+        let (mut app, root) = new_app("twice");
+        let id = identity(&app);
+        let netac = app.ssd_candidates[0].disk.clone();
+        app.nvme_health
+            .insert(id.clone(), collect(&Src(netac_page()), &netac, "t"));
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(18.4)));
+        app.poll_retest();
+        finish(&mut app, Ok(summary(16.0)));
+        assert_eq!(state(&app), StorageState::BenchmarkAnomalyCheck);
+        app.poll_retest();
+        assert!(
+            !app.benchmark_is_running(),
+            "never a second automatic retest"
+        );
+        match &app.build_vm(0.0, 0.0).ssd {
+            SsdVm::Done { status, .. } => {
+                assert_eq!(status.clone().unwrap().1, Tone::Warning, "not red");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_first_run_never_retests() {
+        let (mut app, root) = new_app("stable");
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(3.0)));
+        assert!(matches!(app.benchmark_state, BenchmarkUiState::Done { .. }));
+        assert_eq!(
+            app.selected_assessment().unwrap().retest,
+            RetestOutcome::NotNeeded
+        );
+        // No health on this host: benchmark fine, health unknown.
+        assert_eq!(state(&app), StorageState::InsufficientData);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_during_idle_prevents_the_retest_and_keeps_the_first_result() {
+        let (mut app, root) = new_app("cancel-idle");
+        app.retest_idle = Duration::from_secs(3600);
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(18.4)));
+        app.apply(Action::BenchmarkCancel);
+        match &app.benchmark_state {
+            BenchmarkUiState::Done { result, .. } => {
+                assert!(result.write_variation_percent > 12.0, "first result shown")
+            }
+            _ => panic!("first result must stay visible"),
+        }
+        let a = app.selected_assessment().unwrap();
+        assert_eq!(a.retest, RetestOutcome::Cancelled);
+        assert_eq!(state(&app), StorageState::BenchmarkAnomalyRetest);
+        app.retest_idle = Duration::ZERO;
+        app.poll_retest();
+        assert!(app.retest_identity.is_none() && !app.benchmark_is_running());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_or_failure_of_the_retest_run_restores_the_first_result() {
+        for cancel in [true, false] {
+            let (mut app, root) = new_app(if cancel { "cancel-run" } else { "fail-run" });
+            app.start_benchmark();
+            finish(&mut app, Ok(summary(18.4)));
+            app.poll_retest();
+            if cancel {
+                app.apply(Action::BenchmarkCancel);
+            }
+            finish(&mut app, Err("I/O error".into()));
+            match &app.benchmark_state {
+                BenchmarkUiState::Done { result, .. } => {
+                    assert!(result.write_variation_percent > 12.0)
+                }
+                _ => panic!("first result must stay visible"),
+            }
+            let a = app.selected_assessment().unwrap();
+            assert_eq!(
+                a.retest,
+                if cancel {
+                    RetestOutcome::Cancelled
+                } else {
+                    RetestOutcome::Failed
+                }
+            );
+            assert_eq!(state(&app), StorageState::BenchmarkAnomalyRetest);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn retest_fails_closed_on_health_or_missing_target() {
+        // Media errors: no further write testing.
+        let (mut app, root) = new_app("health");
+        let id = identity(&app);
+        let disk = app.ssd_candidates[0].disk.clone();
+        app.nvme_health.insert(
+            id.clone(),
+            collect(
+                &Src(smart_page(0, 40, 100, 10, 2, 1, 1, 0, 4, 4)),
+                &disk,
+                "t",
+            ),
+        );
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(18.4)));
+        app.poll_retest();
+        assert!(app.retest_identity.is_none());
+        assert_eq!(
+            app.assessments[&id].retest,
+            RetestOutcome::Skipped(RetestSkip::HealthForbidsWrites)
+        );
+        assert_eq!(state(&app), StorageState::StorageAttention);
+        let _ = std::fs::remove_dir_all(root);
+
+        // Target disappeared during the idle.
+        let (mut app, root) = new_app("target");
+        let id = identity(&app);
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(18.4)));
+        std::fs::remove_dir_all(root.join("target")).unwrap();
+        app.poll_retest();
+        assert_eq!(
+            app.assessments[&id].retest,
+            RetestOutcome::Skipped(RetestSkip::TargetUnavailable)
+        );
+        assert!(!app.benchmark_is_running());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn health_pending_waits_then_fails_closed() {
+        let (mut app, root) = new_app("pending");
+        let id = identity(&app);
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(18.4)));
+        // Simulate an in-flight health read.
+        app.assessments.get_mut(&id).unwrap().health_pending = true;
+        app.poll_retest();
+        assert!(
+            matches!(app.benchmark_state, BenchmarkUiState::RetestWaiting { .. }),
+            "waits for the health read"
+        );
+        if let BenchmarkUiState::RetestWaiting { deadline, .. } = &mut app.benchmark_state {
+            *deadline = Instant::now();
+        }
+        app.poll_retest();
+        assert_eq!(
+            app.assessments[&id].retest,
+            RetestOutcome::Skipped(RetestSkip::HealthPending)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two physical disks, each benchmarked: assessments never mix.
+    #[test]
+    fn assessments_are_per_physical_disk() {
+        let (mut app, root) = new_app("two");
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(3.0)));
+        app.select_ssd_disk(1);
+        app.start_benchmark();
+        finish(&mut app, Ok(summary(18.4)));
+        assert!(matches!(
+            app.benchmark_state,
+            BenchmarkUiState::RetestWaiting { .. }
+        ));
+        app.poll_retest();
+        finish(&mut app, Ok(summary(4.0)));
+        assert_eq!(state(&app), StorageState::AnomalyNotConfirmed);
+        app.select_ssd_disk(0);
+        assert_eq!(state(&app), StorageState::InsufficientData);
+        assert_eq!(app.assessments.len(), 2);
+        let names = package_names(&app);
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("Storage_Correlation_") && n.ends_with("_PD3.json"))
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("Storage_Correlation_") && n.ends_with("_PD4.json"))
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

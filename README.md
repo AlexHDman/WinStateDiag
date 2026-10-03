@@ -5,7 +5,7 @@
 **Portable read-only diagnostic center for Windows**
 EN: *Windows System Diagnostics Center* · RU: *Диагностический центр состояния Windows*
 
-Current version: **v0.4.0** · Windows 10 / 11 x64 · portable, no installer
+Current version: **v0.4.3** · Windows 10 / 11 x64 · portable, no installer
 
 > WinStateDiag **diagnoses and reports**. It does **not** repair Windows and never runs repair commands automatically.
 
@@ -23,7 +23,8 @@ WinStateDiag is a single portable `WinStateDiag.exe`. It examines the current st
 - **SFC / DISM / CHKDSK result states** — the completion (100%) is shown separately from what the check found: OK, ATTENTION or ERROR. Example: `DISM ⚠ 100%` means the scan completed and reported a component store that is repairable. The matching repair command is only *shown as text*; WinStateDiag never runs it.
 - **Hardware Report** — hardware inventory/passport (system, board, BIOS/UEFI, CPU, RAM, storage, GPU, network, battery).
 - **Driver Audit** — read-only check of installed drivers with per-device status and evidence.
-- **SSD / NVMe benchmark** — per physical disk (HDDs excluded), up to three disk slots, READ/WRITE results with stability rating and comparison against the previous run of the same disk.
+- **SSD / NVMe benchmark** — per physical disk (HDDs excluded), up to three disk slots, READ/WRITE results with stability rating and comparison against the previous run of the same disk. An UNSTABLE result is automatically confirmed by one retest; both runs are kept.
+- **NVMe Health** — native read-only SMART / Health and Error Information log of NVMe drives (Windows storage API, no third-party tools), correlated per physical disk with the benchmark and Windows storage events. Benchmark instability alone is never reported as an SSD failure.
 - **CryptoPro** — HASH status check with explicit, user-confirmed ReHash as the only exception to read-only behavior.
 
 **Application**
@@ -85,7 +86,8 @@ Windows 10 / 11 x64, без установки, один файл `WinStateDiag.
 - Диагностика ПК EXPC — 14 этапов; режимы: Основная, Глубокие проверки (выбор SFC / DISM / CHKDSK), Полная.
 - Результат SFC / DISM / CHKDSK отдельно от хода выполнения: OK / ВНИМАНИЕ / ОШИБКА. Например, `DISM ⚠ 100%` — проверка завершена, хранилище компонентов требует восстановления. Команда восстановления только показывается текстом и не выполняется.
 - Отчёт об оборудовании, проверка драйверов (только чтение).
-- Тест SSD / NVMe по физическим дискам с историей и сравнением с предыдущим результатом.
+- Тест SSD / NVMe по физическим дискам с историей и сравнением с предыдущим результатом; нестабильный замер автоматически проверяется одним повтором.
+- Здоровье NVMe: собственное чтение SMART / Health и журнала ошибок контроллера (только чтение), сопоставление с замером и событиями Windows. Нестабильный замер сам по себе не считается отказом SSD.
 - КриптоПро: проверка HASH; ReHash — только по подтверждению пользователя.
 - Интерфейс RU / EN, безопасный запуск графики (резервный программный рендер WARP), журнал сессии.
 

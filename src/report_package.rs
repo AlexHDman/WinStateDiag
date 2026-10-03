@@ -80,6 +80,10 @@ pub enum EvidenceModule {
     Hardware,
     DriverAudit,
     SsdBenchmark,
+    /// Native NVMe Health evidence (read-only).
+    NvmeHealth,
+    /// Storage correlation (benchmark + health + events) per disk.
+    StorageCorrelation,
 }
 
 impl EvidenceModule {
@@ -97,6 +101,10 @@ impl EvidenceModule {
             Some(Self::DriverAudit)
         } else if name.starts_with("SSD_Benchmark_") {
             Some(Self::SsdBenchmark)
+        } else if name.starts_with(crate::nvme_health::EVIDENCE_PREFIX) {
+            Some(Self::NvmeHealth)
+        } else if name.starts_with(crate::storage_health::EVIDENCE_PREFIX) {
+            Some(Self::StorageCorrelation)
         } else {
             None
         }

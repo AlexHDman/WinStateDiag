@@ -72,7 +72,7 @@ pub fn draw(
     draw_diagnostic(ui, o, vm, ctl);
     draw_crypto(ui, o, vm, actions);
     draw_hardware(ui, o, vm, ctl, actions);
-    draw_stages(ui, o, vm);
+    draw_stages(ui, o, vm, actions);
     draw_drivers(ui, o, vm, actions);
     draw_result(ui, o, vm, actions);
     draw_start(ui, o, vm, actions);
@@ -627,7 +627,7 @@ fn draw_hardware(
     }
 }
 
-fn draw_stages(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
+fn draw_stages(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
     paint::card(&p, r(o, l::STAGES_CARD));
@@ -639,6 +639,21 @@ fn draw_stages(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
         &format!("{} ({})", d.stages_title_prefix, vm.stages.len()),
         t::TITLE_STAGES,
     );
+    // v0.4.1: explanation of the stage results (status stays on the card).
+    if paint::button(
+        ui,
+        r(o, l::STAGES_DETAILS_BUTTON),
+        "expc_details",
+        d.expc_details_button,
+        ButtonKind::Secondary,
+        true,
+        ButtonIcon::None,
+        t::BUTTON_TEXT_SMALL,
+    )
+    .clicked()
+    {
+        actions.push(Action::ShowExpcDetails);
+    }
     let start = stage_window_start(&vm.stages, l::STAGE_VISIBLE_ROWS);
     for (slot, (i, row)) in vm
         .stages
@@ -2247,6 +2262,8 @@ fn draw_ssd(
 
     match &vm.ssd {
         SsdVm::Done {
+            status,
+            note,
             read_current,
             read_previous,
             read_delta,
@@ -2285,8 +2302,17 @@ fn draw_ssd(
             );
             delta_text(&p, o, rc.x, *read_delta);
             delta_text(&p, o, wc.x, *write_delta);
-            let (st, sc) = ready_state();
-            draw_disk_info_panel(d, &p, o, selected_disk, &st, sc, temp_note, c::TEXT_MUTED);
+            // v0.4.2: the storage correlation (when known) is the status;
+            // otherwise the unchanged "ready" line.
+            let (st, sc) = match status {
+                Some((text, tone)) => (text.clone(), tone_color(*tone)),
+                None => ready_state(),
+            };
+            let (note_lines, note_col) = match note {
+                Some([a, b]) => ([a.as_str(), b.as_str()], c::TEXT_SECONDARY),
+                None => (temp_note, c::TEXT_MUTED),
+            };
+            draw_disk_info_panel(d, &p, o, selected_disk, &st, sc, note_lines, note_col);
             draw_ssd_meta_strip(&p, o, d, Some(meta));
             if paint::button(
                 ui,
@@ -2375,8 +2401,13 @@ fn draw_ssd(
             fraction,
             status,
             elapsed,
+            note,
         } => {
             placeholder_rings(&p);
+            let (note_lines, note_col) = match note {
+                Some([a, b]) => ([a.as_str(), b.as_str()], c::TEXT_SECONDARY),
+                None => (temp_note, c::TEXT_MUTED),
+            };
             draw_disk_info_panel(
                 d,
                 &p,
@@ -2384,8 +2415,8 @@ fn draw_ssd(
                 selected_disk,
                 status,
                 c::BLUE_STATUS,
-                temp_note,
-                c::TEXT_MUTED,
+                note_lines,
+                note_col,
             );
             draw_ssd_meta_strip(&p, o, d, None);
             // Progress lives in the delta line of the frame (no delta yet).

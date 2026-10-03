@@ -1242,14 +1242,25 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
             e.module = driver;
             match target {
                 Some(i) => {
-                    // Current error -> confirmed fault; works now -> risk.
-                    let failing =
-                        matches!(ctx.items[i].pnp_error_code, Some(c) if c != 0 && c != 22);
-                    if failing {
-                        e.severity = Severity::Problem;
-                    } else {
-                        e.reason
-                            .push_str(" (в прошлом; сейчас устройство работает)");
+                    // Current error -> confirmed fault. v0.4.2 (confirmed on
+                    // several real machines): a historical 219 for a device
+                    // that exists now with PnP ErrorCode 0 is HISTORICAL /
+                    // INFO — kept visible as evidence, but it does not by
+                    // itself raise the audit to WARNING, whatever the event
+                    // count. Any other current trouble on the same device is
+                    // its own evidence and still drives the status. An
+                    // unknown current PnP state stays WARNING (fail closed).
+                    match ctx.items[i].pnp_error_code {
+                        Some(c) if c != 0 && c != 22 => e.severity = Severity::Problem,
+                        Some(0) => {
+                            e.severity = Severity::Ok;
+                            e.reason.push_str(
+                                " (исторически; сейчас устройство работает, код PnP 0 — информация)",
+                            );
+                        }
+                        _ => e
+                            .reason
+                            .push_str(" (в прошлом; текущее состояние устройства не подтверждено)"),
                     }
                     ctx.items[i].add_evidence(e);
                 }
@@ -1351,7 +1362,12 @@ pub fn classify(raw: &RawAudit) -> AuditReport {
     let mut items: Vec<AuditItem> = ctx
         .items
         .into_iter()
-        .filter(|it| it.category != Category::Other || it.status != Severity::Ok)
+        // Items carrying evidence stay listed even when it is only
+        // historical/informational (e.g. a past Kernel-PnP 219), so it is
+        // never hidden from Details.
+        .filter(|it| {
+            it.category != Category::Other || it.status != Severity::Ok || !it.evidence.is_empty()
+        })
         .collect();
     items.sort_by(|a, b| {
         b.status
@@ -2187,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn past_load_failure_on_working_device_is_warning() {
+    fn past_load_failure_on_working_device_is_historical_info() {
         let mut d = dev(
             "MEDIA",
             "Realtek High Definition Audio",
@@ -2210,8 +2226,69 @@ mod tests {
             )],
         );
         let it = item(&r, "Realtek");
-        assert_eq!(it.status, Severity::Warning);
+        assert_eq!(it.status, Severity::Ok, "historical 219, device works now");
+        assert_eq!(it.evidence.len(), 1, "kept visible as evidence");
         assert_eq!(it.evidence[0].module, "RTKVHD64");
+        assert!(it.evidence[0].reason.contains("исторически"));
+        assert_eq!(r.overall, Severity::Ok);
+    }
+
+    fn wudf_device(code: Option<u32>) -> RawDevice {
+        let mut d = dev("WPD", "Portable Device", "Microsoft", "10.0.26100.1", 0);
+        d.pnp_id = "SWD\\WPDBUSENUM\\_??_USBSTOR#DISK".into();
+        d.error_code = code;
+        d
+    }
+
+    fn wudf_219(time: &str) -> RawEvent {
+        evt(
+            "KPNP219",
+            219,
+            time,
+            &[
+                "SWD\\WPDBUSENUM\\_??_USBSTOR#DISK",
+                "\\Driver\\WUDFRd",
+                "0xc0000365",
+            ],
+        )
+    }
+
+    /// Real case (several machines): WUDFRd 219 ×3 in the past, device
+    /// present and working now -> INFO / HISTORICAL; count does not matter.
+    #[test]
+    fn historical_wudfrd_219_x3_on_healthy_device_is_not_a_warning() {
+        let r = report(
+            vec![wudf_device(Some(0))],
+            vec![
+                wudf_219("2026-09-10T08:00:00"),
+                wudf_219("2026-09-15T08:00:00"),
+                wudf_219("2026-09-22T08:00:00"),
+            ],
+        );
+        let it = item(&r, "Portable");
+        assert_eq!(it.status, Severity::Ok);
+        assert_eq!(it.evidence.len(), 1, "merged, still visible");
+        assert_eq!(it.evidence[0].count, 3);
+        assert_eq!(r.overall, Severity::Ok, "count alone never raises severity");
+    }
+
+    #[test]
+    fn wudfrd_219_with_current_pnp_failure_stays_a_problem() {
+        let r = report(
+            vec![wudf_device(Some(31))],
+            vec![wudf_219("2026-09-22T08:00:00")],
+        );
+        assert_eq!(item(&r, "Portable").status, Severity::Problem);
+        assert_eq!(r.overall, Severity::Problem);
+    }
+
+    #[test]
+    fn wudfrd_219_with_unknown_current_state_stays_a_warning() {
+        let r = report(
+            vec![wudf_device(None)],
+            vec![wudf_219("2026-09-22T08:00:00")],
+        );
+        assert_eq!(item(&r, "Portable").status, Severity::Warning);
     }
 
     #[test]
