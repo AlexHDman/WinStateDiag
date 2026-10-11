@@ -220,8 +220,21 @@ pub struct StorageDiagnosticSummary {
 #[derive(Debug, Clone, Copy)]
 pub enum DiagnosticProgress {
     Preparation,
-    PassWrite { pass: u32, total: u32 },
-    PassRead { pass: u32, total: u32 },
+    PassWrite {
+        pass: u32,
+        total: u32,
+    },
+    PassRead {
+        pass: u32,
+        total: u32,
+    },
+    /// v0.4.5: a measurement just finished (MiB/s) — live values for the UI.
+    /// Does not change the phase; `read_mib_s` is `None` after the write.
+    Measured {
+        pass: u32,
+        write_mib_s: f64,
+        read_mib_s: Option<f64>,
+    },
     Complete,
 }
 
@@ -350,6 +363,11 @@ where
         if unsafe { FlushFileBuffers(file.0) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        progress(DiagnosticProgress::Measured {
+            pass: pass_number,
+            write_mib_s: write.mb_per_second,
+            read_mib_s: None,
+        });
         progress(DiagnosticProgress::PassRead {
             pass: pass_number,
             total: profile.pass_count,
@@ -363,6 +381,11 @@ where
             true,
             cancel,
         )?;
+        progress(DiagnosticProgress::Measured {
+            pass: pass_number,
+            write_mib_s: write.mb_per_second,
+            read_mib_s: Some(read.mb_per_second),
+        });
         let run = BenchmarkRun {
             block_size: profile.block_size,
             read,
@@ -376,6 +399,39 @@ where
     let summary = aggregate_diagnostic_passes(profile, preparation_elapsed, raw_passes)?;
     progress(DiagnosticProgress::Complete);
     Ok(summary)
+}
+
+/// v1.0 physical transport ceiling (decimal MB/s) of a Windows bus type.
+/// SATA / ATA 6 Gb/s carry at most ~600 MB/s of payload; USB depends on the
+/// unknown link generation, so only the fastest USB link is used as the
+/// ceiling. `None` = no defensible ceiling (NVMe, RAID, unknown, virtual).
+pub fn transport_ceiling_mb_s(bus_type: &str) -> Option<f64> {
+    match bus_type.trim() {
+        "SATA" | "ATA" | "ATAPI" => Some(600.0),
+        "SAS" => Some(2_400.0),
+        "USB" => Some(2_500.0),
+        "SD" | "MMC" => Some(320.0),
+        _ => None,
+    }
+}
+
+/// v1.0: a measured rate above the physical ceiling of the detected
+/// transport cannot be the disk itself (host RAM cache filters such as
+/// Samsung RAPID mode / PrimoCache, a wrong target volume, a misreported
+/// bus). Such a run is BENCHMARK INVALID / RESULT NOT TRUSTED and is never
+/// reported as disk performance. 10 % tolerance for rounding.
+pub fn implausible_reason(bus_type: &str, s: &StorageDiagnosticSummary) -> Option<String> {
+    let ceiling = transport_ceiling_mb_s(bus_type)?;
+    let mb = |mib: f64| mib * 1.048_576;
+    let read = mb(s.read_max_mib_s);
+    let write = mb(s.write_max_mib_s);
+    let worst = read.max(write);
+    (worst > ceiling * 1.10).then(|| {
+        format!(
+            "measured {worst:.0} MB/s (read max {read:.0} / write max {write:.0}) exceeds the {bus} transport ceiling (~{ceiling:.0} MB/s): the I/O was not served by this disk alone (host RAM cache filter, wrong target or misreported bus)",
+            bus = bus_type.trim()
+        )
+    })
 }
 
 fn aggregate_diagnostic_passes(

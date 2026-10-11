@@ -254,18 +254,32 @@ pub enum Weight {
 /// One explained reason behind the classification.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Finding {
-    CriticalWarningBit { bit: u8, name: &'static str },
-    MediaErrors { count: u128, corroborated: bool },
+    CriticalWarningBit {
+        bit: u8,
+        name: &'static str,
+    },
+    MediaErrors {
+        count: u128,
+        corroborated: bool,
+    },
     PercentageUsedAtLimit(u8),
     ErrorLogEntries(u128),
     UnsafeShutdowns(u128),
     HealthUnavailable(ProbeStatus),
+    /// ATA SMART: the drive's own threshold verdict (attribute ids).
+    AtaThresholdExceeded(Vec<u8>),
+    /// ATA SMART: non-zero reallocated / pending / uncorrectable counters.
+    AtaSectorCounters(Vec<(u8, u64)>),
+    /// ATA SMART read successfully and clean (source-of-truth fact).
+    AtaSmartOk,
     BenchmarkUnstable,
     RetestNormalized,
     RetestUnstable,
     RetestNotRun(RetestOutcome),
     DiskEvent(StorageEventRef, Weight),
-    EventContext { groups: usize },
+    EventContext {
+        groups: usize,
+    },
     EventsNotCollected,
 }
 
@@ -287,6 +301,8 @@ impl Finding {
                 }
             }
             Finding::PercentageUsedAtLimit(_) => Weight::Attention,
+            Finding::AtaThresholdExceeded(_) => Weight::Problem,
+            Finding::AtaSectorCounters(_) => Weight::Attention,
             Finding::DiskEvent(_, w) => *w,
             _ => Weight::Fact,
         }
@@ -300,6 +316,9 @@ impl Finding {
             Finding::ErrorLogEntries(_) => "error_information_log_entries".into(),
             Finding::UnsafeShutdowns(_) => "unsafe_shutdowns".into(),
             Finding::HealthUnavailable(_) => "health_unavailable".into(),
+            Finding::AtaThresholdExceeded(_) => "ata_smart.threshold_exceeded".into(),
+            Finding::AtaSectorCounters(_) => "ata_smart.sector_counters".into(),
+            Finding::AtaSmartOk => "ata_smart.ok".into(),
             Finding::BenchmarkUnstable => "benchmark_unstable".into(),
             Finding::RetestNormalized => "retest_normalized".into(),
             Finding::RetestUnstable => "retest_unstable".into(),
@@ -380,6 +399,35 @@ impl Finding {
                     format!("Controller health unavailable ({})", s.as_str())
                 }
             }
+            Finding::AtaThresholdExceeded(ids) => {
+                let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+                if ru {
+                    format!("ATA SMART: порог атрибутов превышен ({})", ids.join(", "))
+                } else {
+                    format!(
+                        "ATA SMART: attribute threshold exceeded ({})",
+                        ids.join(", ")
+                    )
+                }
+            }
+            Finding::AtaSectorCounters(c) => {
+                let list: Vec<String> = c
+                    .iter()
+                    .map(|(id, n)| format!("{} = {n}", crate::ata_smart::attribute_name(*id)))
+                    .collect();
+                if ru {
+                    format!(
+                        "ATA SMART: счётчики секторов не нулевые ({})",
+                        list.join("; ")
+                    )
+                } else {
+                    format!("ATA SMART: non-zero sector counters ({})", list.join("; "))
+                }
+            }
+            Finding::AtaSmartOk => t(
+                "ATA SMART прочитан: пороги не превышены, счётчики секторов нулевые",
+                "ATA SMART read: no threshold exceeded, sector counters zero",
+            ),
             Finding::BenchmarkUnstable => {
                 t("Первый замер нестабилен (UNSTABLE)", "First run UNSTABLE")
             }
@@ -549,6 +597,11 @@ pub fn classify(inputs: &StorageHealthInputs) -> Classification {
 
     // --- Controller health ----------------------------------------------
     let smart = inputs.nvme.as_ref().and_then(|h| h.smart.as_ref());
+    let ata = inputs
+        .nvme
+        .as_ref()
+        .and_then(|h| h.ata_smart.as_ref())
+        .filter(|a| a.state == crate::ata_smart::AtaState::Ok);
     match smart {
         Some(s) => {
             for (bit, name) in crate::nvme_health::CRITICAL_WARNING_BITS {
@@ -579,13 +632,33 @@ pub fn classify(inputs: &StorageHealthInputs) -> Classification {
                 findings.push(Finding::UnsafeShutdowns(s.unsafe_shutdowns));
             }
         }
-        None => findings.push(Finding::HealthUnavailable(
-            inputs
-                .nvme
-                .as_ref()
-                .map(|h| h.status)
-                .unwrap_or(ProbeStatus::Unsupported),
-        )),
+        None => match ata {
+            // ATA SMART is the source of truth for SATA drives: a successful
+            // read can never be reported as "unavailable".
+            Some(a) => {
+                let over = a.threshold_exceeded();
+                if !over.is_empty() {
+                    findings.push(Finding::AtaThresholdExceeded(over));
+                }
+                let counters: Vec<(u8, u64)> = [5u8, 197, 198, 187]
+                    .iter()
+                    .filter_map(|id| a.count(*id).filter(|c| *c > 0).map(|c| (*id, c)))
+                    .collect();
+                if !counters.is_empty() {
+                    findings.push(Finding::AtaSectorCounters(counters));
+                }
+                if a.health() == "SMART: OK" {
+                    findings.push(Finding::AtaSmartOk);
+                }
+            }
+            None => findings.push(Finding::HealthUnavailable(
+                inputs
+                    .nvme
+                    .as_ref()
+                    .map(|h| h.status)
+                    .unwrap_or(ProbeStatus::Unsupported),
+            )),
+        },
     }
     for f in &findings {
         match f.weight() {
@@ -626,7 +699,7 @@ pub fn classify(inputs: &StorageHealthInputs) -> Classification {
             }
         }
     }
-    if state == StorageState::Ok && smart.is_none() {
+    if state == StorageState::Ok && smart.is_none() && ata.is_none() {
         state = StorageState::InsufficientData;
     }
     Classification { state, findings }
@@ -663,6 +736,14 @@ fn bench_json(b: Option<&BenchmarkFacts>) -> String {
     }
 }
 
+/// v1.0 items 15 + 18: session identity and the error-log delta against
+/// the latest COMPLETED session of the same disk.
+#[derive(Debug, Clone, Default)]
+pub struct CorrelationExtras {
+    pub session: Option<crate::storage_history::SessionRecord>,
+    pub error_log_delta: Option<crate::storage_history::ErrorLogDelta>,
+}
+
 /// Evidence JSON of one classification (English codes, both explanations).
 pub fn to_json(
     inputs: &StorageHealthInputs,
@@ -670,6 +751,47 @@ pub fn to_json(
     model: &str,
     health_file: Option<&str>,
     benchmark_files: &[String],
+) -> String {
+    to_json_with(
+        inputs,
+        c,
+        model,
+        health_file,
+        benchmark_files,
+        &CorrelationExtras::default(),
+    )
+}
+
+/// v1.0 item 16: what evidence the verdict was allowed to use.
+fn scope_json(inputs: &StorageHealthInputs) -> String {
+    let (bound, context) = match &inputs.events {
+        EventsInput::NotCollected => (None, None),
+        EventsInput::Collected(list) => {
+            let bound = list
+                .iter()
+                .filter(|e| {
+                    e.physical_disk_index.is_some() && e.physical_disk_index == inputs.disk_index
+                })
+                .count();
+            (Some(bound), Some(list.len() - bound))
+        }
+    };
+    let n = |v: Option<usize>| v.map(|x| x.to_string()).unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"physical_identity\": {}, \"health\": \"current read of this physical disk, this session\", \"benchmark\": \"this physical disk, this session\", \"events_window_days\": 14, \"events_bound_to_this_disk\": {}, \"events_context_not_bound\": {}, \"cross_disk_evidence_used\": false}}",
+        json::string(&inputs.physical_identity),
+        n(bound),
+        n(context)
+    )
+}
+
+pub fn to_json_with(
+    inputs: &StorageHealthInputs,
+    c: &Classification,
+    model: &str,
+    health_file: Option<&str>,
+    benchmark_files: &[String],
+    extras: &CorrelationExtras,
 ) -> String {
     let retest = match &inputs.retest {
         RetestOutcome::NotNeeded => "\"not_needed\"".to_string(),
@@ -707,7 +829,7 @@ pub fn to_json(
         })
         .collect();
     let files: Vec<String> = benchmark_files.iter().map(|f| json::string(f)).collect();
-    format!(
+    let body = format!(
         "{{\n  \"format\": \"winstatediag.storage_correlation/1\",\n  \"physical_identity\": {},\n  \"physical_disk_index\": {},\n  \"model\": {},\n  \"assessed_at\": {},\n  \"state\": {},\n  \"first_run\": {},\n  \"retest\": {},\n  \"retest_run\": {},\n  \"health_status\": {},\n  \"health_evidence\": {},\n  \"benchmark_evidence\": [{}],\n  \"events_collected\": {},\n  \"findings\": [\n{}\n  ],\n  \"rule\": {}\n}}\n",
         json::string(&inputs.physical_identity),
         inputs
@@ -723,7 +845,7 @@ pub fn to_json(
         inputs
             .nvme
             .as_ref()
-            .map(|h| json::string(h.status.as_str()))
+            .map(|h| json::string(crate::nvme_health::health_source_status(h).1))
             .unwrap_or_else(|| "null".into()),
         health_file
             .map(json::string)
@@ -734,7 +856,50 @@ pub fn to_json(
         json::string(
             "Unstable benchmark != SSD failure; counters are facts; severity needs correlation on the same physical disk."
         )
-    )
+    );
+    // v1.0: append source / scope / temperature / session / delta blocks
+    // (fixed order, before the closing brace).
+    let (src, _) = inputs
+        .nvme
+        .as_ref()
+        .map(crate::nvme_health::health_source_status)
+        .unwrap_or(("none", "UNSUPPORTED"));
+    let temp = inputs
+        .nvme
+        .as_ref()
+        .and_then(crate::nvme_health::temperature_provenance)
+        .map(|(c, s)| format!("{{\"celsius\": {c}, \"source\": {}}}", json::string(s)))
+        .unwrap_or_else(|| "null".into());
+    let session = extras
+        .session
+        .as_ref()
+        .map(crate::storage_history::record_json)
+        .unwrap_or_else(|| "null".into());
+    let delta = extras
+        .error_log_delta
+        .as_ref()
+        .map(|d| {
+            format!(
+                "{{\"code\": {}, \"previous_completed_session\": {}, \"en\": {}, \"ru\": {}}}",
+                json::string(d.code()),
+                d.previous_session()
+                    .map(json::string)
+                    .unwrap_or_else(|| "null".into()),
+                json::string(&d.text(false)),
+                json::string(&d.text(true))
+            )
+        })
+        .unwrap_or_else(|| "null".into());
+    let tail = format!(
+        ",\n  \"health_source\": {},\n  \"evidence_scope\": {},\n  \"temperature\": {},\n  \"session\": {},\n  \"error_log_delta\": {}\n}}\n",
+        json::string(src),
+        scope_json(inputs),
+        temp,
+        session,
+        delta
+    );
+    let body = body.trim_end().trim_end_matches('}').trim_end().to_string();
+    body + &tail
 }
 
 // ---------------------------------------------------------------------
@@ -812,69 +977,19 @@ pub fn parse_event_output(stdout: &str) -> Option<Vec<StorageEventRef>> {
     Some(out)
 }
 
-/// `-EncodedCommand` payload: base64 of the UTF-16LE script.
-fn encoded_command(script: &str) -> String {
-    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(B64[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 /// Runs the read-only collector with `host` (hidden, own process tree,
 /// 60 s limit). Any failure is `NotCollected`, never "no events".
 pub fn collect_events(host: &str) -> EventsInput {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new(host);
-    cmd.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-    ])
-    .arg(encoded_command(EVENT_COLLECTOR_PS1))
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
-    let Ok(mut guard) = crate::engine::ProcessGuard::spawn(cmd) else {
-        return EventsInput::NotCollected;
-    };
-    let Some(mut stdout) = guard.child_mut().stdout.take() else {
-        return EventsInput::NotCollected;
-    };
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let never = std::sync::atomic::AtomicBool::new(false);
-    if guard
-        .wait_or_cancel(&never, Some(std::time::Duration::from_secs(60)))
-        .is_err()
-    {
-        return EventsInput::NotCollected;
-    }
-    let bytes = reader.join().unwrap_or_default();
-    match parse_event_output(&String::from_utf8_lossy(&bytes)) {
-        Some(list) => EventsInput::Collected(list),
-        None => EventsInput::NotCollected,
+    match crate::ps_exec::run_powershell(
+        host,
+        EVENT_COLLECTOR_PS1,
+        std::time::Duration::from_secs(60),
+    ) {
+        Ok(out) => match parse_event_output(&out) {
+            Some(list) => EventsInput::Collected(list),
+            None => EventsInput::NotCollected,
+        },
+        Err(_) => EventsInput::NotCollected,
     }
 }
 
@@ -1257,13 +1372,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn encoded_command_is_utf16le_base64() {
-        assert_eq!(encoded_command("A"), "QQA=");
-        assert_eq!(encoded_command("ab"), "YQBiAA==");
-        assert_eq!(encoded_command("abc"), "YQBiAGMA");
-    }
-
-    #[test]
     fn collector_script_is_read_only_and_runs() {
         for forbidden in [
             "Clear-EventLog",
@@ -1340,5 +1448,179 @@ pub(crate) mod tests {
         }
         assert!(SATA_RELIABILITY_FIELDS.contains(&"ReadErrorsUncorrected"));
         assert_eq!(StorageEventSource::ALL.len(), 5);
+    }
+
+    // ---- v1.0 item 13/14: ATA SMART propagation regressions -------------
+
+    pub(crate) fn ata(attrs: &[(u8, u8, u8, u64)]) -> crate::ata_smart::AtaSmart {
+        crate::ata_smart::AtaSmart {
+            state: crate::ata_smart::AtaState::Ok,
+            detail: String::new(),
+            attributes: attrs
+                .iter()
+                .map(|(id, cur, thr, raw)| crate::ata_smart::Attribute {
+                    id: *id,
+                    current: *cur,
+                    worst: *cur,
+                    threshold: Some(*thr),
+                    raw: *raw,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn sata_health(a: crate::ata_smart::AtaSmart) -> NvmeHealth {
+        let d = disk(1, "Patriot P210 512GB", "", "SATA");
+        let mut h = collect(
+            &Src(Err(ProbeError::InvalidFunction)),
+            &d,
+            "2026-10-09T10:00:00",
+        );
+        crate::nvme_health::apply_ata(&mut h, a);
+        h
+    }
+
+    fn sata_inputs(h: NvmeHealth) -> StorageHealthInputs {
+        StorageHealthInputs {
+            physical_identity: "PHYS#Patriot P210 512GB#IDX1".into(),
+            disk_index: Some(1),
+            benchmark: None,
+            retest: RetestOutcome::NotNeeded,
+            nvme: Some(h),
+            events: EventsInput::Collected(Vec::new()),
+            assessed_at: "2026-10-09T10:00:00".into(),
+        }
+    }
+
+    #[test]
+    fn ata_smart_present_is_never_correlation_unavailable() {
+        // Real case (Patriot SATA): ATA SMART read OK, correlation said
+        // "Данные здоровья контроллера недоступны (UNSUPPORTED)".
+        let clean = ata(&[
+            (5, 100, 10, 0),
+            (9, 100, 0, 812),
+            (194, 70, 0, 33),
+            (197, 100, 0, 0),
+        ]);
+        let c = classify(&sata_inputs(sata_health(clean)));
+        assert_eq!(c.state, StorageState::Ok);
+        assert!(
+            !c.findings
+                .iter()
+                .any(|f| matches!(f, Finding::HealthUnavailable(_)))
+        );
+        assert!(c.findings.contains(&Finding::AtaSmartOk));
+    }
+
+    #[test]
+    fn ata_smart_threshold_and_sector_counters_drive_the_verdict() {
+        let bad = ata(&[(5, 5, 10, 120), (197, 100, 0, 8)]);
+        let c = classify(&sata_inputs(sata_health(bad)));
+        assert_eq!(c.state, StorageState::StorageProblem);
+        assert!(c.findings.contains(&Finding::AtaThresholdExceeded(vec![5])));
+        assert!(
+            c.findings
+                .contains(&Finding::AtaSectorCounters(vec![(5, 120), (197, 8)]))
+        );
+        let warn = ata(&[(5, 100, 10, 2)]);
+        assert_eq!(
+            classify(&sata_inputs(sata_health(warn))).state,
+            StorageState::StorageAttention
+        );
+    }
+
+    #[test]
+    fn ata_smart_present_is_never_manifest_unsupported() {
+        let h = sata_health(ata(&[(5, 100, 10, 0)]));
+        assert_eq!(
+            crate::nvme_health::health_source_status(&h),
+            ("ata_smart", "OK")
+        );
+        let j = crate::nvme_health::to_json(&h);
+        assert!(j.contains("\"health_source\": \"ata_smart\""), "{j}");
+        assert!(j.contains("\"health_status\": \"OK\""), "{j}");
+        assert!(!j.contains("ATA SMART is not implemented"), "{j}");
+        // Unreadable ATA (RAID/bridge) stays honestly UNSUPPORTED.
+        let mut none = sata_health(crate::ata_smart::AtaSmart::unsupported("bridge"));
+        none.ata_smart = Some(crate::ata_smart::AtaSmart::unsupported("bridge"));
+        assert_eq!(
+            crate::nvme_health::health_source_status(&none).1,
+            "UNSUPPORTED"
+        );
+        assert_eq!(
+            classify(&sata_inputs(none)).state,
+            StorageState::InsufficientData
+        );
+    }
+
+    #[test]
+    fn reliability_wear_zero_is_no_reliable_data() {
+        let r = crate::nvme_health::parse_reliability(
+            "WSD_REL {\"Temperature\":33,\"Wear\":0,\"PowerOnHours\":812}",
+        )
+        .expect("parsed");
+        assert_eq!(r.wear_percent, None, "Wear 0 is not '0 % worn'");
+        let r = crate::nvme_health::parse_reliability("WSD_REL {\"Wear\":7}").expect("parsed");
+        assert_eq!(r.wear_percent, Some(7.0));
+    }
+
+    #[test]
+    fn correlation_records_source_scope_temperature_session_and_delta() {
+        let a = ata(&[(5, 100, 10, 0), (194, 70, 0, 41)]);
+        let i = sata_inputs(sata_health(a));
+        let c = classify(&i);
+        let rec = crate::storage_history::SessionRecord {
+            session_id: "WSD-20261009-100000-1".into(),
+            physical_identity: i.physical_identity.clone(),
+            start_time: "2026-10-09T09:58:00".into(),
+            end_time: "2026-10-09T10:00:00".into(),
+            status: crate::storage_history::SessionStatus::Completed,
+            producer_version: "1.0".into(),
+            storage_state: c.state.code().into(),
+            error_log_entries: None,
+            media_errors: None,
+        };
+        let text = to_json_with(
+            &i,
+            &c,
+            "Patriot P210 512GB",
+            None,
+            &[],
+            &CorrelationExtras {
+                session: Some(rec),
+                error_log_delta: Some(crate::storage_history::ErrorLogDelta::Stable { value: 3 }),
+            },
+        );
+        let v = json::parse(&text).expect("valid JSON");
+        assert_eq!(v.get("health_status").and_then(|x| x.as_str()), Some("OK"));
+        assert_eq!(
+            v.get("health_source").and_then(|x| x.as_str()),
+            Some("ata_smart")
+        );
+        let scope = v.get("evidence_scope").expect("scope");
+        assert_eq!(
+            scope.get("cross_disk_evidence_used"),
+            Some(&json::Value::Bool(false))
+        );
+        let t = v.get("temperature").expect("temperature");
+        assert_eq!(
+            t.get("source").and_then(|x| x.as_str()),
+            Some("ata_smart_attribute_194_190")
+        );
+        let s = v.get("session").expect("session");
+        assert_eq!(s.get("status").and_then(|x| x.as_str()), Some("COMPLETED"));
+        assert_eq!(
+            s.get("producer_version").and_then(|x| x.as_str()),
+            Some("1.0")
+        );
+        assert_eq!(
+            v.get("error_log_delta")
+                .and_then(|d| d.get("code"))
+                .and_then(|x| x.as_str()),
+            Some("STABLE")
+        );
+        // Plain to_json stays valid with null blocks.
+        let plain = to_json(&i, &c, "m", None, &[]);
+        assert!(json::parse(&plain).is_some(), "{plain}");
     }
 }

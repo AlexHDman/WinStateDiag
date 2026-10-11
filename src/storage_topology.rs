@@ -249,6 +249,34 @@ pub fn candidates_from(source: &dyn TopologySource) -> Vec<DiskCandidate> {
     )
 }
 
+/// STORAGE_BUS_TYPE (winioctl.h) → name. v0.4.4 fix: 10 is BusTypeSas and
+/// 11 is BusTypeSata (a SATA disk was previously named "SD" and then sent
+/// the NVMe protocol).
+pub fn bus_type_name(code: u32) -> &'static str {
+    match code {
+        1 => "SCSI",
+        2 => "ATAPI",
+        3 => "ATA",
+        4 => "1394",
+        5 => "SSA",
+        6 => "Fibre",
+        7 => "USB",
+        8 => "RAID",
+        9 => "iSCSI",
+        10 => "SAS",
+        11 => "SATA",
+        12 => "SD",
+        13 => "MMC",
+        14 => "Virtual",
+        15 => "FileBackedVirtual",
+        16 => "Spaces",
+        17 => "NVMe",
+        18 => "SCM",
+        19 => "UFS",
+        _ => "Unknown",
+    }
+}
+
 #[cfg(windows)]
 pub mod windows_source {
     //! Real Windows enumeration: `\\.\PhysicalDriveN` +
@@ -371,19 +399,7 @@ pub mod windows_source {
             .collect()
     }
 
-    fn bus_type_name(code: u32) -> &'static str {
-        // STORAGE_BUS_TYPE (winioctl.h); only the codes worth naming.
-        match code {
-            1 => "SCSI",
-            3 => "ATA",
-            7 => "USB",
-            8 => "RAID",
-            10 => "SATA",
-            11 => "SD",
-            17 => "NVMe",
-            _ => "Unknown",
-        }
-    }
+    use super::bus_type_name;
 
     fn read_cstr_at(buf: &[u8], offset: i32) -> String {
         if offset <= 0 || offset as usize >= buf.len() {
@@ -982,5 +998,15 @@ mod tests {
     fn capacity_text_matches_the_label_rounding() {
         let d = disk(0, "Samsung 9100 PRO 1TB", "S1", "NVMe", true);
         assert_eq!(capacity_text(&d), "1 TB");
+    }
+
+    #[test]
+    fn storage_bus_type_codes_match_winioctl() {
+        assert_eq!(bus_type_name(11), "SATA");
+        assert_eq!(bus_type_name(10), "SAS");
+        assert_eq!(bus_type_name(17), "NVMe");
+        assert_eq!(bus_type_name(8), "RAID");
+        assert_eq!(bus_type_name(12), "SD");
+        assert_eq!(bus_type_name(99), "Unknown");
     }
 }

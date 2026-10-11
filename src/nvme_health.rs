@@ -352,10 +352,30 @@ pub trait NvmeLogSource {
         log_id: u8,
         length: usize,
     ) -> Result<LogRead, ProbeError>;
+    /// v0.4.5: Identify Controller (CNS 01h, 4096 bytes) — read only for
+    /// the drive-reported WCTEMP / CCTEMP thresholds. Optional.
+    fn read_identify_controller(&self, _disk_index: u32) -> Result<LogRead, ProbeError> {
+        Err(ProbeError::NotSupported(50))
+    }
+}
+
+/// Identify Controller length.
+pub const IDENTIFY_LEN: usize = 4096;
+
+/// Drive-reported composite temperature thresholds (Identify Controller
+/// WCTEMP bytes 266–267, CCTEMP bytes 268–269, Kelvin). 0 / implausible
+/// values mean "not reported" — never a guess.
+pub fn parse_temp_thresholds(id: &[u8]) -> (Option<f64>, Option<f64>) {
+    let k = |at: usize| -> Option<f64> {
+        let v = u16::from_le_bytes([*id.get(at)?, *id.get(at + 1)?]);
+        // 20 °C … 150 °C: anything else is not a usable threshold.
+        (293..=423).contains(&v).then(|| f64::from(v) - 273.0)
+    };
+    (k(266), k(268))
 }
 
 /// The whole health record for one physical disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NvmeHealth {
     /// Same identity as the SSD benchmark / history.
     pub physical_identity: String,
@@ -375,6 +395,109 @@ pub struct NvmeHealth {
     /// Non-empty entries read (newest first as the controller returns them).
     /// `None` when the page was not read.
     pub error_log: Option<Vec<ErrorLogEntry>>,
+    /// v0.4.4: Windows Storage Reliability counters (SATA/other fallback;
+    /// facts only, `None` when not read / not available).
+    pub reliability: Option<StorageReliability>,
+    /// v1.0: read-only ATA / SATA SMART attributes (`None` = not an ATA
+    /// disk / not read).
+    pub ata_smart: Option<crate::ata_smart::AtaSmart>,
+    /// v0.4.5: drive-reported warning / critical composite temperature
+    /// (Identify Controller WCTEMP / CCTEMP, °C); `None` = not reported.
+    pub temp_warning_c: Option<f64>,
+    pub temp_critical_c: Option<f64>,
+}
+
+/// v0.4.4 health routing by the Windows bus type (STORAGE_BUS_TYPE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthRoute {
+    /// Native NVMe log pages.
+    Nvme,
+    /// SATA/ATA: never the NVMe protocol. ATA SMART is not implemented; the
+    /// Windows Storage Reliability counters are the fallback.
+    AtaSata,
+    /// RAID/RST, SCSI, USB, unknown: NVMe pass-through may exist (e.g. an
+    /// NVMe drive behind RST or a USB bridge); a refusal is UNSUPPORTED.
+    Probe,
+    /// SAS, SD, MMC, virtual, Storage Spaces…: no supported provider.
+    NotApplicable,
+}
+
+pub fn route(bus_type: &str) -> HealthRoute {
+    match bus_type.trim() {
+        "NVMe" => HealthRoute::Nvme,
+        "SATA" | "ATA" | "ATAPI" => HealthRoute::AtaSata,
+        "RAID" | "SCSI" | "USB" | "Unknown" | "" => HealthRoute::Probe,
+        _ => HealthRoute::NotApplicable,
+    }
+}
+
+/// `MSFT_StorageReliabilityCounter` facts (read-only, may be all empty).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StorageReliability {
+    pub temperature_c: Option<f64>,
+    pub wear_percent: Option<f64>,
+    pub power_on_hours: Option<f64>,
+    pub read_errors_total: Option<f64>,
+    pub read_errors_uncorrected: Option<f64>,
+    pub write_errors_total: Option<f64>,
+    pub write_errors_uncorrected: Option<f64>,
+}
+
+impl StorageReliability {
+    pub fn is_empty(&self) -> bool {
+        *self == StorageReliability::default()
+    }
+}
+
+/// Read-only Windows Storage Reliability reader for `PhysicalDrive{N}`.
+pub fn reliability_ps1(index: u32) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Continue'
+$r = $null
+try {{
+    $d = Get-PhysicalDisk -ErrorAction Stop | Where-Object {{ [string]$_.DeviceId -eq '{index}' }} | Select-Object -First 1
+    if ($d) {{ $r = $d | Get-StorageReliabilityCounter -ErrorAction Stop }}
+}} catch {{ }}
+$o = [ordered]@{{}}
+if ($r) {{ foreach ($k in @('Temperature','Wear','PowerOnHours','ReadErrorsTotal','ReadErrorsUncorrected','WriteErrorsTotal','WriteErrorsUncorrected')) {{ $o[$k] = $r.$k }} }}
+Write-Output ('WSD_REL ' + (ConvertTo-Json -InputObject ([PSCustomObject]$o) -Compress))
+"#
+    )
+}
+
+pub fn parse_reliability(stdout: &str) -> Option<StorageReliability> {
+    let v = json::parse(crate::ps_exec::marked_line(stdout, "WSD_REL ")?)?;
+    let n = |k: &str| match v.get(k) {
+        Some(json::Value::Num(x)) => Some(*x),
+        _ => None,
+    };
+    // A 0 °C / 0 h reading from an empty counter is not a value.
+    let pos = |x: Option<f64>| x.filter(|v| *v > 0.0);
+    Some(StorageReliability {
+        temperature_c: pos(n("Temperature")),
+        // v1.0 item 14: MSFT_StorageReliabilityCounter returns Wear = 0 for
+        // drives that do not report wear at all — 0 is not "0 % worn".
+        // Only a positive value is a reading; otherwise "no reliable data".
+        wear_percent: pos(n("Wear")),
+        power_on_hours: pos(n("PowerOnHours")),
+        read_errors_total: n("ReadErrorsTotal"),
+        read_errors_uncorrected: n("ReadErrorsUncorrected"),
+        write_errors_total: n("WriteErrorsTotal"),
+        write_errors_uncorrected: n("WriteErrorsUncorrected"),
+    })
+}
+
+/// Reads the Storage Reliability counters of `PhysicalDrive{index}`
+/// (read-only `Get-StorageReliabilityCounter`). `None` when the host could
+/// not run or produced no result; an empty record means "no data".
+pub fn read_reliability(host: &str, index: u32) -> Option<StorageReliability> {
+    let out = crate::ps_exec::run_powershell(
+        host,
+        &reliability_ps1(index),
+        std::time::Duration::from_secs(60),
+    )
+    .ok()?;
+    parse_reliability(&out)
 }
 
 pub const WINDOWS_API_SOURCE: &str = "IOCTL_STORAGE_QUERY_PROPERTY + STORAGE_PROTOCOL_SPECIFIC_DATA (ProtocolTypeNvme, NVMeDataTypeLogPage) on \\\\.\\PhysicalDriveN";
@@ -382,7 +505,7 @@ pub const WINDOWS_API_SOURCE: &str = "IOCTL_STORAGE_QUERY_PROPERTY + STORAGE_PRO
 /// True for buses where NVMe log pages can never apply (ATA SMART is a
 /// different command set and is deliberately not implemented).
 pub fn is_ata_bus(bus_type: &str) -> bool {
-    matches!(bus_type, "SATA" | "ATA" | "ATAPI")
+    route(bus_type) == HealthRoute::AtaSata
 }
 
 /// Collects the health record for `disk` through `source`. Never panics;
@@ -405,12 +528,21 @@ pub fn collect(
         error_log_status: ProbeStatus::Unsupported,
         error_log_detail: None,
         error_log: None,
+        reliability: None,
+        ata_smart: None,
+        temp_warning_c: None,
+        temp_critical_c: None,
     };
-    if is_ata_bus(&disk.bus_type) {
-        let why = format!(
-            "bus type {}: NVMe log pages do not apply (ATA SMART is not implemented)",
-            disk.bus_type
-        );
+    let r = route(&disk.bus_type);
+    if matches!(r, HealthRoute::AtaSata | HealthRoute::NotApplicable) {
+        let why = if r == HealthRoute::AtaSata {
+            format!(
+                "bus type {}: SMART NOT AVAILABLE — NVMe log pages do not apply; health from ATA SMART when the read succeeds (Windows Storage Reliability counters as facts)",
+                disk.bus_type
+            )
+        } else {
+            format!("bus type {}: no supported health provider", disk.bus_type)
+        };
         h.status_detail = Some(why.clone());
         h.error_log_detail = Some(why);
         return h;
@@ -431,6 +563,13 @@ pub fn collect(
             h.status = e.status();
             h.status_detail = Some(e.describe());
         }
+    }
+    if h.status == ProbeStatus::Ok
+        && let Ok(id) = source.read_identify_controller(disk.index)
+    {
+        let (w, c) = parse_temp_thresholds(&id.data);
+        h.temp_warning_c = w;
+        h.temp_critical_c = c;
     }
     if h.status != ProbeStatus::Ok {
         h.error_log_status = h.status;
@@ -485,6 +624,76 @@ fn num<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "null".into())
 }
 
+/// Attach an ATA SMART read to a SATA health record. A successful read
+/// becomes the record's health source: the stale "ATA SMART is not
+/// implemented" detail is replaced so no consumer reports UNSUPPORTED.
+pub fn apply_ata(h: &mut NvmeHealth, ata: crate::ata_smart::AtaSmart) {
+    if ata.state == crate::ata_smart::AtaState::Ok {
+        h.status_detail = Some(format!(
+            "bus type {}: NVMe log pages do not apply; ATA SMART read OK ({}) — current health source",
+            h.bus_type,
+            ata.health()
+        ));
+        if !h.source.contains("ATA SMART") {
+            h.source = format!("{}; ATA SMART READ DATA/THRESHOLDS", h.source);
+        }
+    }
+    h.ata_smart = Some(ata);
+}
+
+/// v1.0 item 17: the drive temperature WITH its provenance. Order: the
+/// NVMe composite sensor, ATA attribute 194/190, then the Windows Storage
+/// Reliability counter. Never a board / CPU sensor, never 0.
+pub fn temperature_provenance(h: &NvmeHealth) -> Option<(f64, &'static str)> {
+    if let Some(c) = h.smart.as_ref().and_then(|l| l.composite_temperature_c()) {
+        return Some((c as f64, "nvme_smart_composite_temperature"));
+    }
+    if let Some(t) = h
+        .ata_smart
+        .as_ref()
+        .filter(|a| a.state == crate::ata_smart::AtaState::Ok)
+        .and_then(|a| a.temperature_c())
+    {
+        return Some((t as f64, "ata_smart_attribute_194_190"));
+    }
+    h.reliability
+        .as_ref()
+        .filter(|r| !r.is_empty())
+        .and_then(|r| r.temperature_c)
+        .map(|t| (t, "msft_storage_reliability_counter"))
+}
+
+/// Normalized current-health record: (health_source, health_status).
+/// ATA SMART is the source of truth for SATA drives — a successful ATA
+/// read is never reported as UNSUPPORTED just because the NVMe log page
+/// is absent (v1.0 item 13).
+pub fn health_source_status(h: &NvmeHealth) -> (&'static str, &'static str) {
+    if let Some(l) = h.smart.as_ref() {
+        let cw = l.critical_warning;
+        let status = if cw & 0b1101 != 0 {
+            "PROBLEM"
+        } else if cw != 0 || l.media_and_data_integrity_errors > 0 || l.percentage_used >= 100 {
+            "ATTENTION"
+        } else {
+            "OK"
+        };
+        return ("nvme_smart_health_log", status);
+    }
+    if let Some(a) = h
+        .ata_smart
+        .as_ref()
+        .filter(|a| a.state == crate::ata_smart::AtaState::Ok)
+    {
+        let status = match a.health() {
+            "SMART: THRESHOLD EXCEEDED" => "PROBLEM",
+            "SMART: OK" => "OK",
+            _ => "ATTENTION",
+        };
+        return ("ata_smart", status);
+    }
+    ("none", h.status.as_str())
+}
+
 /// Evidence JSON (UTF-8, `\n`, fixed field order). Missing values are
 /// `null`, never 0. No serial number field is added: the only device tag
 /// is the physical identity the SSD benchmark evidence already records.
@@ -509,6 +718,22 @@ pub fn to_json(h: &NvmeHealth) -> String {
             "  \"status_detail\": {}",
             opt_str(h.status_detail.as_deref())
         ),
+        format!(
+            "  \"health_source\": {}",
+            json::string(health_source_status(h).0)
+        ),
+        format!(
+            "  \"health_status\": {}",
+            json::string(health_source_status(h).1)
+        ),
+        format!(
+            "  \"temperature\": {}",
+            temperature_provenance(h)
+                .map(|(c, src)| format!("{{\"celsius\": {c}, \"source\": {}}}", json::string(src)))
+                .unwrap_or_else(|| "null".into())
+        ),
+        format!("  \"temp_warning_c\": {}", num(h.temp_warning_c)),
+        format!("  \"temp_critical_c\": {}", num(h.temp_critical_c)),
     ];
     let flags = s
         .map(|l| {
@@ -661,6 +886,26 @@ pub fn to_json(h: &NvmeHealth) -> String {
         opt_str(h.error_log_detail.as_deref()),
         entries
     ));
+    f.push(match &h.reliability {
+        None => "  \"storage_reliability\": null".to_string(),
+        Some(r) => {
+            let n = |v: Option<f64>| v.map(|x| format!("{x}")).unwrap_or_else(|| "null".into());
+            format!(
+                "  \"storage_reliability\": {{\"source\": \"MSFT_StorageReliabilityCounter\", \"temperature_c\": {}, \"wear_percent\": {}, \"power_on_hours\": {}, \"read_errors_total\": {}, \"read_errors_uncorrected\": {}, \"write_errors_total\": {}, \"write_errors_uncorrected\": {}}}",
+                n(r.temperature_c),
+                n(r.wear_percent),
+                n(r.power_on_hours),
+                n(r.read_errors_total),
+                n(r.read_errors_uncorrected),
+                n(r.write_errors_total),
+                n(r.write_errors_uncorrected)
+            )
+        }
+    });
+    f.push(match &h.ata_smart {
+        None => "  \"ata_smart\": null".to_string(),
+        Some(s) => format!("  \"ata_smart\": {}", crate::ata_smart::to_json(s)),
+    });
     f.push(format!(
         "  \"note\": {}",
         json::string(
@@ -703,6 +948,9 @@ pub mod windows_source {
     const PROTOCOL_TYPE_NVME: Dword = 3;
     /// STORAGE_PROTOCOL_NVME_DATA_TYPE::NVMeDataTypeLogPage.
     const NVME_DATA_TYPE_LOG_PAGE: Dword = 2;
+    /// NVMeDataTypeIdentify + NVME_IDENTIFY_CNS_CONTROLLER (v0.4.5).
+    const NVME_DATA_TYPE_IDENTIFY: Dword = 1;
+    const NVME_IDENTIFY_CNS_CONTROLLER: Dword = 1;
 
     const ERROR_INVALID_FUNCTION: Dword = 1;
     const ERROR_ACCESS_DENIED: Dword = 5;
@@ -804,14 +1052,30 @@ pub mod windows_source {
         log_id: u8,
         length: usize,
     ) -> Result<Vec<u8>, ProbeError> {
+        query_typed(
+            h,
+            property_id,
+            NVME_DATA_TYPE_LOG_PAGE,
+            Dword::from(log_id),
+            length,
+        )
+    }
+
+    fn query_typed(
+        h: &OwnedHandle,
+        property_id: Dword,
+        data_type: Dword,
+        request_value: Dword,
+        length: usize,
+    ) -> Result<Vec<u8>, ProbeError> {
         let total = QUERY_HEADER_LEN + PSD_LEN + length;
         let mut buf = vec![0u8; total];
         buf[0..4].copy_from_slice(&property_id.to_le_bytes());
         buf[4..8].copy_from_slice(&PROPERTY_STANDARD_QUERY.to_le_bytes());
         let psd = StorageProtocolSpecificData {
             protocol_type: PROTOCOL_TYPE_NVME,
-            data_type: NVME_DATA_TYPE_LOG_PAGE,
-            protocol_data_request_value: Dword::from(log_id),
+            data_type,
+            protocol_data_request_value: request_value,
             protocol_data_request_sub_value: 0,
             protocol_data_offset: PSD_LEN as Dword,
             protocol_data_length: length as Dword,
@@ -896,6 +1160,31 @@ pub mod windows_source {
                 .map_err(|_| first),
             }
         }
+
+        fn read_identify_controller(&self, disk_index: u32) -> Result<LogRead, ProbeError> {
+            let h = open_read_only(disk_index)?;
+            let q = |prop| {
+                query_typed(
+                    &h,
+                    prop,
+                    NVME_DATA_TYPE_IDENTIFY,
+                    NVME_IDENTIFY_CNS_CONTROLLER,
+                    super::IDENTIFY_LEN,
+                )
+            };
+            match q(STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY) {
+                Ok(data) => Ok(LogRead {
+                    data,
+                    via: "StorageDeviceProtocolSpecificProperty",
+                }),
+                Err(first) => q(STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY)
+                    .map(|data| LogRead {
+                        data,
+                        via: "StorageAdapterProtocolSpecificProperty",
+                    })
+                    .map_err(|_| first),
+            }
+        }
     }
 
     const _: () = assert!(PSD_LEN == 40 && DESCRIPTOR_LEN == 48);
@@ -941,6 +1230,28 @@ pub fn extract_protocol_data(out: &[u8], expected: usize) -> Result<Vec<u8>, Pro
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn identify_controller_thresholds_are_read_or_left_unknown() {
+        let mut id = vec![0u8; IDENTIFY_LEN];
+        id[266..268].copy_from_slice(&356u16.to_le_bytes()); // 83 °C
+        id[268..270].copy_from_slice(&358u16.to_le_bytes()); // 85 °C
+        assert_eq!(parse_temp_thresholds(&id), (Some(83.0), Some(85.0)));
+        let zero = vec![0u8; IDENTIFY_LEN];
+        assert_eq!(
+            parse_temp_thresholds(&zero),
+            (None, None),
+            "0 = not reported"
+        );
+        let mut bad = vec![0u8; IDENTIFY_LEN];
+        bad[266..268].copy_from_slice(&5000u16.to_le_bytes());
+        assert_eq!(
+            parse_temp_thresholds(&bad).0,
+            None,
+            "implausible is never used"
+        );
+        assert_eq!(parse_temp_thresholds(&[0u8; 10]), (None, None));
+    }
+
     use super::*;
     use std::cell::RefCell;
 
@@ -1390,5 +1701,69 @@ pub(crate) mod tests {
             .collect();
         assert!(ioctls.iter().all(|w| *w == "IOCTL_STORAGE_QUERY_PROPERTY"));
         assert!(code.contains("NVME_DATA_TYPE_LOG_PAGE: Dword = 2"));
+    }
+
+    /// The SATA fallback reader runs read-only and always yields a record
+    /// (empty when the host has no Storage cmdlets / no such disk).
+    #[test]
+    fn reliability_reader_runs_and_never_invents_values() {
+        let script = reliability_ps1(0);
+        for verb in [
+            "Set-",
+            "Remove-",
+            "Reset-",
+            "Initialize-",
+            "Format-",
+            "Repair-",
+        ] {
+            assert!(!script.contains(verb), "{verb}");
+        }
+        assert!(is_ata_bus("SATA") && !is_ata_bus("NVMe"));
+        let Some(host) = crate::ps_exec::test_host() else {
+            return;
+        };
+        let rel = read_reliability(&host, 9999).expect("marker line");
+        assert!(rel.is_empty(), "no disk 9999 → no values: {rel:?}");
+    }
+
+    /// v0.4.4 confirmed bug: a SATA disk must never get the NVMe protocol.
+    #[test]
+    fn routing_never_sends_nvme_protocol_to_sata() {
+        assert_eq!(route("NVMe"), HealthRoute::Nvme);
+        for bus in ["SATA", "ATA", "ATAPI"] {
+            assert_eq!(route(bus), HealthRoute::AtaSata);
+            let src = fake(Ok(smart_bytes()), Ok(vec![]));
+            let h = collect(&src, &disk(2, "XrayDisk 512GB", "", bus), "t");
+            assert!(src.calls.borrow().is_empty(), "{bus}: no NVMe IOCTL");
+            assert_eq!(h.status, ProbeStatus::Unsupported);
+            assert!(h.smart.is_none(), "no fabricated SMART");
+            assert!(h.status_detail.unwrap().contains("SMART NOT AVAILABLE"));
+        }
+        for bus in ["SAS", "SD", "Spaces", "Virtual"] {
+            assert_eq!(route(bus), HealthRoute::NotApplicable);
+            let src = fake(Ok(smart_bytes()), Ok(vec![]));
+            collect(&src, &disk(2, "x", "", bus), "t");
+            assert!(src.calls.borrow().is_empty());
+        }
+        for bus in ["RAID", "USB", "SCSI", "Unknown"] {
+            assert_eq!(route(bus), HealthRoute::Probe);
+        }
+        let rel = parse_reliability(
+            "WSD_REL {\"Temperature\":38,\"Wear\":2,\"PowerOnHours\":0,\"ReadErrorsTotal\":0}",
+        )
+        .unwrap();
+        assert_eq!(rel.temperature_c, Some(38.0));
+        assert_eq!(rel.power_on_hours, None, "0 h is an empty counter");
+        assert_eq!(rel.read_errors_total, Some(0.0));
+        assert!(parse_reliability("WSD_REL {}").unwrap().is_empty());
+        let mut h = collect(
+            &fake(Ok(smart_bytes()), Ok(vec![])),
+            &disk(2, "XrayDisk", "", "SATA"),
+            "t",
+        );
+        h.reliability = Some(rel);
+        let js = to_json(&h);
+        assert!(json::parse(&js).is_some(), "{js}");
+        assert!(js.contains("MSFT_StorageReliabilityCounter"));
     }
 }
