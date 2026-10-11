@@ -2,7 +2,7 @@
 
 This document holds engineering lessons from real diagnostic machines. Cases are anonymized and generalized: no client names, computer names or serial numbers.
 
-Status: **v0.4.3.** Items marked *backlog* are not implemented; they record what future evidence or classification must do.
+Status: **v1.0.** Items marked *backlog* are not implemented; they record what future evidence or classification must do. The v1.0 section at the end closes several earlier backlog items.
 
 ## Permanent principles
 
@@ -28,6 +28,7 @@ Status: **v0.4.3.** Items marked *backlog* are not implemented; they record what
 | **B. CHECK / ATTENTION** | An anomaly that needs correlation or a retest. |
 | **C. HISTORICAL / NOISE** | Old or isolated evidence without current impact. |
 | **D. WINSTATEDIAG ISSUE** | A tool-side problem: collection gap, classification error, contradictory summary, wrong terminology or unit, encoding issue, or another diagnostic-tool limitation. |
+| **INSUFFICIENT DATA** (v1.0) | A technical state, not a category of fault: the evidence needed for a verdict could not be collected (SMART blocked by a bridge / RAID path, a store that is absent, a reference that is missing). It is never shown as OK and never as a failure. |
 
 ## Real-machine lessons (v0.4.2 – v0.4.3)
 
@@ -43,9 +44,9 @@ Status: **v0.4.3.** Items marked *backlog* are not implemented; they record what
 | EXPC INFO steps without their own counter | D | Fixed (Info counter) |
 | One global `latest_evidence` for several physical disks | D | Fixed (per-disk `latest_evidence`) |
 | Error Log Entries = 4702 on a healthy NVMe drive (Patriot P300) | C (fact) | Never a fault verdict |
-| NVIDIA device: user-mode crash shown instead of stronger kernel-driver evidence | D | Backlog: strongest linked evidence |
-| System Event Log summary "OK" while a significant kernel event was already evidence | D | Backlog: cross-module consistency |
-| Repeated unattributed user-mode Code Integrity event hidden behind an overall OK | B / D | Backlog: Code Integrity aggregation |
+| NVIDIA device: user-mode crash shown instead of stronger kernel-driver evidence | D | Strongest linked evidence (v0.4.4); dump evidence priority 2 (v1.0) |
+| System Event Log summary "OK" while a significant kernel event was already evidence | D | v1.0: cross-module consistency note |
+| Repeated unattributed user-mode Code Integrity event hidden behind an overall OK | B / D | v1.0: Code Integrity aggregation (user vs kernel mode) |
 
 ### Native NVMe Health: real Windows validation
 
@@ -366,6 +367,148 @@ Older notes on this machine said a historical WUDFRd Event 219 could remain WARN
   - Values are filled by the driver and are often empty behind USB and RAID. An empty value is unknown, not 0.
   - The class needs administrator rights.
 
+## v0.4.4 lessons (source candidate; Windows / client live validation pending)
+
+### SATA disk routed to the NVMe protocol (WinStateDiag issue, fixed)
+
+- **Cause:** `STORAGE_BUS_TYPE` 11 was labelled "SATA/SD" and 10 "SATA". SAS and SATA were therefore confused, and a SATA disk could reach the NVMe log-page query.
+- **Fix:** the full winioctl mapping (10 SAS, 11 SATA, 12 SD, … 17 NVMe) and an explicit route:
+  - NVMe → native reader.
+  - SATA/ATA → Storage Reliability counters, otherwise SMART NOT AVAILABLE / INSUFFICIENT DATA.
+  - USB/RAID/RST → a provider if one exists, otherwise UNSUPPORTED.
+- **Rule:** `ProtocolTypeNvme` is never sent to a SATA disk. Missing values stay missing.
+
+### VSS shadow storage (classification)
+
+- ≥85 % use of the shadow-storage limit alone is **INFO**. Windows deletes old shadows by design.
+- **ATTENTION** needs Volsnap 25/33/35/36 or VSS 8193/12289 operational failures: recent ones (7 days), or older ones (30 days) combined with near-limit use.
+
+### Driver dates (classification)
+
+- A future date or negative age is **DATE ANOMALY / INFO** (often a placeholder date in the INF), and no negative age is shown.
+- Age alone is **AGE INFO**. It is never REVIEW OLD or WARNING, because old inbox drivers are often the current ones.
+
+### Crash dump analysis: confidence model
+
+- **HIGH:** a third-party module from `!analyze -v`, with good symbols, corroborated by Driver Audit evidence for the same driver (PnP, kernel/boot/TDR or Code Integrity).
+- **MEDIUM:** a third-party module without that corroboration, or with partial symbols.
+- **LOW:** only a generic or OS module (ntoskrnl, hal, win32k…), failed symbols, or signs of memory corruption.
+- **CAUSE NOT DETERMINED:** no usable module, or the analysis did not complete (timeout or error).
+- ntoskrnl / hal alone are never named as the cause.
+- **Correlation priority:** PnP → kernel / boot / TDR → Code Integrity → user-mode crash.
+- **Memory:** a memory-test *recommendation*, never a conclusion. It is given for:
+  - memory-corruption signs;
+  - bugchecks 0x1A / 0x4E / 0x12B;
+  - 0x139 without a third-party module;
+  - any LOW result.
+- **Read-only:**
+  - The original dump is only read and copied into the report.
+  - The debugger is installed only on an explicit click, via the official winget `Microsoft.WinDbg` package or the official download page.
+
+### Group Policy / ADMX health: lesson
+
+- **Real-world trigger:** after a Windows feature update (25H2 → 26H2), the Central Store's ADMX templates can lag behind the clients. GPMC then shows unknown or undefined settings, or ADML resource errors.
+- **Detecting this is diagnostic, not a repair:**
+  - WinStateDiag never copies ADMX/ADML, never touches SYSVOL, never runs gpupdate and never downloads templates.
+  - A standalone computer is **NOT APPLICABLE**, not an error.
+  - A domain member that cannot reach SYSVOL is **UNREACHABLE**, never "Central Store not found".
+- **Version evidence:**
+  - The template generation is never inferred from file names or timestamps.
+  - OUTDATED / OK requires the official Microsoft reference for the same release, or explicit `supportedOn` definitions. Otherwise the result is **INSUFFICIENT DATA**.
+  - 25H2 and 26H2 are handled separately.
+  - Local vs Central Store differences are informational.
+- **Official reference for 26H2:** https://aka.ms/Windows11/26H2/GPsettings ("Windows 11 and Windows Server 2019 Policy Settings — 26H2" spreadsheet, Microsoft Download Center id 108849).
+  - WinStateDiag reads it only if an administrator places the `.xlsx` in `Reference\` next to the EXE.
+  - The reference URL is written into every `GroupPolicy_ADMX_Health_*.json`.
+
+## v0.4.5 lessons: low-level hardware sensors (source candidate)
+
+### Real case: MSI PRO Z890-P WIFI, Core Ultra 7 270K Plus, RTX 5060
+
+- **What AIDA64 showed** (validation reference only, never a dependency):
+  - board 38 °C, CPU 54 °C, PCH 46 °C, GPU 36 °C, GPU hotspot 43 °C, DIMM 39 °C, Samsung 9100 46 °C, Netac 43 °C;
+  - +3.3 V 3.320, +5 V 5.020, +12 V 12.024, Vcore 1.418, VID 1.105;
+  - CPU package 58.44 W, IA cores 44.76 W, GPU 24.03 W, GPU 12VHPWR 17.58 W.
+- **What v0.4.4 showed:** SENSOR DATA NOT AVAILABLE. Real sensors existed; WinStateDiag simply had no provider that could reach them.
+- **Machine security state:** Memory Integrity (HVCI) on and the Microsoft vulnerable-driver blocklist on.
+
+### Why the backend choice is constrained by Windows security
+
+- **CPU MSR, Super I/O (board rails, fans) and SMBus (DIMM temperatures)** need ring-0 port/MSR access through a kernel driver.
+- **WinRing0** (used by LibreHardwareMonitor up to 0.9.4 and by OpenHardwareMonitor) is flagged by Microsoft Defender as `VulnerableDriver:WinNT/Winring0` and is on the vulnerable-driver blocklist. It is rejected.
+- **LibreHardwareMonitorLib 0.9.5+** uses the signed **PawnIO** driver instead.
+  - PawnIO is installed separately by its own setup as a persistent kernel driver service.
+  - WinStateDiag never installs it and never asks to.
+  - When the user has installed PawnIO (for example for another monitoring tool), the internal provider uses it automatically.
+- **Without PawnIO,** LibreHardwareMonitorLib still reads GPU (NVAPI/ADL/IGCL) and storage sensors. The provider then reports PARTIAL.
+- **Never done for sensors:** disabling HVCI / Memory Integrity, disabling the blocklist, whitelisting a driver, installing a service, or using unofficial forks/binaries.
+
+### Provider order and provenance
+
+- **Provider order:** NVMe Health (disks), internal LibreHardwareMonitorLib, HWiNFO shared memory, LHM/OHM WMI, nvidia-smi, Windows Storage Reliability, Win32_VoltageProbe, ACPI thermal zone.
+  - HWiNFO shared memory is used only if the user already runs HWiNFO with Shared Memory Support enabled.
+  - LHM/OHM WMI is used only if such a monitor is already running.
+- **Disagreement between providers** is never hidden. Both values are kept, the higher-priority provider is canonical, and Details show SENSOR SOURCE MISMATCH.
+- **NVMe temperatures** from the native NVMe Health reader are canonical. No second, contradictory SSD temperature is shown.
+
+### Classification rules (permanent)
+
+- **CPU temperature on the dashboard** = average of all cores. Per-core values stay in the raw JSON only.
+- **ATX rails:** only the motherboard's +12 V / +5 V / +3.3 V / 5VSB are rated against a nominal (≤3 % Отлично, ≤5 % Внимание!, else Критично!).
+  - Dynamic rails (Vcore, VID, VCCSA, VCCIO, VDD2, GPU core, PCIe/12VHPWR inputs) are informational and never rated.
+- **Confidence:**
+  - HIGH: board-specific mapping (named rail of a Super I/O chip from LHM/HWiNFO).
+  - MEDIUM: recognised chip with generic scaling, or a running LHM/OHM monitor with a board mapping.
+  - LOW: a generic WMI probe or ACPI thermal zone.
+  - A LOW/UNKNOWN rail outside tolerance becomes CHECK SENSOR / VERIFY EXTERNALLY, never red.
+- **Wording:** "Обнаружено отклонение линии питания. Показание датчика требует подтверждения внешним измерением." WinStateDiag never states that a PSU is faulty.
+  - Future correlation (rail deviation + Kernel-Power 41 + unexpected shutdown + BugCheck) may say "possible power instability", nothing stronger.
+- **Fans:** 0 RPM is a legal reading (zero-RPM modes). It is not a failure on its own.
+- **Min/Max:** WinStateDiag session sample values (about 10 s at 1 sample/s, no load applied), not lifetime hardware values.
+- **No invented values:** 0 °C channels and null values are dropped, never shown.
+
+## v0.4.5 consolidation lessons (local release candidate)
+
+- **Dashboard vs Details.** The dashboard only answers OK / Attention / Critical / Not checked. Raw evidence and provider/debug strings ("PARTIAL · LHM…") belong behind [Детали].
+- **Details are local.** An EXPC row's [Детали] shows that stage only: its EXPC records, its own sources (07: crash inventory + incidents; 14: Driver Audit) and its own journal lines. The header [Детали] stays the 14-stage summary. Regression tests cover the click target and the content.
+- **Details windows are OS windows** (immediate viewports). Users need them larger than, and outside of, the main window.
+- **Sensor references.**
+  - Only defensible references are shown: the ATX ±5 % band, the drive-reported NVMe WCTEMP / CCTEMP, "динамический" for dynamic rails, otherwise "без фикс. эталона".
+  - No universal temperature thresholds; no CPU/GPU limit unless reliably known (none in this pass).
+  - Only the number is coloured; a missing reference stays neutral.
+- **Autonomous sensor coverage is PARTIAL** on the MSI test PC (no PawnIO, no ring-0 provider). HWiNFO shared memory is an optional enhancement, never a requirement. Severity never changes because a provider is absent.
+- **Unexpected shutdown ≠ BSOD.**
+  - The crash card counts unexpected shutdowns, BugChecks and dumps separately.
+  - A Kernel-Power 41 without a BugCheck says "BSOD не подтверждён".
+  - A freeze is "HANG CONFIRMED" only with direct evidence (App Hang, TDR / LiveKernelEvent, WATCHDOG live report). Otherwise it is "HANG NOT CONFIRMED", because it could be a reset or power loss.
+  - The probable subsystem needs signals; ties and absence give "CAUSE NOT DETERMINED". KP41/6008 carry the boot time, so the timeline is anchored at the last System event before that boot.
+- **Branding.** `assets\logo.png` and `assets\expc-symbol.png` are canonical and never regenerated; only derived assets (header RGBA) are rebuilt from them. The window icon must be set in code because eframe installs egui's default icon otherwise.
+- **Client/Computer copy** never changes diagnostic state.
+
+## v1.0 lessons (local release candidate)
+
+Cases are anonymised: MSI test PC, a home PC with a 0x139 BSOD, several NVMe drives (Samsung 9100 PRO, Netac, Patriot P300, NX-512), two Windows servers and two office PCs.
+
+| Lesson | Category | v1.0 |
+|---|---|---|
+| 0x139 KERNEL_SECURITY_CHECK_FAILURE dump names a VPN miniport (`RvNetMP60.sys`, process `RvControlSvc`) while Driver Audit says "0 problems / 0 warnings" — the module was outside the audited device set | D | **Fixed.** Dump-driven extension: lmvm + read-only driver resolution; the culprit is always a Driver Audit item (BugcheckDump, priority 2); confidence still from the base audit. |
+| SSD sequence ACCEPT → UNSTABLE (`_02`, same minute) → retest ACCEPT; manifest kept the stale UNSTABLE as `latest_evidence`; the second correlation referenced the FIRST run's benchmark and health files | D | **Fixed.** Stored names returned by the package; retest named after its own run; manifest picks the current run by the evidence timestamp and lists `current_sequence`; correlation references the exact runs. |
+| CHKDSK "Windows обнаружила проблемы, которые были исправлены в оперативном режиме" reported as OK | D | **Fixed.** `finding_class` REPAIRED → ATTENTION ("ИСПРАВЛЕНО / ВНИМАНИЕ"); execution and finding are separate; RU/EN tests. |
+| Collector text with Cyrillic decoded from the OEM code page (event messages, update titles, service names) | D | **Fixed.** UTF-8 output for every collector. |
+| Launched from a PowerShell 7 session, the 5.1 collectors inherited PS7's `PSModulePath` and silently lost `Get-AuthenticodeSignature` (empty signature) | D | **Fixed.** `PSModulePath` cleared for the child; regression test. |
+| Sensor pass at 88–96 % CPU load claimed "no stress" without saying where the load came from | D | **Fixed.** Process snapshot during sampling (system CPU %, top 5 processes when ≥ 50 %); context, never a fault. |
+| Mixed DIMM capacities raised a hardware WARNING on a machine with clean WHEA and memory tests | D | **Fixed.** Mixed capacities / speeds and configured-below-rated are INFO context. |
+| "System events: OK" next to Driver Audit evidence from the System log | D | **Fixed.** Cross-module consistency qualifies the OK stage. |
+| Summary counters ("11 VSS events in 7 days / 28 in 8–30 days") not verifiable in the ZIP | D | **Fixed.** `Event_Evidence_*.json`: count, 7-day count, first / last, latest messages, parsed fields; shown stage-locally. |
+| SideBySide 33 from a browser self-updater: one event per temp folder (`sdwra_<pid>_<n>`) | C | Aggregated by executable + assembly (66 events → one line); full paths kept in the messages; no owner invented. |
+| Repeated user-mode Code Integrity (hundreds of events) | B / C | Aggregated (process + module); kernel-mode CI stays separate and stronger; count alone is not severity. |
+| Windows Update Event 20 (store app packages, 0x80073d02) repeated | C | Historical when a later install (19) succeeded; KB / HRESULT / title kept. |
+| SATA HDDs had no SMART at all (Storage Reliability only) | D | **Fixed where the path allows.** Read-only ATA SMART (READ DATA / THRESHOLDS); MSI: 3 SATA HDDs OK, NVMe honestly UNSUPPORTED on this path. |
+| Approved full EXPC logo delivered with a baked-in checkerboard | D (asset) | Keyed without touching artwork pixels (`scripts/key_logo.py`); body shifted, logo not shrunk. |
+| Titlebar icon tiny / blurry (256 px frame shrunk by Windows) | D | Resource icon at system sizes via `WM_SETICON`. |
+
+Permanent principle (unchanged): **EVENT COUNT ALONE DOES NOT DETERMINE SEVERITY.**
+
 ## Process
 
 After the user approves an implementation, the steps are:
@@ -379,3 +522,24 @@ After the user approves an implementation, the steps are:
 7. push.
 
 The README describes only public functionality that already works.
+
+
+## v1.0 Stable consolidation — real-case feedback closed (2026-10-10)
+
+Sanitized real cases (machines anonymised), each now a regression test:
+
+| Case | Wrong before | Now |
+|---|---|---|
+| Server with Hyper-V unavailable | Hypervisor 41 → 6 "unexpected shutdowns" | Hypervisor INFO; Kernel-Power only by provider |
+| Workstation services | 7009 grouped by 30000 / 45000; CDPSvc ×6 hidden | grouped by service; CDPSvc actionable |
+| Office PC | "1 application error" | «happd.exe — 1× сбой · Exception 0x…» |
+| Office PC | VSS faulty (Volsnap 33 / 8224) | normal activity |
+| Office PC | Pending reboot from software cleanup | INFO cleanup |
+| Several | empty unsigned-driver WARNING; Aladdin "no valid signature" | identity required; "not confirmed by current method" |
+| Workstation | oem16.inf = Kaspersky + Intel Graphics | mapping conflict, no delete advice |
+| Workstation | CI 3004 DefenderSessionHelper missing | software / security finding |
+| SATA SSD | 2.5–3 GB/s benchmark | BENCHMARK INVALID |
+| SATA disks | SMART present but UNSUPPORTED in manifest / correlation | ATA health source of truth |
+| Patriot NVMe | absolute 4710 error-log entries alarming | delta between completed sessions |
+| Notebook LPDDR5 | 8 SMBIOS devices read as 8 modules | «распаянная, SMBIOS: 8 устр.» |
+| MSI | WinDbg installed shown as not installed | re-detection, package / backend states |

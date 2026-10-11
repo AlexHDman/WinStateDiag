@@ -65,7 +65,7 @@ cargo build --release          # static CRT, see .cargo/config.toml
 powershell -ExecutionPolicy Bypass -File scripts\make_release.ps1
 ```
 
-The release script produces `dist\WinStateDiag-vX.Y.Z\WinStateDiag.exe`. The version comes from `Cargo.toml` (title bar, EXE metadata and release folder follow it).
+The release script produces `dist\WinStateDiag-vX.Y\WinStateDiag.exe` (since v1.0 releases are named `major.minor`; a patch digit appears only when it is not zero). The version comes from `Cargo.toml` (title bar, EXE metadata, manifest and release folder follow it).
 
 Repository layout: `src\` (Rust GUI and orchestration), `embedded\` (PowerShell diagnostic engine, embedded into the EXE), `assets\` (icon and branding), `scripts\` (release and QA scripts), `docs\` (architecture, known bugs, visual master).
 

@@ -1,5 +1,45 @@
 # WinStateDiag — Known bugs
 
+## Fixed in v1.0 (kept for history)
+
+| Bug | Fix |
+|---|---|
+| Hyper-V-Hypervisor Event 41 counted as Kernel-Power unexpected shutdown (6 false incidents) | Provider + EventID identity; regression fixture. |
+| SCM 7009 grouped by timeout (30000 / 45000) | Grouped by service (param2); timeout is an attribute. |
+| CDPSvc repeated failures not surfaced | Actionable recurring groups (≥ 3). |
+| SATA SSD benchmark reported 2571–3065 MB/s | Target re-derived from the selected disk; transport plausibility gate → BENCHMARK INVALID. |
+| ATA SMART collected but manifest / correlation said UNSUPPORTED | Normalized `health_source` / `health_status`; correlation classifies ATA. |
+| Reliability Wear = 0 shown as 0 % wear | "no reliable data". |
+| Empty "unsigned driver" WARNING without identity | Identity + SIGCHK required; otherwise INSUFFICIENT DATA / not confirmed. |
+| oem16.inf mapped to Kaspersky + Intel Graphics | Mapping conflict evidence, no delete advice. |
+| CI 3004 DefenderSessionHelper dropped (no PnP device) | Software / security findings. |
+| Volsnap 33 / VSS 8224 marked as VSS failure | Normal activity (INFO). |
+| WinDbg installed but shown "НЕ УСТАНОВЛЕН / не удалось установить" | Independent re-detection; package vs backend states. |
+| Crash card and Details counters disagreed | One `Counters` source. |
+| SSD final state: manifest `latest_evidence` kept a stale UNSTABLE run after UNSTABLE → retest → STABLE (same-minute `_02` collision; retest named after the first run) | Stored names returned by the package; `<initial>_retest` naming; manifest orders by evidence timestamp; `current_sequence`. |
+| `Storage_Correlation_*_02.json` referenced the first run's benchmark / health files | Correlation references the exact stored files of its own run. |
+| CHKDSK online repair ("исправлены в оперативном режиме") shown as OK | `finding_class` REPAIRED → ATTENTION. |
+| Crash manifest `latest_evidence` listed only the `.dmp` | Complete set: dump + analysis TXT + summary JSON. |
+| Driver Audit "0 problems / 0 warnings" while a dump named a third-party kernel module outside the audited set | Dump-driven Driver Audit extension. |
+| Collector Cyrillic text decoded from the OEM code page; signature missing when started from PowerShell 7 | UTF-8 prelude; `PSModulePath` cleared for the 5.1 child. |
+| `manifest.rs` legacy ordering read the date dots of a bare stem as an extension (`run_key` on "…_05.10.26_10-58" returned nothing) | Found by the v1.0 regression tests; keys are built from full names. |
+
+## OPEN: Windows Update / Store package Event 20 titles
+
+- Store app updates (WindowsUpdateClient 20, HRESULT 0x80073d02 "package in use") repeat on many machines. v1.0 aggregates them and marks them historical when a later install succeeded; there is no deeper Store-package diagnosis yet.
+
+## OPEN: sensors without a safe user-mode path
+
+- CPU temperature / package power, +12V / +5V / +3.3V, board / PCH temperatures, CPU / system fans and DIMM temperatures need privileged MSR / Super-I/O / SMBus access. They read «Нет данных» unless the user's own PawnIO, or a running HWiNFO / LHM / OHM, provides them. This is by design (see `docs\SENSOR_BACKEND_V2_RESEARCH.md`).
+
+## OPEN: LiveKernelReports are explained by folder, not debugged
+
+- Live kernel dumps are grouped and explained (WATCHDOG / USB / NDIS / power). They are not run through cdb automatically, so module-level analysis of live dumps is not done yet.
+
+## OPEN: ATA SMART behind controllers
+
+- `SMART_RCV_DRIVE_DATA` works for SATA disks on the standard AHCI path (validated: 3 SATA HDDs). Behind USB bridges, Intel RST RAID or other controllers Windows usually blocks it: the result is honestly UNSUPPORTED / INSUFFICIENT DATA. No pass-through or vendor commands are used (by design).
+
 ## BUG: incomplete RAM / DIMM detection on X79G
 
 - **Status:** OPEN. Confirmed on a real client PC. Audit done 2026-09-24; not fixed yet.
