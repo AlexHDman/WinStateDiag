@@ -61,8 +61,13 @@ Requirements: Rust (stable, edition 2024) with the `x86_64-pc-windows-msvc` tool
 ```powershell
 cargo test
 cargo build --release          # static CRT, see .cargo/config.toml
+# third-party sensor bundle (nuget.org, verified against scripts\release\lhm_bundle.sha256):
+powershell -ExecutionPolicy Bypass -File scripts\release\fetch_lhm.ps1
 # versioned portable release (fmt/check/test, fresh build, SHA-256 check):
 powershell -ExecutionPolicy Bypass -File scripts\make_release.ps1
+# proven release: clean worktree at an exact commit, live probes, evidence
+# in release-evidence\ (elevated; fails closed):
+scripts\release\release_gate.cmd <expected-head-sha>
 ```
 
 The release script produces `dist\WinStateDiag-vX.Y\WinStateDiag.exe` (since v1.0 releases are named `major.minor`; a patch digit appears only when it is not zero). The version comes from `Cargo.toml` (title bar, EXE metadata, manifest and release folder follow it).

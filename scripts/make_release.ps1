@@ -14,12 +14,17 @@
 #      existing release unless -Force)
 #   6. SHA256(dist EXE) must equal SHA256(target\release\win_state_diag.exe)
 #   7. lists older dist entries as obsolete (does NOT delete anything)
-#   8. writes docs\releases\vX.Y.Z.txt (release manifest)
+#   8. writes <ManifestDir>\release_manifest.txt with PRODUCER_COMMIT and
+#      WORKTREE_CLEAN (default: release-evidence\vX.Y\manual_<stamp>\,
+#      git-ignored, so a release run never dirties the worktree)
+#
+# A proven release is produced only by scripts\release\release_gate.cmd,
+# which requires a clean worktree at an expected HEAD.
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File C:\AI\WinStateDiag\scripts\make_release.ps1 [-Force]
+#   powershell -ExecutionPolicy Bypass -File C:\AI\WinStateDiag\scripts\make_release.ps1 [-Force] [-ManifestDir <dir>]
 
-param([switch]$Force)
+param([switch]$Force, [string]$ManifestDir = '')
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -45,6 +50,11 @@ if ($cargo -notmatch '(?ms)^\[package\].*?^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"')
 $semver = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
 $version = if ($Matches[3] -eq '0') { "$($Matches[1]).$($Matches[2])" } else { $semver }
 Write-Host "WinStateDiag release v$version (Cargo $semver)" -ForegroundColor Yellow
+
+# Producer commit (recorded in the manifest; a dirty tree is recorded too).
+$commit = "$(git rev-parse HEAD)".Trim()
+if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') { Fail 'cannot read the Git HEAD commit' }
+$worktreeClean = @(git status --porcelain --untracked-files=all | Where-Object { $_ }).Count -eq 0
 
 # Older releases are never touched: hash them before and verify after.
 $dist = Join-Path $root 'dist'
@@ -97,6 +107,8 @@ $obsolete = @(Get-ChildItem -LiteralPath $dist -Force | Where-Object {
 
 $lines = @(
     "VERSION=$version",
+    "PRODUCER_COMMIT=$commit",
+    "WORKTREE_CLEAN=$(if ($worktreeClean) { 'YES' } else { 'NO' })",
     "PORTABLE_PATH=$releaseExe",
     "EXE_LAST_WRITE=$($distItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))",
     "EXE_SIZE=$($distItem.Length)",
@@ -114,9 +126,11 @@ $lines = @(
 )
 
 # 8. manifest (kept outside the portable folder: the distribution unit is the EXE)
-$manifestDir = Join-Path $root 'docs\releases'
-New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
-$lines | Out-File (Join-Path $manifestDir "v$version.txt") -Encoding utf8
+if (-not $ManifestDir) {
+    $ManifestDir = Join-Path $root ("release-evidence\v$version\manual_" + $started.ToString('yyyyMMdd-HHmmss'))
+}
+New-Item -ItemType Directory -Force -Path $ManifestDir | Out-Null
+$lines | Out-File (Join-Path $ManifestDir 'release_manifest.txt') -Encoding utf8
 
 Write-Host ''
 $lines | ForEach-Object { Write-Host $_ }

@@ -51,3 +51,7 @@ Thumbs.db
 # Generated previews / caches
 /assets/expc-header-logo-full.png
 __pycache__/
+
+# Release gate evidence (logs, manifests with producer commit, probe
+# outputs, superseded EXE backups) - local, never committed.
+/release-evidence/
