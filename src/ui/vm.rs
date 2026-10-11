@@ -37,6 +37,248 @@ pub struct StageRow {
     pub active: bool,
     /// Deep-check result (only for a completed SFC / DISM / CHKDSK row).
     pub finding: Option<StageFinding>,
+    /// v0.4.4 stage table: diagnostic result of a completed step (from the
+    /// EXPC evidence), its short finding and the step duration.
+    pub result: Option<crate::details::StageState>,
+    pub result_text: String,
+    pub short_finding: String,
+    pub duration: String,
+}
+
+/// v0.4.4: the two application pages (one window, common header).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Page {
+    #[default]
+    Diagnostics,
+    Hardware,
+}
+
+/// One label/value line of a compact card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InfoRow {
+    pub label: String,
+    pub value: String,
+    pub tone: Tone,
+}
+
+impl InfoRow {
+    pub fn new(label: impl Into<String>, value: impl Into<String>, tone: Tone) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            tone,
+        }
+    }
+}
+
+/// Benchmark Test 1 / Test 2 block (READ / WRITE in MB/s).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TestVm {
+    pub read: String,
+    pub write: String,
+    pub stability: String,
+    pub tone: Tone,
+    /// Comparison with the previous compatible run, when known.
+    pub delta: Option<String>,
+}
+
+/// v0.4.5: one Test 1 / Test 2 block (live during the run).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TestBlockVm {
+    /// Not started (subdued); optional caption (e.g. retest countdown).
+    Waiting(Option<String>),
+    /// Measuring now: latest MB/s values (None until the first pass).
+    Active {
+        read: Option<String>,
+        write: Option<String>,
+        elapsed: String,
+    },
+    Done(TestVm),
+}
+
+/// Crash Dump / BSOD Analyzer card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrashVm {
+    pub headline: String,
+    pub tone: Tone,
+    /// v0.4.5 "Unexpected shutdowns: N · BugCheck / BSOD: N · Dumps: N".
+    pub counts: String,
+    pub debugger: String,
+    pub debugger_tone: Tone,
+    pub debugger_missing: bool,
+    pub busy: bool,
+    pub can_analyze: bool,
+    pub has_details: bool,
+    pub rows: Vec<InfoRow>,
+    /// v1.0 live analysis (large indeterminate ring + real stages).
+    pub analysis: Option<AnalysisProgressVm>,
+    /// v1.0 result colour of the last analysis (green / yellow / red).
+    pub outcome: Option<(String, Tone)>,
+    /// v1.0 embedded WinDbg installer status (shown above the button).
+    pub install: Option<InstallVm>,
+}
+
+/// v1.0 one stage line of the running dump analysis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageMark {
+    Done,
+    Active,
+    Pending,
+}
+
+/// v1.0 dump analysis in progress: no percentage (cdb reports none).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnalysisProgressVm {
+    pub stages: Vec<(String, StageMark)>,
+    pub elapsed: String,
+    /// "Загрузка символов Microsoft..." while the symbol cache grows.
+    pub note: Option<String>,
+    /// "Дамп 1 из 3 · 100326-9500-01.dmp".
+    pub dump_label: String,
+}
+
+/// v1.0 embedded installer state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstallVm {
+    pub title: String,
+    pub lines: Vec<(String, StageMark)>,
+    /// Real percentage only when winget printed one.
+    pub percent: Option<u8>,
+    pub running: bool,
+    pub failed: bool,
+    pub succeeded: bool,
+    pub status: String,
+}
+
+/// One compact "label value" item of the sensor card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SensorChip {
+    pub label: String,
+    pub value: String,
+    pub tone: Tone,
+    /// v0.4.5 reference column ("11.40–12.60 V", "W 83° / C 85°",
+    /// "динамический", "без фикс. эталона").
+    pub reference: String,
+}
+
+impl SensorChip {
+    pub fn new(label: impl Into<String>, value: impl Into<String>, tone: Tone) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            tone,
+            reference: String::new(),
+        }
+    }
+
+    pub fn with_ref(mut self, reference: impl Into<String>) -> Self {
+        self.reference = reference.into();
+        self
+    }
+}
+
+/// v1.0 one cell of the 4-column sensor matrix.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SensorCell {
+    /// A real reading; only the number carries the colour.
+    Value { text: String, tone: Tone },
+    /// Expected for this row but not available ("Нет данных"). A hardware
+    /// counter that reports 0 W is unavailable, never "0 W".
+    NoData,
+    /// Not meaningful for this row ("—").
+    NotApplicable,
+}
+
+impl SensorCell {
+    pub fn value(text: impl Into<String>, tone: Tone) -> Self {
+        SensorCell::Value {
+            text: text.into(),
+            tone,
+        }
+    }
+}
+
+/// v1.0 one row of the main sensor view: Наименование | T°C | Volt | Watt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SensorMatrixRow {
+    pub label: String,
+    pub temp: SensorCell,
+    pub volt: SensorCell,
+    pub watt: SensorCell,
+}
+
+/// v1.0 one line of the compact "Эталон" reference table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SensorRefRow {
+    pub label: String,
+    pub range: String,
+}
+
+/// v0.4.5 compact Hardware Sensors card (full table in Details).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SensorsVm {
+    /// v1.0 main view: every EXPECTED row stays visible (missing values
+    /// read "Нет данных").
+    pub matrix: Vec<SensorMatrixRow>,
+    /// v1.0 reference table (fixed ATX bands, drive-reported NVMe
+    /// thresholds, "динамический", "без фикс. эталона").
+    pub refs: Vec<SensorRefRow>,
+    pub temps: Vec<SensorChip>,
+    /// ATX rails only (+12V / +5V / +3.3V / 5VSB).
+    pub rails: Vec<SensorChip>,
+    /// "Отлично" / "Внимание!" / "Критично!" / "Нет данных" / check sensor.
+    pub power_state: String,
+    pub power_tone: Tone,
+    pub power_message: String,
+    pub power: Vec<SensorChip>,
+    pub fans: Vec<SensorChip>,
+    /// Provider / layer state line (e.g. "PARTIAL · nvidia-smi · LHM: PawnIO not installed").
+    pub status_line: String,
+    pub busy: bool,
+    pub has_data: bool,
+    /// v1.0 item 8: the lower-right READ indicator of the card.
+    pub read: SensorReadVm,
+}
+
+/// v1.0 sensor read activity: a real elapsed timer, never a fake percent.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum SensorReadVm {
+    #[default]
+    Idle,
+    /// Reading in progress; whole seconds since the read started.
+    Reading { elapsed_s: u64 },
+    /// The read failed (details in the sensor Details window).
+    Error { message: String },
+}
+
+impl SensorReadVm {
+    /// "00:07" — elapsed time shown under READ.
+    pub fn elapsed_text(&self) -> Option<String> {
+        match self {
+            SensorReadVm::Reading { elapsed_s } => {
+                Some(format!("{:02}:{:02}", elapsed_s / 60, elapsed_s % 60))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Group Policy / ADMX Health card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpoVm {
+    pub status: String,
+    pub tone: Tone,
+    pub rows: Vec<InfoRow>,
+    pub busy: bool,
+    pub has_result: bool,
+}
+
+/// Hardware state vs system diagnostic state (never one "OK").
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemStateVm {
+    pub hardware: InfoRow,
+    pub system: InfoRow,
+    pub note: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -137,8 +379,14 @@ pub enum SsdVm {
         /// v0.4.2: note lines during the automatic retest (first run kept
         /// visible); `None` = the usual temp-file note.
         note: Option<[String; 2]>,
+        /// v0.4.5 live Test 1 / Test 2 blocks.
+        blocks: [TestBlockVm; 2],
+        /// The automatic confirmation retest is running / pending.
+        retest: bool,
     },
     Done {
+        /// v0.4.4: Test 1 (first run) / Test 2 (automatic retest).
+        tests: [Option<TestVm>; 2],
         /// v0.4.2 storage correlation result for the status line (text,
         /// tone); `None` until it is known.
         status: Option<(String, Tone)>,
@@ -260,6 +508,16 @@ pub struct DashboardVm {
     /// reads `crate::i18n::t(vm.lang)` for its static text instead of
     /// hardcoding a language.
     pub lang: Language,
+    /// v0.4.4 page navigation and Hardware/Diagnostics page modules.
+    pub page: Page,
+    pub crash: CrashVm,
+    pub sensors: SensorsVm,
+    pub gpo: GpoVm,
+    pub system_state: SystemStateVm,
+    /// SMART / NVMe Health facts of the selected disk.
+    pub smart: Vec<InfoRow>,
+    /// v0.4.5 compact passport rows (Windows, CPU, RAM, motherboard).
+    pub passport: Vec<InfoRow>,
 }
 
 /// UI -> app intents, applied after rendering (keeps borrows disjoint).
@@ -304,6 +562,23 @@ pub enum Action {
     ShowDrivers,
     /// v0.4.1: open the EXPC diagnostic results window.
     ShowExpcDetails,
+    /// v0.4.4: switch page (Diagnostics / Hardware).
+    SetPage(Page),
+    /// Crash Dump analyzer: run the headless analysis.
+    AnalyzeDumps,
+    ShowCrashDetails,
+    /// Explicit user click: official Microsoft WinDbg installation.
+    InstallAnalyzer,
+    /// v0.4.5: re-sample the hardware sensors (writes evidence).
+    RefreshSensors,
+    ShowSensorDetails,
+    RunGpoCheck,
+    ShowGpoDetails,
+    /// v0.4.5: copy "Клиент: X / Компьютер: Y" to the clipboard (no state
+    /// change).
+    CopyClientInfo,
+    /// v0.4.5: Details of ONE EXPC stage (0-based row index).
+    ShowStageDetails(usize),
 }
 
 // Stage short labels / descriptions moved to `crate::i18n::Dict` (v0.3.6

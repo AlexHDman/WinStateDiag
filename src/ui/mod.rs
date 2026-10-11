@@ -6,6 +6,7 @@ pub mod capture;
 pub mod dashboard;
 pub mod fixture;
 pub mod fonts;
+pub mod pages;
 pub mod paint;
 pub mod sysinfo;
 pub mod tokens;

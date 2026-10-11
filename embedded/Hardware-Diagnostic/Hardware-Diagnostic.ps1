@@ -82,7 +82,7 @@ function New-HardwareReportLines {
         $lines.Add("- $($disk.Model), $($disk.Capacity), $($disk.MediaType) / $($disk.BusType)")
         $lines.Add("  Serial: $($disk.Serial); firmware: $($disk.Firmware); health: $($disk.Health)")
         $lines.Add("  Reason: $($disk.HealthReason)")
-        if ($disk.Reliability) { $lines.Add("  Reliability: temperature $($disk.Reliability.TemperatureC) C; wear $($disk.Reliability.WearPercent)%; power-on $($disk.Reliability.PowerOnHours) h; read/write errors $($disk.Reliability.ReadErrorsTotal)/$($disk.Reliability.WriteErrorsTotal)") }
+        if ($disk.Reliability) { $lines.Add("  Reliability: temperature $($disk.Reliability.TemperatureC) C; wear $(if (($disk.Reliability.WearPercent -as [double]) -gt 0) { "$($disk.Reliability.WearPercent)%" } else { 'no reliable data' }); power-on $($disk.Reliability.PowerOnHours) h; read/write errors $($disk.Reliability.ReadErrorsTotal)/$($disk.Reliability.WriteErrorsTotal)") }
     }
     $lines.Add('')
     $lines.Add('[GPU]')

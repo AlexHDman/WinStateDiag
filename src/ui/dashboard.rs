@@ -66,20 +66,56 @@ pub fn draw(
     ui.painter()
         .rect_filled(canvas, CornerRadius::ZERO, c::BG_ROOT);
 
+    // v0.4.4: common header (title, Start, page tabs, RU/EN, EXPC) and two
+    // pages. Existing cards are reused unchanged, placed by origin shift.
     draw_header(ui, o, vm);
     draw_language_switch(ui, o, vm, actions);
-    draw_client(ui, o, vm, ctl);
-    draw_diagnostic(ui, o, vm, ctl);
-    draw_crypto(ui, o, vm, actions);
-    draw_hardware(ui, o, vm, ctl, actions);
-    draw_stages(ui, o, vm, actions);
-    draw_drivers(ui, o, vm, actions);
-    draw_result(ui, o, vm, actions);
     draw_start(ui, o, vm, actions);
-    draw_overall(ui, o, vm);
-    draw_ssd(ui, o, vm, ctl, actions);
-    draw_journal(ui, o, vm, actions);
+    super::pages::draw_tabs(ui, o, vm, actions);
+    // v1.0: every body card of BOTH pages (and the status bar) sits
+    // BODY_SHIFT lower, so the full EXPC logo has room in the header.
+    let o = body_origin(o);
+    let shift = |s: [f32; 2]| o + vec2(s[0], s[1]);
+    match vm.page {
+        Page::Diagnostics => {
+            draw_client(ui, o, vm, ctl, actions);
+            draw_diagnostic(ui, o, vm, ctl);
+            draw_crypto(ui, o, vm, actions);
+            draw_drivers(ui, shift(l::DIAG_DRIVERS_SHIFT), vm, actions);
+            super::pages::draw_passport(ui, o, vm);
+            super::pages::draw_gpo_compact(ui, o, vm, actions);
+            // v1.0: no idle report block; report actions sit in the journal.
+            super::pages::draw_journal_compact(ui, o, vm, actions);
+            draw_overall(ui, o, vm);
+            super::pages::draw_stages_table(ui, o, vm, actions);
+        }
+        Page::Hardware => {
+            draw_hardware(ui, shift(l::HW_HARDWARE_SHIFT), vm, ctl, actions);
+            super::pages::draw_system_state(ui, o, vm);
+            super::pages::draw_sensors(ui, o, vm, actions);
+            // v0.4.5: Driver Audit and the report action live on the
+            // Diagnostics page only (no duplicated cards).
+            super::pages::draw_smart(ui, o, vm);
+            draw_ssd(ui, shift(l::HW_SSD_SHIFT), vm, ctl, actions);
+            super::pages::draw_crash(ui, o, vm, actions);
+        }
+    }
     draw_status_bar(ui, o, vm);
+}
+
+/// Origin of the page body (cards, status bar): the canvas origin moved
+/// down by `BODY_SHIFT`. The header (title, Start, tabs, RU/EN, logo) uses
+/// the canvas origin itself.
+pub fn body_origin(o: Pos2) -> Pos2 {
+    o + vec2(0.0, l::BODY_SHIFT)
+}
+
+/// v0.4.3 single-page drawing kept for the legacy stage card and journal
+/// (still used by QA scenes/tests).
+#[allow(dead_code)]
+fn draw_legacy_cards(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
+    draw_stages(ui, o, vm, actions);
+    draw_journal(ui, o, vm, actions);
 }
 
 /// Compact RU/EN switch in the top header (v0.3.6 Visual Master alignment,
@@ -134,13 +170,14 @@ pub(crate) fn lang_button_colors(active: bool) -> (Color32, Color32) {
     }
 }
 
-/// Embedded EXPC header wordmark + emblem (v0.3.6 Visual Master alignment,
-/// §3): derived from the existing `assets/logo.png` brand asset — the
-/// "EXPC" wordmark and circular AI-profile emblem only (no "Design" text,
-/// no QR code), with the black background cleanly removed and the gold
-/// pushed toward the brighter/richer tone the new master shows. 534x88 RGBA.
-const EXPC_HEADER_LOGO_RGBA: &[u8] = include_bytes!("../../assets/expc-header-logo.rgba");
-const EXPC_HEADER_LOGO_DIM: [usize; 2] = [534, 88];
+/// v1.0 approved FULL EXPC header logo: "Design", the EXPC wordmark, the
+/// circular head emblem and both slogans, exactly as in
+/// `assets/logo_Header_right.png` (v1.0). That file has the transparency checkerboard
+/// baked into its pixels; `scripts/key_logo.py` removes only the neutral
+/// checker (every opaque artwork pixel keeps its RGB), keeps the 3:1 aspect
+/// and downsamples alpha-correctly. 545x208 RGBA = 2x the 272.41x104 slot.
+const EXPC_HEADER_LOGO_RGBA: &[u8] = include_bytes!("../../assets/expc-header-logo-full.rgba");
+pub(crate) const EXPC_HEADER_LOGO_DIM: [usize; 2] = [545, 208];
 
 fn expc_header_logo(ctx: &egui::Context) -> egui::TextureHandle {
     let id = egui::Id::new("expc_header_logo");
@@ -234,7 +271,13 @@ fn single_line_edit(
     });
 }
 
-fn draw_client(ui: &mut Ui, o: Pos2, vm: &DashboardVm, ctl: &mut Controls<'_>) {
+fn draw_client(
+    ui: &mut Ui,
+    o: Pos2,
+    vm: &DashboardVm,
+    ctl: &mut Controls<'_>,
+    actions: &mut Vec<Action>,
+) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
     paint::card(&p, r(o, l::CLIENT_CARD));
@@ -273,6 +316,20 @@ fn draw_client(ui: &mut Ui, o: Pos2, vm: &DashboardVm, ctl: &mut Controls<'_>) {
             c::ATTENTION_CLIENT,
             vm.time,
         );
+    }
+    // v0.4.5: copy "Клиент: X / Компьютер: Y" (never changes any state).
+    let copy = r(o, l::CLIENT_COPY_BUTTON);
+    let resp = ui
+        .interact(copy, ui.id().with("client_copy"), Sense::click())
+        .on_hover_text(d.client_copy_tooltip);
+    let col = if resp.hovered() {
+        c::TEXT_TITLE
+    } else {
+        c::TEXT_SECONDARY
+    };
+    paint::icon_copy(&p, copy, col);
+    if resp.clicked() {
+        actions.push(Action::CopyClientInfo);
     }
     let comp = r(o, l::COMPUTER_FIELD);
     field(&p, comp);
@@ -625,6 +682,53 @@ fn draw_hardware(
     {
         actions.push(Action::ViewHardware);
     }
+    // v0.4.5: while the Hardware Report runs, a gold light travels around
+    // the button border (static gold border when animations are off).
+    if hardware_report_running(vm) {
+        let b = r(o, l::HW_BUTTON);
+        p.rect_stroke(
+            b,
+            CornerRadius::same(l::BUTTON_RADIUS),
+            Stroke::new(1.0, c::GOLD_ACCENT.gamma_multiply(0.45)),
+            StrokeKind::Inside,
+        );
+        if vm.animate {
+            let pts = border_runner(b.shrink(0.5), (vm.time * 0.45).fract() as f32, 0.18);
+            p.add(egui::Shape::line(pts, Stroke::new(2.0, c::GOLD_ACCENT)));
+        }
+    }
+}
+
+/// The Hardware Report module is running (overall module row 2).
+pub(crate) fn hardware_report_running(vm: &DashboardVm) -> bool {
+    vm.overall
+        .modules
+        .get(1)
+        .is_some_and(|m| m.state == ModuleState::Running)
+}
+
+/// Points of a border segment starting at `phase` (0..1 of the perimeter)
+/// and covering `len` of it, clockwise from the top-left corner.
+pub(crate) fn border_runner(rect: Rect, phase: f32, len: f32) -> Vec<Pos2> {
+    let (w, h) = (rect.width(), rect.height());
+    let per = 2.0 * (w + h);
+    let at = |d: f32| -> Pos2 {
+        let d = d.rem_euclid(per);
+        if d < w {
+            egui::pos2(rect.left() + d, rect.top())
+        } else if d < w + h {
+            egui::pos2(rect.right(), rect.top() + d - w)
+        } else if d < 2.0 * w + h {
+            egui::pos2(rect.right() - (d - w - h), rect.bottom())
+        } else {
+            egui::pos2(rect.left(), rect.bottom() - (d - 2.0 * w - h))
+        }
+    };
+    let start = phase * per;
+    let steps = 24;
+    (0..=steps)
+        .map(|i| at(start + len * per * i as f32 / steps as f32))
+        .collect()
 }
 
 fn draw_stages(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
@@ -1188,6 +1292,9 @@ fn draw_drivers(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action
     }
 }
 
+/// v0.4.4 large Result card, replaced in v0.4.5 by the compact report row
+/// (`pages::draw_report_row`); kept for the legacy QA scenes.
+#[allow(dead_code)]
 fn draw_result(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
@@ -1703,25 +1810,6 @@ fn dual_ring(
             "MB/s",
             t::SSD_UNIT,
             c::TEXT_BODY,
-        );
-    }
-}
-
-fn delta_text(p: &Painter, o: Pos2, center_x: f32, delta: Option<f64>) {
-    if let Some(d) = delta {
-        let col = if d >= 0.0 {
-            c::GREEN_DELTA
-        } else {
-            c::TEXT_PRIMARY
-        };
-        paint::text(
-            p,
-            center_x,
-            my(o, l::RING_DELTA_BASELINE),
-            Align::Center,
-            &format!("{d:+.1}%"),
-            t::DELTA,
-            col,
         );
     }
 }
@@ -2262,6 +2350,7 @@ fn draw_ssd(
 
     match &vm.ssd {
         SsdVm::Done {
+            tests,
             status,
             note,
             read_current,
@@ -2272,36 +2361,11 @@ fn draw_ssd(
             write_delta,
             meta,
         } => {
-            dual_ring(
-                &p,
-                rc,
-                "READ",
-                c::READ_LABEL,
-                read_current,
-                c::READ_CURRENT,
-                read_previous.as_deref(),
-                c::READ_PREVIOUS_TEXT,
-                &c::READ_RING_STOPS,
-                &c::READ_PREVIOUS_ARC_STOPS,
-                c::VIOLET_TRACK,
-                o,
-            );
-            dual_ring(
-                &p,
-                wc,
-                "WRITE",
-                c::WRITE_LABEL,
-                write_current,
-                c::WRITE_CURRENT,
-                write_previous.as_deref(),
-                c::WRITE_PREVIOUS_TEXT,
-                &c::WRITE_RING_STOPS,
-                &c::WRITE_PREVIOUS_ARC_STOPS,
-                c::TEAL_TRACK,
-                o,
-            );
-            delta_text(&p, o, rc.x, *read_delta);
-            delta_text(&p, o, wc.x, *write_delta);
+            // v0.4.4: Test 1 / Test 2 blocks (first run / automatic
+            // retest) replace the current-vs-previous rings.
+            let _ = (read_current, read_previous, read_delta);
+            let _ = (write_current, write_previous, write_delta);
+            super::pages::draw_test_blocks(&p, frame, vm, tests);
             // v0.4.2: the storage correlation (when known) is the status;
             // otherwise the unchanged "ready" line.
             let (st, sc) = match status {
@@ -2402,8 +2466,13 @@ fn draw_ssd(
             status,
             elapsed,
             note,
+            blocks,
+            retest,
         } => {
-            placeholder_rings(&p);
+            // v0.4.5: live Test 1 / Test 2 blocks (elapsed clock in the
+            // active block's title) instead of empty rings.
+            let _ = elapsed;
+            super::pages::draw_test_block_pair(&p, frame, vm, blocks, *retest);
             let (note_lines, note_col) = match note {
                 Some([a, b]) => ([a.as_str(), b.as_str()], c::TEXT_SECONDARY),
                 None => (temp_note, c::TEXT_MUTED),
@@ -2419,10 +2488,10 @@ fn draw_ssd(
                 note_col,
             );
             draw_ssd_meta_strip(&p, o, d, None);
-            // Progress lives in the delta line of the frame (no delta yet).
+            // Overall progress: a thin bar along the bottom edge of the frame.
             let bar = Rect::from_min_size(
-                egui::pos2(frame.left() + 24.0, my(o, l::RING_DELTA_BASELINE) - 10.0),
-                vec2(frame.width() - 48.0 - 110.0, 8.0),
+                egui::pos2(frame.left() + 12.0, frame.bottom() - 8.0),
+                vec2(frame.width() - 24.0, 3.0),
             );
             paint::progress_bar(
                 &p,
@@ -2431,15 +2500,6 @@ fn draw_ssd(
                 Some(*fraction),
                 paint::intensity(c::BLUE_STAGE, running_stage_intensity(vm.time, vm.animate)),
                 None,
-            );
-            paint::text(
-                &p,
-                frame.right() - 24.0,
-                my(o, l::RING_DELTA_BASELINE) - 1.0,
-                Align::Max,
-                &format!("{} {elapsed}", d.ssd_elapsed_prefix),
-                t::CAPTION,
-                c::TEXT_SECONDARY,
             );
             paint::button(
                 ui,
@@ -2843,6 +2903,22 @@ pub(crate) fn lang_button_rects_for_tests() -> (Rect, Rect) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hardware_report_gold_runner_stays_on_the_button_border() {
+        let b = Rect::from_min_size(egui::pos2(10.0, 20.0), vec2(150.0, 40.0));
+        for phase in [0.0, 0.3, 0.77, 0.99] {
+            let pts = border_runner(b, phase, 0.18);
+            assert_eq!(pts.len(), 25);
+            for q in pts {
+                let on_edge = (q.x - b.left()).abs() < 0.01
+                    || (q.x - b.right()).abs() < 0.01
+                    || (q.y - b.top()).abs() < 0.01
+                    || (q.y - b.bottom()).abs() < 0.01;
+                assert!(on_edge && b.expand(0.01).contains(q), "{q:?}");
+            }
+        }
+    }
+
     use super::*;
 
     fn rows(active: Option<usize>) -> Vec<StageRow> {
@@ -2860,26 +2936,75 @@ mod tests {
                 right_text: String::new(),
                 active: active == Some(i),
                 finding: None,
+                result: None,
+                result_text: String::new(),
+                short_finding: String::new(),
+                duration: String::new(),
             })
             .collect()
     }
 
     #[test]
-    fn lang_buttons_are_compact_equal_and_do_not_overlap() {
+    fn lang_buttons_are_compact_equal_stacked_and_left_of_the_full_logo() {
         let (ru, en) = lang_button_rects_for_tests();
         assert_eq!(ru.width(), en.width());
         assert_eq!(ru.height(), en.height());
-        // Explicit correction: ~30–40% larger than the 30x18 (540 px²)
-        // compact pass, yet still well under the original 42x22 (924 px²).
+        // Compact buttons, never the master's large pills.
         let area = ru.width() * ru.height();
-        assert!((540.0 * 1.3..=540.0 * 1.4).contains(&area), "area {area}");
-        assert!(area < 924.0);
-        // The whole [RU][EN][EXPC] group shares one vertical centre line.
+        assert!(area <= 1000.0, "area {area}");
+        // v1.0 approved master: RU above EN (vertical stack), the stack
+        // centred on the full logo's centre line, left of the logo.
         let logo = r(Pos2::ZERO, l::EXPC_HEADER_LOGO);
-        assert!((ru.center().y - logo.center().y).abs() <= 1.0);
-        assert!((en.center().y - logo.center().y).abs() <= 1.0);
-        assert!(en.max.x < logo.min.x, "EN must sit left of the EXPC logo");
-        assert!(ru.max.x <= en.min.x, "RU and EN must not overlap");
+        assert!((ru.center().x - en.center().x).abs() < 0.01, "same column");
+        assert!(ru.max.y < en.min.y, "RU above EN, no overlap");
+        let stack_center = (ru.min.y + en.max.y) / 2.0;
+        assert!((stack_center - logo.center().y).abs() <= 1.0);
+        assert!(
+            en.max.x < logo.min.x,
+            "the stack sits left of the EXPC logo"
+        );
+    }
+
+    #[test]
+    fn header_right_logo_keeps_its_exact_source_proportions_and_breathing_room() {
+        // Source: assets/logo_Header_right.png, 2030x775.
+        let logo = r(Pos2::ZERO, l::EXPC_HEADER_LOGO);
+        assert!((logo.width() / logo.height() - 2030.0 / 775.0).abs() < 0.005);
+        let [w, h] = EXPC_HEADER_LOGO_DIM;
+        assert!((w as f32 / h as f32 - 2030.0 / 775.0).abs() < 0.005);
+        assert_eq!(EXPC_HEADER_LOGO_RGBA.len(), w * h * 4);
+        // Not shrunk to the old 184x46 slot.
+        assert!(logo.width() >= 270.0 && logo.height() >= 100.0);
+        // Body of both pages starts below the logo with air.
+        let body_top = super::super::tokens::mpos(body_origin(Pos2::ZERO), 0.0, 121.0).y;
+        assert!(
+            logo.bottom() + 6.0 <= body_top,
+            "{} vs {body_top}",
+            logo.bottom()
+        );
+        // Inside the canvas horizontally.
+        assert!(logo.right() <= super::super::tokens::CANVAS_W - 12.0);
+        assert!(logo.top() >= 4.0);
+        // The keyed asset has real transparency (corners clear) and opaque
+        // gold artwork (no checkerboard left).
+        let px = |x: usize, y: usize| &EXPC_HEADER_LOGO_RGBA[(y * w + x) * 4..(y * w + x) * 4 + 4];
+        assert_eq!(px(0, 0)[3], 0);
+        assert_eq!(px(w - 1, h - 1)[3], 0);
+        let opaque = EXPC_HEADER_LOGO_RGBA
+            .chunks(4)
+            .filter(|p| p[3] == 255)
+            .count();
+        assert!(opaque > w * h / 5, "artwork present: {opaque}");
+        // Opaque pixels are gold or dark outline, never neutral mid-grey
+        // checker tones.
+        let grey = EXPC_HEADER_LOGO_RGBA
+            .chunks(4)
+            .filter(|p| {
+                let (mx, mn) = (p[0].max(p[1]).max(p[2]), p[0].min(p[1]).min(p[2]));
+                p[3] == 255 && mx - mn < 10 && (120..=210).contains(&mx)
+            })
+            .count();
+        assert!(grey * 200 < opaque, "checker residue: {grey} / {opaque}");
     }
 
     #[test]

@@ -25,7 +25,7 @@ function ConvertTo-HardwareSize {
 
 function Get-HardwareMemoryType {
     param([AllowNull()][object]$Code)
-    switch ([int]$Code) { 20 { 'DDR' } 21 { 'DDR2' } 24 { 'DDR3' } 26 { 'DDR4' } 30 { 'LPDDR4' } 34 { 'DDR5' } 35 { 'LPDDR5' } default { 'Unknown' } }
+    switch ([int]$Code) { 20 { 'DDR' } 21 { 'DDR2' } 24 { 'DDR3' } 26 { 'DDR4' } 27 { 'LPDDR' } 28 { 'LPDDR2' } 29 { 'LPDDR3' } 30 { 'LPDDR4' } 34 { 'DDR5' } 35 { 'LPDDR5' } default { 'Unknown' } }
 }
 
 # v0.4.2: SMBIOS memory speeds (Win32_PhysicalMemory.Speed /
@@ -362,17 +362,31 @@ function New-HardwarePassport {
             DeviceLocator = ConvertTo-HardwareText (Get-HardwareValue $_ 'DeviceLocator')
             BankLabel = ConvertTo-HardwareText (Get-HardwareValue $_ 'BankLabel')
             Serial = ConvertTo-HardwareText (Get-HardwareValue $_ 'SerialNumber')
-            State = $(if($speed -and $configured -and [int]$configured -lt [int]$speed){'WARNING'}elseif(-not (Get-HardwareValue $_ 'DeviceLocator')){'INFO'}else{'OK'})
+            State = $(if($speed -and $configured -and [int]$configured -lt [int]$speed){'INFO'}elseif(-not (Get-HardwareValue $_ 'DeviceLocator')){'INFO'}else{'OK'})
         }
     })
+    # v1.0: module mix and configured-vs-rated speed are CONTEXT (INFO),
+    # never a hardware WARNING by themselves: a mixed-capacity kit that runs
+    # normally, with clean WHEA and no memory-test errors, is not a fault.
+    # JEDEC / configured rate / XMP-EXPO profile stay separate facts.
     $ramReasons = @()
+    $ramContext = @()
     $capacities = @($ramRows | Where-Object CapacityBytes | ForEach-Object CapacityBytes | Sort-Object -Unique)
     $speeds = @($ramRows | Where-Object RatedSpeedMHz | ForEach-Object RatedSpeedMHz | Sort-Object -Unique)
-    if ($capacities.Count -gt 1) { $ramReasons += 'Mixed module capacities.' }
-    if ($speeds.Count -gt 1) { $ramReasons += 'Mixed declared module speeds.' }
-    if (@($ramRows | Where-Object { $_.RatedSpeedMHz -and $_.ConfiguredClockMHz -and [int]$_.ConfiguredClockMHz -lt [int]$_.RatedSpeedMHz }).Count) { $ramReasons += 'One or more modules run below their declared speed.' }
+    if ($capacities.Count -gt 1) { $ramContext += 'Mixed module capacities (context; not a fault without memory errors, WHEA or failed memory tests).' }
+    if ($speeds.Count -gt 1) { $ramContext += 'Mixed declared module speeds (context).' }
+    if (@($ramRows | Where-Object { $_.RatedSpeedMHz -and $_.ConfiguredClockMHz -and [int]$_.ConfiguredClockMHz -lt [int]$_.RatedSpeedMHz }).Count) { $ramContext += 'Configured data rate below the declared rate (JEDEC / XMP-EXPO profile context, not a fault).' }
     $declaredSlots = [int](($arrays | Measure-Object MemoryDevices -Sum).Sum)
-    $ramState = if (-not $ramRows.Count) { 'UNKNOWN' } elseif ($ramReasons.Count) { 'WARNING' } elseif ($declaredSlots -le 0 -or @($ramRows | Where-Object DeviceLocator -eq 'Unavailable').Count) { 'INFO' } else { 'OK' }
+    # v1.0 item 34: LPDDR is soldered on-board memory. SMBIOS lists one
+    # memory device per channel/package (e.g. 8 x 2 GB) - these are not
+    # removable modules; slot / dual-channel / mixed-kit rules do not apply.
+    $lpddr = @($ramRows | Where-Object { [string]$_.Type -like 'LPDDR*' }).Count -gt 0
+    $ramTopology = if ($lpddr) { 'ONBOARD_LPDDR' } elseif ($ramRows.Count) { 'MODULES' } else { 'UNKNOWN' }
+    if ($lpddr) {
+        $ramContext = @($ramContext | Where-Object { $_ -notlike 'Mixed module capacities*' })
+        $ramContext += ('On-board (soldered) LPDDR memory: SMBIOS lists {0} memory devices (channels/packages), not removable modules.' -f $ramRows.Count)
+    }
+    $ramState = if (-not $ramRows.Count) { 'UNKNOWN' } elseif ($ramReasons.Count) { 'WARNING' } elseif ($ramContext.Count -or $declaredSlots -le 0 -or @($ramRows | Where-Object DeviceLocator -eq 'Unavailable').Count) { 'INFO' } else { 'OK' }
 
     $diskRows = @()
     if ($physical.Count) {
@@ -499,7 +513,7 @@ function New-HardwarePassport {
         Motherboard=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $board 'Manufacturer'); Product=ConvertTo-HardwareText (Get-HardwareValue $board 'Product'); Version=ConvertTo-HardwareText (Get-HardwareValue $board 'Version'); Serial=ConvertTo-HardwareText (Get-HardwareValue $board 'SerialNumber') }
         Bios=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $bios 'Manufacturer'); Version=ConvertTo-HardwareText (Get-HardwareValue $bios 'SMBIOSBIOSVersion' (Get-HardwareValue $bios 'Version')); ReleaseDate=Get-HardwareValue $bios 'ReleaseDate'; FirmwareType=ConvertTo-HardwareText $Source.FirmwareType 'UNKNOWN'; SecureBoot=ConvertTo-HardwareText (Get-HardwareValue $Source 'SecureBootState') 'Unable to determine' }
         Cpu=[PSCustomObject]@{ Models=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Name }); Manufacturers=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Manufacturer }|Sort-Object -Unique); PhysicalCores=[int](($processors | Measure-Object NumberOfCores -Sum).Sum); LogicalProcessors=[int](($processors | Measure-Object NumberOfLogicalProcessors -Sum).Sum); MaxClockMHz=$(($processors | Measure-Object MaxClockSpeed -Maximum).Maximum); CurrentClockMHz=$(($processors | Measure-Object CurrentClockSpeed -Maximum).Maximum); Sockets=@($processors | ForEach-Object SocketDesignation | Where-Object { $_ }); Architecture=$(switch([int](Get-HardwareValue ($processors|Select-Object -First 1) 'Architecture' -1)){0{'x86'}5{'ARM'}9{'x64'}12{'ARM64'}default{'Unknown'}}); L2CacheKB=[int](($processors|Measure-Object L2CacheSize -Sum).Sum); L3CacheKB=[int](($processors|Measure-Object L3CacheSize -Sum).Sum) }
-        Ram=[PSCustomObject]@{ State=$ramState; Reasons=$ramReasons; TotalBytes=[uint64](($memory | Measure-Object Capacity -Sum).Sum); Total=ConvertTo-HardwareSize (($memory | Measure-Object Capacity -Sum).Sum); ModuleCount=$ramRows.Count; DeclaredSlots=$declaredSlots; Modules=$ramRows }
+        Ram=[PSCustomObject]@{ State=$ramState; Reasons=$ramReasons; Context=$ramContext; TotalBytes=[uint64](($memory | Measure-Object Capacity -Sum).Sum); Total=ConvertTo-HardwareSize (($memory | Measure-Object Capacity -Sum).Sum); ModuleCount=$ramRows.Count; DeclaredSlots=$declaredSlots; Topology=$ramTopology; Modules=$ramRows }
         Storage=[PSCustomObject]@{ State=$storageState; Disks=$diskRows }
         Gpu=[PSCustomObject]@{ State=$(if ($gpus.Count) { 'INFO' } else { 'UNKNOWN' }); Controllers=$gpus }
         Network=[PSCustomObject]@{ State=$(if ($networks.Count) { 'INFO' } else { 'UNKNOWN' }); Adapters=$networks }

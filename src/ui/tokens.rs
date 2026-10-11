@@ -28,7 +28,9 @@ pub const CANVAS_ORIGIN_IN_MASTER: [f32; 2] = [1.0, 33.0];
 /// Reference canvas (client area) size in points. In reference mode
 /// pixels_per_point is forced to 1.0, so this is also the physical size.
 pub const CANVAS_W: f32 = 1376.0;
-pub const CANVAS_H: f32 = 1108.0;
+/// v1.0: the master's 1108 px client height plus `layout::BODY_SHIFT`, so
+/// the full approved EXPC logo gets its vertical breathing room.
+pub const CANVAS_H: f32 = 1108.0 + layout::BODY_SHIFT;
 
 /// Master rect (x, y, w, h in master px) -> canvas rect relative to `origin`.
 pub fn mrect(origin: Pos2, x: f32, y: f32, w: f32, h: f32) -> Rect {
@@ -76,22 +78,26 @@ pub mod layout {
     pub const INNER_CARD_RADIUS: u8 = 6;
     pub const ROW_RADIUS: u8 = 5;
 
-    // ---- Header ----
-    pub const HEADER_ICON: R = [27.0, 55.0, 54.0, 49.0];
+    // ---- Header (v1.0 Visual Master: full EXPC logo) ----
+    /// Every body card (both pages) and the status bar are drawn shifted
+    /// down by this amount, the header is not: the full approved logo keeps
+    /// its exact proportions and gets vertical breathing room instead of
+    /// being shrunk to the old header height.
+    pub const BODY_SHIFT: f32 = 32.0;
+    pub const HEADER_ICON: R = [27.0, 63.0, 54.0, 49.0];
     pub const APP_TITLE_X: f32 = 110.0;
-    pub const APP_TITLE_BASELINE: f32 = 79.0;
-    pub const APP_SUBTITLE_BASELINE: f32 = 106.5;
-    /// Right-hand header group [RU] [EN] [EXPC], treated as ONE unit and
-    /// vertically centred on y = 76 (the master's header composition line).
-    /// RU/EN: compact buttons, ~35% larger than the 30x18 previous pass
-    /// (explicit correction; the PNG's 56x44 pills are intentionally not
-    /// reproduced).
-    pub const HEADER_GROUP_CENTER_Y: f32 = 76.0;
-    pub const LANG_BUTTON_RU: R = [1013.0, 66.0, 36.0, 20.0];
-    pub const LANG_BUTTON_EN: R = [1057.0, 66.0, 36.0, 20.0];
-    /// EXPC wordmark + emblem (derived transparent asset, unchanged
-    /// artwork), right edge on the master's logo right edge (x 1351).
-    pub const EXPC_HEADER_LOGO: R = [1109.0, 56.0, 242.0, 40.0];
+    pub const APP_TITLE_BASELINE: f32 = 87.0;
+    pub const APP_SUBTITLE_BASELINE: f32 = 114.5;
+    /// Vertical centre line of the header group (logo, RU/EN stack).
+    pub const HEADER_GROUP_CENTER_Y: f32 = 93.0;
+    /// RU / EN stacked vertically left of the logo (approved master).
+    pub const LANG_BUTTON_RU: R = [1034.5, 66.0, 38.0, 24.0];
+    pub const LANG_BUTTON_EN: R = [1034.5, 96.0, 38.0, 24.0];
+    /// v1.0: the right header logo keyed from `assets/logo_Header_right.png`
+    /// (2030x775 — its exact aspect preserved: 272.41x104, no crop / squash
+    /// / recolour). Right edge 18 px from the client edge (unchanged),
+    /// vertically centred on HEADER_GROUP_CENTER_Y.
+    pub const EXPC_HEADER_LOGO: R = [1086.59, 41.0, 272.41, 104.0];
 
     // ---- Left column ----
     pub const CLIENT_CARD: R = [19.0, 121.0, 341.0, 95.0];
@@ -196,7 +202,8 @@ pub mod layout {
     pub const RESULT_BUTTON_REPORT: R = [301.0, 1011.0, 113.0, 40.0];
     pub const RESULT_BUTTON_FOLDER: R = [425.0, 1011.0, 113.0, 40.0];
 
-    pub const START_BUTTON: R = [116.0, 1071.0, 330.0, 38.0];
+    /// v0.4.4: Start Diagnostics lives in the common header.
+    pub const START_BUTTON: R = [600.0, 50.0, 330.0, 40.0];
 
     // ---- Right column ----
     pub const OVERALL_CARD: R = [571.0, 121.0, 788.0, 245.0];
@@ -328,6 +335,64 @@ pub mod layout {
     pub const STATUS_TEXT_LEFT_X: f32 = 19.0;
     pub const STATUS_TEXT_RIGHT_X: f32 = 1347.0;
     pub const STATUS_BASELINE: f32 = 1130.5;
+
+    // ---- v0.4.4 two-page layout (provisional visual master) ----
+    /// v1.0 page tabs: compact, width from the label text (+ padding),
+    /// centred as a pair under the Start button.
+    pub const PAGE_TAB_Y: f32 = 101.0;
+    pub const PAGE_TAB_H: f32 = 28.0;
+    pub const PAGE_TAB_PAD_X: f32 = 22.0;
+    pub const PAGE_TAB_MIN_W: f32 = 128.0;
+    pub const PAGE_TAB_GAP: f32 = 8.0;
+    /// Origin shifts used to place existing cards on a page (dx, dy).
+    pub const DIAG_DRIVERS_SHIFT: [f32; 2] = [0.0, -333.0];
+    #[allow(dead_code)]
+    pub const DIAG_RESULT_SHIFT: [f32; 2] = [0.0, -181.0];
+    pub const HW_HARDWARE_SHIFT: [f32; 2] = [0.0, -243.0];
+    #[allow(dead_code)]
+    pub const HW_DRIVERS_SHIFT: [f32; 2] = [0.0, -91.0];
+    #[allow(dead_code)]
+    pub const HW_RESULT_SHIFT: [f32; 2] = [0.0, -91.0];
+    pub const HW_SSD_SHIFT: [f32; 2] = [0.0, -257.0];
+    /// Diagnostics page.
+    /// v0.4.4 GPO card (kept for reference; v0.4.5 shows GPO as a thin row
+    /// inside the passport card).
+    #[allow(dead_code)]
+    pub const GPO_CARD: R = [19.0, 648.0, 539.0, 142.0];
+    /// v1.0 compact "КОМПЬЮТЕР" passport: Windows / CPU / RAM / board only.
+    pub const PASSPORT_CARD: R = [19.0, 648.0, 539.0, 151.0];
+    /// v1.0 Group Policy / ADMX as its own very small secondary card: title
+    /// + [Проверить] [Детали] on one line, the status on the next.
+    pub const GPO_COMPACT_CARD: R = [19.0, 809.0, 539.0, 58.0];
+    /// Compact report action row (replaces the large Result card). v1.0:
+    /// no longer drawn on the dashboard — the idle "Диагностика не
+    /// выполнялась" block is gone; [Отчёт] [Папка] live in the journal
+    /// header. Kept for the legacy QA scenes.
+    #[allow(dead_code)]
+    pub const REPORT_ROW_CARD: R = [19.0, 856.0, 539.0, 50.0];
+    /// v0.4.5 client/computer copy icon (between the "Клиент" label and the
+    /// field).
+    pub const CLIENT_COPY_BUTTON: R = [124.0, 139.0, 26.0, 26.0];
+    pub const JOURNAL_COMPACT_CARD: R = [19.0, 877.0, 539.0, 222.0];
+    pub const STAGE_TABLE_CARD: R = [571.0, 378.0, 788.0, 721.0];
+    /// Stage table header: opens the full EXPC results window.
+    pub const STAGE_TABLE_DETAILS_BUTTON: R = [1187.0, 386.0, 160.0, 27.0];
+    /// Compact journal: Open (full viewer) left of Clear, same size.
+    pub const JOURNAL_COMPACT_OPEN_BUTTON: R = [366.0, 885.0, 86.0, 26.0];
+    pub const JOURNAL_COMPACT_CLEAR_BUTTON: R = [458.0, 885.0, 88.0, 26.0];
+    /// v1.0 report actions in the journal header (enabled once a report
+    /// exists): [Отчёт] [Папка].
+    pub const JOURNAL_COMPACT_REPORT_BUTTON: R = [182.0, 885.0, 86.0, 26.0];
+    pub const JOURNAL_COMPACT_FOLDER_BUTTON: R = [274.0, 885.0, 86.0, 26.0];
+    /// Hardware page.
+    pub const SYSTEM_STATE_CARD: R = [19.0, 220.0, 539.0, 98.0];
+    /// v0.4.5 sensor card: the Hardware page no longer repeats Driver Audit
+    /// / Result, so the vertical sensor list takes that space.
+    /// v1.0: the 4-column sensor matrix needs ~430 px; SMART / Health gets
+    /// the rest (selected NVMe facts + every SATA disk incl. HDDs).
+    pub const POWER_CARD: R = [19.0, 328.0, 539.0, 500.0];
+    pub const SMART_CARD: R = [19.0, 838.0, 539.0, 261.0];
+    pub const CRASH_CARD: R = [571.0, 708.0, 788.0, 391.0];
     /// Compact progress bar of the running operation (after its text).
     pub const STATUS_OP_BAR_W: f32 = 140.0;
     pub const STATUS_OP_BAR_H: f32 = 6.0;
@@ -502,6 +567,24 @@ pub mod color {
     pub const RADIO_FILL_OFF: Color32 = hex(0x0a1c2c);
 
     pub const BUTTON_SECONDARY_FILL: Color32 = hex(0x10253b);
+    /// v0.4.4: purple is reserved for PAGE NAVIGATION only.
+    pub const PAGE_TAB_ACTIVE_FILL: Color32 = hex(0x4a1f94);
+    pub const PAGE_TAB_ACTIVE_BORDER: Color32 = hex(0xb57aff);
+    pub const PAGE_TAB_ACTIVE_GLOW: Color32 = hex(0x8a4cf0);
+    pub const PAGE_TAB_ACTIVE_TEXT: Color32 = hex(0xffffff);
+    pub const PAGE_TAB_INACTIVE_FILL: Color32 = hex(0x0d0a1e);
+    pub const PAGE_TAB_INACTIVE_BORDER: Color32 = hex(0x2c2148);
+    pub const PAGE_TAB_INACTIVE_TEXT: Color32 = hex(0x8576a8);
+    /// v1.0 EXPC active-diagnostics focus: 1 px violet frame, soft outer
+    /// glow (calm breathing) and the active row's subtle violet background.
+    pub const EXPC_ACTIVE_BORDER: Color32 = hex(0xa678ff);
+    pub const EXPC_ACTIVE_GLOW: Color32 = hex(0x7a3fe0);
+    pub const EXPC_ACTIVE_ROW: Color32 = hex(0x241a4c);
+    pub const EXPC_ACTIVE_ROW_ACCENT: Color32 = hex(0x9a62ff);
+    /// Seconds per breath of the EXPC focus glow (slow, never flashing).
+    pub const EXPC_GLOW_PERIOD: f64 = 3.2;
+    /// Thin cyan outline of the benchmark Test 1 / Test 2 blocks.
+    pub const TEST_BLOCK_BORDER: Color32 = hex(0x1fb6c9);
     pub const BUTTON_SECONDARY_HOVER: Color32 = hex(0x173350);
     pub const BUTTON_SECONDARY_PRESSED: Color32 = hex(0x0b1b2c);
     pub const BUTTON_SECONDARY_BORDER: Color32 = hex(0x315472);
@@ -631,6 +714,8 @@ pub mod typography {
     /// still fits comfortably inside the smaller ring.
     pub const SSD_CURRENT: TextStyle = s(32.0, Semibold);
     pub const SSD_PREVIOUS: TextStyle = s(27.0, Semibold);
+    /// v0.4.5 Test 1 / Test 2 READ/WRITE values (1.5x SSD_PREVIOUS).
+    pub const TEST_METRIC: TextStyle = s(40.5, Semibold);
     pub const SSD_UNIT: TextStyle = s(14.0, Regular);
     pub const SSD_RING_LABEL: TextStyle = s(15.5, Semibold);
     /// Disk-selector card text (v0.3.6 UI finalization).

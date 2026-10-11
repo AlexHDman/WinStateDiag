@@ -6,6 +6,7 @@ use crate::engine::{
     self, DeepChecks, DiagnosticMode, EXPC_DEEP_FLAGS, EXPC_STEP_COUNT, EXPC_STEP_LABELS,
     EXPC_WEIGHTS, EngineEvent, HardwareEvent, HardwareViewRequest, SessionRequest, Stage,
 };
+use crate::events;
 use crate::i18n::{self, Language};
 use crate::nvme_health;
 use crate::report_package::{
@@ -23,7 +24,12 @@ use crate::ui::vm::{
     MetaRow, ModuleRow, ModuleState, OperationVm, OverallVm, ResultVm, RowState, SsdVm,
     StageFinding, StageRow, StartVm, Tone,
 };
+use crate::ui::vm::{
+    AnalysisProgressVm, CrashVm, GpoVm, InfoRow, InstallVm, Page, SensorCell, SensorChip,
+    SensorMatrixRow, SensorRefRow, SensorsVm, StageMark, SystemStateVm, TestBlockVm, TestVm,
+};
 use crate::ui::{self, fixture, fonts, sysinfo};
+use crate::{crash_dump, gpo_admx, incidents, passport, sensors};
 use egui::RichText;
 use egui::{Rect, vec2};
 use std::path::{Path, PathBuf};
@@ -200,6 +206,8 @@ enum ExportStatus {
     Copied,
     Saved(PathBuf),
     Failed(String),
+    /// v1.0: the user closed the Save As dialog.
+    Cancelled,
 }
 
 impl ExportStatus {
@@ -211,6 +219,7 @@ impl ExportStatus {
                 c::TEXT_PRIMARY,
             ),
             ExportStatus::Failed(e) => (format!("{}: {e}", d.export_save_failed), c::RED_ERROR),
+            ExportStatus::Cancelled => (d.export_cancelled.to_string(), c::TEXT_SECONDARY),
         }
     }
 }
@@ -281,6 +290,90 @@ pub(crate) fn driver_summary_header(
 }
 
 /// One step of the EXPC details window.
+/// v0.4.5 Details windows are real OS windows (egui immediate viewports):
+/// large, movable, resizable, allowed outside the main window, in the
+/// WinStateDiag colours. Where the backend cannot open another native
+/// window (and in unit tests) egui embeds the same content in a window
+/// inside the dashboard. The OS close button clears `open`.
+pub(crate) fn detail_window<R>(
+    ctx: &egui::Context,
+    key: &str,
+    title: &str,
+    size: [f32; 2],
+    open: &mut bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let mut add = Some(add);
+    let builder = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size(size)
+        .with_min_inner_size([420.0, 300.0])
+        .with_resizable(true);
+    let (out, close) =
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(key), builder, |ui, class| {
+            let Some(add) = add.take() else {
+                return (None, false);
+            };
+            if class == egui::ViewportClass::EmbeddedWindow {
+                return (Some(add(ui)), false);
+            }
+            let close = ui.ctx().input(|i| i.viewport().close_requested());
+            let r = egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(c::BG_CARD)
+                        .inner_margin(egui::Margin::same(16)),
+                )
+                .show(ui, |ui| add(ui))
+                .inner;
+            (Some(r), close)
+        });
+    if close {
+        *open = false;
+    }
+    out
+}
+
+/// v1.0 standard action of a Details window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetailsAct {
+    Copy,
+    Save,
+    OpenFolder,
+    Close,
+}
+
+/// v1.0 standard Details action bar, left to right:
+/// [Копировать] [Сохранить как...] ([Открыть папку отчёта]) [Закрыть].
+/// Copy / Save act on the CURRENT module's text only.
+pub(crate) fn details_action_bar(
+    ui: &mut egui::Ui,
+    d: &i18n::Dict,
+    export_enabled: bool,
+    folder: Option<bool>,
+) -> Option<DetailsAct> {
+    let mut act = None;
+    ui.horizontal(|ui| {
+        if details::secondary_button(ui, d.journal_viewer_copy, export_enabled).clicked() {
+            act = Some(DetailsAct::Copy);
+        }
+        if details::secondary_button(ui, d.details_save_as, export_enabled).clicked() {
+            act = Some(DetailsAct::Save);
+        }
+        if let Some(enabled) = folder
+            && details::secondary_button(ui, d.details_open_folder, enabled).clicked()
+        {
+            act = Some(DetailsAct::OpenFolder);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if details::secondary_button(ui, d.journal_viewer_close, true).clicked() {
+                act = Some(DetailsAct::Close);
+            }
+        });
+    });
+    act
+}
+
 pub(crate) fn expc_stage_card(
     ui: &mut egui::Ui,
     d: &i18n::Dict,
@@ -554,6 +647,9 @@ struct ExpcSubStageTracker {
     /// Last message received from PowerShell (retained for future use)
     #[allow(dead_code)]
     last_message: String,
+    /// v0.4.4: when each step started and how long it took.
+    started: [Option<Instant>; 14],
+    durations: [Option<Duration>; 14],
 }
 
 impl Default for ExpcSubStageTracker {
@@ -563,6 +659,8 @@ impl Default for ExpcSubStageTracker {
             internal_pct: [0; 14],
             active_index: None,
             last_message: String::new(),
+            started: [None; 14],
+            durations: [None; 14],
         }
     }
 }
@@ -607,6 +705,13 @@ impl ExpcSubStageTracker {
         };
 
         // Parse the suffix to determine state
+        let finished = message.contains("— завершено") || message.contains("— пропущено");
+        if finished && self.durations[idx].is_none() {
+            self.durations[idx] = self.started[idx].map(|t| t.elapsed());
+        }
+        if !finished && self.started[idx].is_none() {
+            self.started[idx] = Some(Instant::now());
+        }
         if message.contains("— завершено") {
             self.status[idx] = SubStageStatus::Done;
             self.internal_pct[idx] = 100;
@@ -964,6 +1069,10 @@ fn nvme_health_rows(h: &nvme_health::NvmeHealth, d: &i18n::Dict) -> Vec<(String,
         ProbeStatus::Error => d.nvme_status_error.to_string(),
     };
     let mut rows = vec![(d.nvme_status_label.to_string(), status)];
+    // v1.0 ATA / SATA SMART facts (read-only; UNSUPPORTED is honest).
+    if let Some(a) = &h.ata_smart {
+        rows.extend(a.fact_lines());
+    }
     let Some(s) = h.smart.as_ref() else {
         if let Some(detail) = &h.status_detail {
             rows.push((String::new(), detail.clone()));
@@ -1108,6 +1217,7 @@ fn ssd_benchmark_evidence(
         disk_label,
         None,
         RunRole::Initial,
+        None,
     )
 }
 
@@ -1130,6 +1240,42 @@ impl RunRole {
 /// Benchmark evidence. Additive v0.4.2 JSON fields: `physical_disk_index`,
 /// `model` (per-disk manifest grouping) and `run_role`; the automatic
 /// retest gets its own `_retest` file so both runs are always kept.
+/// v1.0 evidence of an INVALID run (physically impossible for the
+/// transport): raw facts + reason, explicitly not a performance result.
+fn invalid_benchmark_evidence(
+    result: &StorageDiagnosticSummary,
+    test_dir: &Path,
+    duration_seconds: f64,
+    disk: Option<&storage_topology::PhysicalDiskInfo>,
+    reason: &str,
+) -> Vec<EvidenceFile> {
+    let t = sysinfo::local_time();
+    let mb = |v: f64| v * 1.048_576;
+    let q = crate::deep_checks::json::string;
+    let json = format!(
+        "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"validity\":\"INVALID\",\"verdict\":\"BENCHMARK INVALID / RESULT NOT TRUSTED\",\"invalid_reason\":{},\"captured_at\":{},\"physical_disk_index\":{},\"model\":{},\"bus_type\":{},\"transport_ceiling_mb_s\":{},\"test_dir\":{},\"duration_s\":{:.3},\"read_max_mb_s\":{:.3},\"write_max_mb_s\":{:.3},\"note\":\"not disk performance; excluded from history and stability\"}}",
+        q(reason),
+        q(&local_iso(t)),
+        disk.map(|d| d.index.to_string())
+            .unwrap_or_else(|| "null".into()),
+        disk.map(|d| q(d.model.trim()))
+            .unwrap_or_else(|| "null".into()),
+        disk.map(|d| q(&d.bus_type))
+            .unwrap_or_else(|| "null".into()),
+        disk.and_then(|d| storage_benchmark::transport_ceiling_mb_s(&d.bus_type))
+            .map(|c| format!("{c:.0}"))
+            .unwrap_or_else(|| "null".into()),
+        q(&test_dir.display().to_string()),
+        duration_seconds,
+        mb(result.read_max_mib_s),
+        mb(result.write_max_mib_s),
+    );
+    vec![EvidenceFile::new(
+        format!("SSD_Benchmark_{}_INVALID.json", evidence_stamp(t)),
+        json.into_bytes(),
+    )]
+}
+
 fn ssd_benchmark_evidence_for(
     result: &StorageDiagnosticSummary,
     test_dir: &Path,
@@ -1138,11 +1284,20 @@ fn ssd_benchmark_evidence_for(
     disk_label: String,
     disk: Option<&storage_topology::PhysicalDiskInfo>,
     role: RunRole,
+    retest_of: Option<&str>,
 ) -> Vec<EvidenceFile> {
     let t = sysinfo::local_time();
-    let stem = match role {
-        RunRole::Initial => format!("SSD_Benchmark_{}", evidence_stamp(t)),
-        RunRole::AutomaticRetest => format!("SSD_Benchmark_{}_retest", evidence_stamp(t)),
+    // v1.0: the retest is named after the STORED stem of the initial run it
+    // confirms (`<initial>_retest`), so the pair can never be mismatched
+    // with another same-minute run (`_02`).
+    let stem = match (role, retest_of) {
+        (RunRole::Initial, _) => format!("SSD_Benchmark_{}", evidence_stamp(t)),
+        (RunRole::AutomaticRetest, Some(initial)) => {
+            format!("{}_retest", initial.trim_end_matches(".json"))
+        }
+        (RunRole::AutomaticRetest, None) => {
+            format!("SSD_Benchmark_{}_retest", evidence_stamp(t))
+        }
     };
     let mb = |mib: f64| mib * 1.048576;
     let mut text = String::new();
@@ -1230,8 +1385,12 @@ fn ssd_benchmark_evidence_for(
         out
     };
     let json = format!(
-        "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"run_role\":{},\"physical_disk_index\":{},\"model\":{},\"test_dir\":{},\"disk\":{},\"block_size\":{},\"queue_depth\":{},\"test_file_size\":{},\"pass_count\":{},\"duration_s\":{:.3},\"read_mb_s\":{:.3},\"write_mb_s\":{:.3},\"read_variation_percent\":{:.3},\"write_variation_percent\":{:.3},\"stability\":{},\"stable\":{},\"passes\":[{}]}}",
+        "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"run_role\":{},\"captured_at\":{},\"retest_of\":{},\"physical_disk_index\":{},\"model\":{},\"test_dir\":{},\"disk\":{},\"block_size\":{},\"queue_depth\":{},\"test_file_size\":{},\"pass_count\":{},\"duration_s\":{:.3},\"read_mb_s\":{:.3},\"write_mb_s\":{:.3},\"read_variation_percent\":{:.3},\"write_variation_percent\":{:.3},\"stability\":{},\"stable\":{},\"passes\":[{}]}}",
         json_str(role.code()),
+        json_str(&local_iso(t)),
+        retest_of
+            .map(|r| json_str(&format!("{}.json", r.trim_end_matches(".json"))))
+            .unwrap_or_else(|| "null".into()),
         disk.map(|d| d.index.to_string())
             .unwrap_or_else(|| "null".into()),
         disk.map(|d| json_str(d.model.trim()))
@@ -1316,6 +1475,130 @@ enum CryptoEvent {
     Rehashed(cryptopro::RehashOutcome),
 }
 
+/// v0.4.4 Crash Dump analyzer UI state.
+#[derive(Default)]
+struct CrashState {
+    inventory: Option<Result<crash_dump::Inventory, String>>,
+    analyses: Vec<crash_dump::DumpAnalysis>,
+    busy: CrashBusy,
+    /// v1.0 live stage of the running analysis.
+    progress: Option<AnalysisProgress>,
+    /// v1.0 embedded installer.
+    install: InstallState,
+    /// v1.0 local install journal (Details).
+    install_log: Vec<String>,
+}
+
+/// v1.0 real progress of the running analysis (stages from the debugger's
+/// own output; no percentage).
+#[derive(Clone, Debug)]
+struct AnalysisProgress {
+    stage: crash_dump::AnalysisStage,
+    started: Instant,
+    dump_index: usize,
+    dump_total: usize,
+    dump_name: String,
+    symbols_downloading: bool,
+}
+
+/// v1.0 embedded WinDbg installer state.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum InstallState {
+    #[default]
+    Idle,
+    Running {
+        stage: crash_dump::InstallStage,
+        percent: Option<u8>,
+    },
+    /// winget reported success; the analyzer is being re-detected.
+    Verifying,
+    Succeeded,
+    Failed(String),
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum CrashBusy {
+    #[default]
+    Idle,
+    // Constructed by the Windows-only inventory collector.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Scanning,
+    Analyzing,
+}
+
+/// One analyzed dump from the worker.
+struct AnalyzedDump {
+    dump: crash_dump::DumpFile,
+    bugcheck: Option<crash_dump::BugcheckEvent>,
+    status: crash_dump::AnalysisStatus,
+    raw: String,
+    bytes: Option<Vec<u8>>,
+    /// v1.0 `lmvm` + installed-driver resolution of the implicated module.
+    module_info: Option<crash_dump::ModuleInfo>,
+    resolution: Option<crash_dump::DriverResolution>,
+}
+
+/// Messages of the crash worker thread.
+#[cfg_attr(any(not(windows), test), allow(dead_code))]
+enum CrashMsg {
+    Inventory(Result<crash_dump::Inventory, String>),
+    /// v1.0 real stage reached (index of the dump, total dumps, name).
+    Stage(crash_dump::AnalysisStage, usize, usize, String),
+    /// v1.0 the local symbol cache is growing (Microsoft symbol download).
+    Symbols(bool),
+    Analyzed(Vec<AnalyzedDump>),
+}
+
+/// v1.0 one physical disk of the read-only ATA SMART scan.
+#[derive(Clone, Debug)]
+struct AtaDisk {
+    index: u32,
+    model: String,
+    bus: String,
+    smart: crate::ata_smart::AtaSmart,
+}
+
+/// v1.0 messages of the hidden installer thread.
+#[cfg_attr(not(windows), allow(dead_code))]
+enum InstallMsg {
+    Line(String),
+    Done(crash_dump::InstallResult),
+}
+
+/// PowerShell host used by the Windows collectors.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PS_HOST: &str = "powershell.exe";
+
+/// Local symbol cache for headless dump analysis.
+// Used by the analysis thread, which never runs under `cfg(test)`.
+#[cfg_attr(any(not(windows), test), allow(dead_code))]
+fn symbol_cache_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("WinStateDiag")
+        .join("Symbols")
+}
+
+/// Total size of the files under `dir` (symbol-download detection; read
+/// only, bounded depth).
+#[cfg_attr(any(not(windows), test), allow(dead_code))]
+fn dir_size(dir: &Path) -> u64 {
+    fn walk(p: &Path, depth: u32) -> u64 {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return 0;
+        };
+        rd.flatten()
+            .map(|e| match e.metadata() {
+                Ok(m) if m.is_dir() && depth < 4 => walk(&e.path(), depth + 1),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+    walk(dir, 0)
+}
+
 /// Short, safe idle between an UNSTABLE first run and its retest.
 const RETEST_IDLE: Duration = Duration::from_secs(10);
 /// Extra time the retest waits for the health read before failing closed.
@@ -1336,6 +1619,8 @@ struct StorageAssessment {
     first_duration: f64,
     first_previous: Option<HistoryEntry>,
     second: Option<StorageDiagnosticSummary>,
+    /// v1.0 duration of the automatic retest (Disk Details).
+    second_duration: Option<f64>,
     retest: storage_health::RetestOutcome,
     benchmark_files: Vec<String>,
     health_file: Option<String>,
@@ -1343,6 +1628,8 @@ struct StorageAssessment {
     health_pending: bool,
     events_pending: bool,
     classification: Option<storage_health::Classification>,
+    /// v1.0 item 18: session start (benchmark accepted).
+    started_at: String,
 }
 
 fn bench_facts(r: &StorageDiagnosticSummary) -> storage_health::BenchmarkFacts {
@@ -1359,16 +1646,49 @@ fn bench_facts(r: &StorageDiagnosticSummary) -> storage_health::BenchmarkFacts {
     }
 }
 
+/// Elapsed seconds as an "mm:ss" clock (live Test 1 / Test 2 timer).
+fn clock_mm_ss(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
 /// "UNSTABLE (WRITE 18.40%)": a run's overall level and its worst spread.
-fn run_brief_long(r: &StorageDiagnosticSummary) -> String {
+fn test_vm(
+    r: &StorageDiagnosticSummary,
+    previous: Option<&HistoryEntry>,
+    d: &i18n::Dict,
+) -> TestVm {
+    let mb = |mib: f64| format!("{:.0}", mib * 1.048576);
     let level =
         stability_level(r.read_variation_percent).max(stability_level(r.write_variation_percent));
-    let (axis, v) = if r.write_variation_percent >= r.read_variation_percent {
-        ("WRITE", r.write_variation_percent)
-    } else {
-        ("READ", r.read_variation_percent)
-    };
-    format!("{} ({axis} {v:.2}%)", stability_text(level))
+    let pct = |v: Option<f64>| v.map(|x| format!("{x:+.1}%")).unwrap_or_else(|| "—".into());
+    TestVm {
+        read: mb(r.summary_read_mib_s),
+        write: mb(r.summary_write_mib_s),
+        stability: format!(
+            "{} · R {:.1}% / W {:.1}%",
+            stability_text(level),
+            r.read_variation_percent,
+            r.write_variation_percent
+        ),
+        tone: stability_tone(level),
+        delta: previous.map(|p| {
+            d.test_delta_fmt
+                .replace(
+                    "{r}",
+                    &pct(ssd_history::delta_percent(
+                        r.summary_read_mib_s,
+                        p.read_mib_s,
+                    )),
+                )
+                .replace(
+                    "{w}",
+                    &pct(ssd_history::delta_percent(
+                        r.summary_write_mib_s,
+                        p.write_mib_s,
+                    )),
+                )
+        }),
+    }
 }
 
 /// "UNSTABLE 18.4%": compact form for the dashboard note lines.
@@ -1418,6 +1738,9 @@ enum BenchmarkUiState {
         /// enumerated, in which case history falls back to the older
         /// volume-serial identity (`ssd_history::disk_identity_for`).
         physical_identity: Option<String>,
+        /// v0.4.5 latest measured MiB/s (live Test block values).
+        live_write: Option<f64>,
+        live_read: Option<f64>,
     },
     Done {
         result: StorageDiagnosticSummary,
@@ -1431,6 +1754,8 @@ enum BenchmarkUiState {
     Cancelled,
 }
 pub struct WinStateDiagApp {
+    /// v1.0: crisp multi-size resource icon on every native window.
+    window_icons: crate::win_icon::WindowIcons,
     client_name: String,
     computer_name: String,
     mode: DiagnosticMode,
@@ -1447,6 +1772,14 @@ pub struct WinStateDiagApp {
     expc_checks: Vec<deep_checks::ExpcCheck>,
     expc_details_open: bool,
     expc_export_status: Option<ExportStatus>,
+    /// v0.4.5 Copy/Save status of the per-stage Details window.
+    stage_export_status: Option<ExportStatus>,
+    /// v1.0 Copy / Save as status lines of the remaining Details windows.
+    crash_export_status: Option<ExportStatus>,
+    disk_export_status: Option<ExportStatus>,
+    gpo_export_status: Option<ExportStatus>,
+    /// v0.4.5 Copy/Save status of the sensor Details window.
+    sensors_export_status: Option<ExportStatus>,
     driver_export_status: Option<ExportStatus>,
     #[cfg(test)]
     driver_rerun_requests: usize,
@@ -1469,6 +1802,8 @@ pub struct WinStateDiagApp {
     report_opened: bool,
     /// `<EXE dir>\Reports`: the only place a final report may be opened from.
     reports_root: PathBuf,
+    /// v1.0 item 18: identity of this app run's storage sessions.
+    storage_session_id: String,
     /// The one cumulative report package of this running WinStateDiag.
     package: SharedPackage,
     /// Stop request of the running diagnostic (None when nothing runs).
@@ -1480,6 +1815,45 @@ pub struct WinStateDiagApp {
     crypto_rx: Option<Receiver<CryptoEvent>>,
     driver_audit: DriverAuditState,
     drivers_open: bool,
+    /// v0.4.4: active page (Diagnostics / Hardware).
+    page: Page,
+    /// Crash Dump / BSOD analyzer state.
+    crash: CrashState,
+    crash_rx: Option<Receiver<CrashMsg>>,
+    /// v1.0 read-only ATA SMART of every physical disk (HDDs included).
+    ata_scan: Option<Vec<AtaDisk>>,
+    ata_rx: Option<Receiver<Vec<AtaDisk>>>,
+    ata_evidence_pending: bool,
+    /// v1.0 aggregated event evidence of this session.
+    event_evidence: Option<Result<(Vec<events::Aggregate>, Option<bool>), String>>,
+    events_rx: Option<Receiver<Result<(Vec<events::RawEvent>, Vec<events::ServiceInfo>), String>>>,
+    /// v1.0 hidden WinDbg installer output.
+    install_rx: Option<Receiver<InstallMsg>>,
+    crash_details_open: bool,
+    /// After an explicit "install analyzer" click: (launched, last re-scan).
+    /// The debugger is re-detected periodically for 10 minutes.
+    crash_redetect: Option<(Instant, Instant)>,
+    /// v0.4.5 hardware sensors (10 s sampling window; session min/max).
+    sensors: Option<sensors::Snapshot>,
+    sensors_rx: Option<Receiver<sensors::Snapshot>>,
+    /// v1.0 item 8: when the current sensor read started (real timer).
+    sensors_started: Option<Instant>,
+    /// v1.0 item 8: the last read failed (cleared by the next read).
+    sensors_error: Option<String>,
+    /// Write sensor evidence for the read in flight.
+    sensors_evidence_pending: bool,
+    sensors_details_open: bool,
+    /// v0.4.5 compact computer passport (read-only CIM collector).
+    passport: Option<Result<passport::Passport, String>>,
+    passport_rx: Option<Receiver<Result<passport::Passport, String>>>,
+    /// v0.4.5 text queued for the clipboard (copied on the next frame).
+    clipboard_out: Option<String>,
+    /// v0.4.5 per-stage Details window (0-based EXPC stage index).
+    stage_details: Option<usize>,
+    /// Group Policy / ADMX health.
+    gpo: Option<Result<(gpo_admx::GpoInputs, gpo_admx::GpoResult), String>>,
+    gpo_rx: Option<Receiver<Result<gpo_admx::GpoInputs, String>>>,
+    gpo_details_open: bool,
     window_fitted: bool,
     /// Physical SSD/NVMe disks WinStateDiag could enumerate on this machine
     /// (v0.3.6, multi-SSD). Empty when enumeration is unavailable (e.g. any
@@ -1568,6 +1942,11 @@ impl Default for WinStateDiagApp {
             expc_checks: Vec::new(),
             expc_details_open: false,
             expc_export_status: None,
+            stage_export_status: None,
+            crash_export_status: None,
+            disk_export_status: None,
+            gpo_export_status: None,
+            sensors_export_status: None,
             driver_export_status: None,
             #[cfg(test)]
             driver_rerun_requests: 0,
@@ -1583,6 +1962,13 @@ impl Default for WinStateDiagApp {
             raw_passes_open: false,
             report_opened: false,
             reports_root: exe_dir().join("Reports"),
+            storage_session_id: {
+                let t = sysinfo::local_time();
+                crate::storage_history::new_session_id(&format!(
+                    "{:04}{:02}{:02}-{:02}{:02}{:02}",
+                    t.year, t.month, t.day, t.hour, t.minute, t.second
+                ))
+            },
             package: Arc::new(Mutex::new(SessionPackage::for_exe_dir(&exe_dir()))),
             session_cancel: None,
             hardware: HardwareViewState::Idle,
@@ -1591,6 +1977,30 @@ impl Default for WinStateDiagApp {
             crypto_rx: None,
             driver_audit: DriverAuditState::Failed(String::new()),
             drivers_open: false,
+            page: Page::Diagnostics,
+            crash: CrashState::default(),
+            crash_rx: None,
+            ata_scan: None,
+            ata_rx: None,
+            ata_evidence_pending: false,
+            event_evidence: None,
+            events_rx: None,
+            install_rx: None,
+            crash_details_open: false,
+            crash_redetect: None,
+            sensors: None,
+            sensors_rx: None,
+            sensors_started: None,
+            sensors_error: None,
+            sensors_evidence_pending: false,
+            sensors_details_open: false,
+            passport: None,
+            passport_rx: None,
+            clipboard_out: None,
+            stage_details: None,
+            gpo: None,
+            gpo_rx: None,
+            gpo_details_open: false,
             window_fitted: false,
             ssd_candidates: Vec::new(),
             ssd_selected: 0,
@@ -1608,11 +2018,13 @@ impl Default for WinStateDiagApp {
             language: i18n::load(&exe_dir()),
             language_pref_dir: exe_dir(),
             reference: ReferenceMode::from_args(),
+            window_icons: Default::default(),
         };
         // Unit tests never start the (read-only) PowerShell collector.
         if app.reference.is_none() && !cfg!(test) {
             app.driver_audit = start_driver_audit();
             app.start_crypto_check();
+            app.start_hardware_collectors();
         }
         // Physical SSD/NVMe enumeration (v0.3.6): Windows-only real probe,
         // behind the same "not in QA reference / not under test" guard as
@@ -1634,6 +2046,12 @@ impl Default for WinStateDiagApp {
             app.client_name = fixture::CLIENT_NAME.into();
             app.computer_name = fixture::COMPUTER_NAME.into();
             app.benchmark_path = fixture::BENCHMARK_PATH.into();
+            let scene = app
+                .reference
+                .as_ref()
+                .map(|r| r.scene.clone())
+                .unwrap_or_default();
+            app.seed_qa_scene(&scene);
         }
         app
     }
@@ -1760,6 +2178,26 @@ impl WinStateDiagApp {
         let physical_identity = self
             .selected_ssd_candidate()
             .map(|c| storage_topology::physical_disk_identity(&c.disk));
+        // v1.0 (SATA "2571–3065 MB/s" audit): the target directory and the
+        // disk identity come from the SAME selected candidate. A stale UI
+        // path could otherwise write to another volume (e.g. the NVMe C:)
+        // while the result is attributed to the selected SATA disk.
+        if let Some(c) = self.selected_ssd_candidate() {
+            match storage_topology::benchmark_target_dir(c) {
+                Ok(dir)
+                    if c.volume
+                        .as_ref()
+                        .is_some_and(|v| v.physical_disk_index == c.disk.index) =>
+                {
+                    self.benchmark_path = dir.display().to_string();
+                }
+                _ => {
+                    let msg = i18n::t(self.language).journal_ssd_target_unavailable;
+                    push_journal(&mut self.journal, msg.to_string());
+                    return false;
+                }
+            }
+        }
         let path = PathBuf::from(self.benchmark_path.trim());
         let test_dir = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1785,6 +2223,8 @@ impl WinStateDiagApp {
             });
         }
         self.benchmark_state = BenchmarkUiState::Running {
+            live_write: None,
+            live_read: None,
             progress: DiagnosticProgress::Preparation,
             rx,
             cancel,
@@ -1808,6 +2248,17 @@ impl WinStateDiagApp {
             RunRole::Initial
         };
         let disk = self.selected_ssd_candidate().map(|c| c.disk.clone());
+        // v1.0: the stored stem of the initial run this retest confirms.
+        let retest_of: Option<String> = self
+            .retest_identity
+            .as_ref()
+            .and_then(|id| self.assessments.get(id))
+            .and_then(|a| {
+                a.benchmark_files
+                    .iter()
+                    .find(|n| n.ends_with(".json"))
+                    .cloned()
+            });
         let mut ssd_evidence: Option<Vec<EvidenceFile>> = None;
         if let BenchmarkUiState::Running {
             progress,
@@ -1816,11 +2267,59 @@ impl WinStateDiagApp {
             started,
             test_dir,
             physical_identity,
+            live_write,
+            live_read,
         } = &mut self.benchmark_state
         {
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    BenchmarkEvent::Progress(DiagnosticProgress::Measured {
+                        write_mib_s,
+                        read_mib_s,
+                        ..
+                    }) => {
+                        *live_write = Some(write_mib_s);
+                        if read_mib_s.is_some() {
+                            *live_read = read_mib_s;
+                        }
+                    }
                     BenchmarkEvent::Progress(value) => *progress = value,
+                    BenchmarkEvent::Finished(Ok(result))
+                        if disk
+                            .as_ref()
+                            .and_then(|d| {
+                                storage_benchmark::implausible_reason(&d.bus_type, &result)
+                            })
+                            .is_some() =>
+                    {
+                        // v1.0: physically impossible for the detected
+                        // transport → BENCHMARK INVALID / RESULT NOT TRUSTED.
+                        // Never history, never a stability verdict, never
+                        // "performance"; the raw facts stay in evidence.
+                        let reason = disk
+                            .as_ref()
+                            .and_then(|d| {
+                                storage_benchmark::implausible_reason(&d.bus_type, &result)
+                            })
+                            .unwrap_or_default();
+                        let duration_seconds = started.elapsed().as_secs_f64();
+                        ssd_evidence = Some(invalid_benchmark_evidence(
+                            &result,
+                            test_dir,
+                            duration_seconds,
+                            disk.as_ref(),
+                            &reason,
+                        ));
+                        finished_err = true;
+                        history_log = Some(format!(
+                            "{}: {reason}",
+                            i18n::t(self.language).ssd_benchmark_invalid
+                        ));
+                        next_state = Some(BenchmarkUiState::Failed(format!(
+                            "{} — {reason}",
+                            i18n::t(self.language).ssd_benchmark_invalid
+                        )));
+                    }
                     BenchmarkEvent::Finished(Ok(result)) => {
                         // Best-effort history bookkeeping: a storage or
                         // permission failure here never affects the result.
@@ -1883,6 +2382,7 @@ impl WinStateDiagApp {
                             disk_identity_label(physical_identity.as_deref()),
                             disk.as_ref(),
                             role,
+                            retest_of.as_deref(),
                         ));
                         // v0.3.6 §10: cache this disk's own result by its
                         // identity so selecting away and back (without a
@@ -1922,14 +2422,12 @@ impl WinStateDiagApp {
         if let Some(line) = history_log {
             push_journal(&mut self.journal, line);
         }
-        // The completed benchmark joins the session report automatically.
-        let names: Vec<String> = ssd_evidence
-            .as_ref()
-            .map(|f| f.iter().map(|e| e.name.clone()).collect())
-            .unwrap_or_default();
+        // The completed benchmark joins the session report automatically;
+        // the assessment records the names it was STORED under.
+        let mut names: Vec<String> = Vec::new();
         if let Some(files) = ssd_evidence {
             let module = i18n::t(self.language).ssd_module_name;
-            self.contribute_evidence(module, files);
+            names = self.contribute_evidence(module, files);
         }
         if let Some((identity, result, duration, previous)) = finished {
             match self.retest_identity.take() {
@@ -1938,6 +2436,7 @@ impl WinStateDiagApp {
                     if let Some(a) = self.assessments.get_mut(&id) {
                         a.retest = storage_health::RetestOutcome::Completed(bench_facts(&result));
                         a.second = Some(result);
+                        a.second_duration = Some(duration);
                         a.benchmark_files.extend(names);
                     }
                     self.finalize_assessment(&id);
@@ -1979,6 +2478,7 @@ impl WinStateDiagApp {
                 first_duration: duration,
                 first_previous: previous,
                 second: None,
+                second_duration: None,
                 retest: if unstable {
                     storage_health::RetestOutcome::Pending
                 } else {
@@ -1990,6 +2490,7 @@ impl WinStateDiagApp {
                 health_pending: probing,
                 events_pending: probing,
                 classification: None,
+                started_at: local_iso(sysinfo::local_time()),
             },
         );
         if unstable {
@@ -2128,13 +2629,61 @@ impl WinStateDiagApp {
             .as_ref()
             .map(|d| d.model.trim().to_string())
             .unwrap_or_default();
-        let json = storage_health::to_json(
+        // v1.0 items 15 + 18: session identity; delta against the latest
+        // COMPLETED session of this disk (cancelled runs never anchor).
+        let status = match inputs.retest {
+            storage_health::RetestOutcome::Cancelled => {
+                crate::storage_history::SessionStatus::Cancelled
+            }
+            storage_health::RetestOutcome::Failed => crate::storage_history::SessionStatus::Failed,
+            _ => crate::storage_history::SessionStatus::Completed,
+        };
+        let smart_now = inputs.nvme.as_ref().and_then(|h| h.smart.as_ref());
+        let record = crate::storage_history::SessionRecord {
+            session_id: self.storage_session_id.clone(),
+            physical_identity: identity.to_string(),
+            start_time: a.started_at.clone(),
+            end_time: inputs.assessed_at.clone(),
+            status,
+            producer_version: crate::APP_VERSION.to_string(),
+            storage_state: c.state.code().to_string(),
+            error_log_entries: smart_now
+                .map(|s| s.error_information_log_entries.min(u64::MAX as u128) as u64),
+            media_errors: smart_now
+                .map(|s| s.media_and_data_integrity_errors.min(u64::MAX as u128) as u64),
+        };
+        let history_path = self.reports_root.join(crate::storage_history::FILE_NAME);
+        let mut history = std::fs::read_to_string(&history_path)
+            .map(|t| crate::storage_history::parse(&t))
+            .unwrap_or_default();
+        let error_log_delta = smart_now.map(|_| {
+            crate::storage_history::delta(
+                crate::storage_history::latest_completed(
+                    &history,
+                    identity,
+                    &self.storage_session_id,
+                ),
+                record.error_log_entries,
+            )
+        });
+        let json = storage_health::to_json_with(
             &inputs,
             &c,
             &model,
             a.health_file.as_deref(),
             &a.benchmark_files,
+            &storage_health::CorrelationExtras {
+                session: Some(record.clone()),
+                error_log_delta: error_log_delta.clone(),
+            },
         );
+        crate::storage_history::upsert(&mut history, record);
+        if std::fs::create_dir_all(&self.reports_root).is_ok() {
+            let _ = std::fs::write(&history_path, crate::storage_history::to_json(&history));
+        }
+        if let Some(dl) = error_log_delta.as_ref() {
+            push_journal(&mut self.journal, dl.text(self.language == Language::Ru));
+        }
         let name = storage_health::evidence_file_name(&evidence_stamp(now), inputs.disk_index);
         let d = i18n::t(self.language);
         let disk = inputs
@@ -2170,11 +2719,19 @@ impl WinStateDiagApp {
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let captured_at = local_iso(sysinfo::local_time());
-                    let health = nvme_health::collect(
+                    let mut health = nvme_health::collect(
                         &nvme_health::windows_source::WindowsNvmeReader,
                         &disk,
                         &captured_at,
                     );
+                    // v0.4.4 SATA/ATA fallback: never the NVMe protocol;
+                    // Windows Storage Reliability counters (facts only).
+                    if nvme_health::is_ata_bus(&disk.bus_type) {
+                        health.reliability =
+                            nvme_health::read_reliability("powershell.exe", disk.index);
+                        // v1.0 read-only ATA SMART (READ DATA / THRESHOLDS).
+                        nvme_health::apply_ata(&mut health, crate::ata_smart::read(disk.index));
+                    }
                     let _ = tx.send(ProbeMsg::Health(health));
                     let events = storage_health::collect_events("powershell.exe");
                     let _ = tx.send(ProbeMsg::Events(identity, events));
@@ -2254,10 +2811,16 @@ impl WinStateDiagApp {
         );
         let identity = health.physical_identity.clone();
         self.nvme_health.insert(identity.clone(), health);
-        self.contribute_evidence(d.nvme_module_name, vec![file]);
+        // v1.0: the correlation references the health file by its STORED
+        // name (a same-day collision stores it as `_NN`).
+        let stored = self
+            .contribute_evidence(d.nvme_module_name, vec![file])
+            .into_iter()
+            .next()
+            .unwrap_or(name);
         if let Some(a) = self.assessments.get_mut(&identity) {
             a.health_pending = false;
-            a.health_file = Some(name);
+            a.health_file = Some(stored);
         }
         self.finalize_assessment(&identity);
     }
@@ -2286,17 +2849,22 @@ impl WinStateDiagApp {
 
     /// Adds evidence to the session package (UI-thread modules) and
     /// journals the outcome.
-    fn contribute_evidence(&mut self, module: &str, files: Vec<EvidenceFile>) {
+    /// Returns the names the files were STORED under (input order); on an
+    /// error the requested names (nothing was renamed).
+    fn contribute_evidence(&mut self, module: &str, files: Vec<EvidenceFile>) -> Vec<String> {
         let date = identity_date(sysinfo::local_time());
         let created = report_package::lock(&self.package).final_zip().is_none();
-        let result = report_package::lock(&self.package).contribute(
+        let requested: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
+        let (sys_state, hw_state) = self.state_codes();
+        report_package::lock(&self.package).set_states(&sys_state, &hw_state);
+        let result = report_package::lock(&self.package).contribute_named(
             &self.client_name,
             &self.computer_name,
             &date,
             files,
         );
         match result {
-            Ok(zip) => {
+            Ok((zip, stored)) => {
                 if created {
                     self.report_opened = false;
                 }
@@ -2305,8 +2873,12 @@ impl WinStateDiagApp {
                     .replace("{module}", module)
                     .replace("{path}", &display_report_path(&zip));
                 push_journal(&mut self.journal, line);
+                stored
             }
-            Err(err) => push_journal(&mut self.journal, format!("[ERROR] {module}: {err}")),
+            Err(err) => {
+                push_journal(&mut self.journal, format!("[ERROR] {module}: {err}"));
+                requested
+            }
         }
     }
 
@@ -2349,6 +2921,107 @@ impl WinStateDiagApp {
             stage_message: "Подготовка EXPC Diagnostic".into(),
             rx,
         };
+        // v0.4.4 auxiliary read-only modules (not EXPC stages): Group Policy
+        // / ADMX health and a fresh crash inventory join this session.
+        self.start_gpo_check();
+        self.start_crash_scan();
+        self.start_sensor_read(true);
+        self.start_event_collection();
+        // v1.0: a fresh ATA SMART scan joins this session's report.
+        self.ata_evidence_pending = true;
+        self.start_ata_scan();
+    }
+
+    /// v1.0 read-only event evidence for this session (joins its ZIP).
+    fn start_event_collection(&mut self) {
+        #[cfg(windows)]
+        if self.reference.is_none() && !cfg!(test) && self.events_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(events::collect(PS_HOST));
+            });
+            self.events_rx = Some(rx);
+        }
+    }
+
+    fn poll_events(&mut self) {
+        let Some(rx) = &self.events_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.events_rx = None;
+                self.accept_events(res);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.events_rx = None,
+        }
+    }
+
+    /// Aggregates the raw events and adds `Event_Evidence_<stamp>.json`.
+    fn accept_events(
+        &mut self,
+        res: Result<(Vec<events::RawEvent>, Vec<events::ServiceInfo>), String>,
+    ) {
+        match res {
+            Ok((raw, services)) => {
+                let aggs = events::aggregate(&raw, &services);
+                let wu = events::wu_failure_is_historical(&raw);
+                let now = sysinfo::local_time();
+                let json = events::to_json(&aggs, wu, &local_iso(now));
+                let name = format!("{}{}.json", events::EVIDENCE_PREFIX, evidence_stamp(now));
+                self.event_evidence = Some(Ok((aggs, wu)));
+                let d = i18n::t(self.language);
+                self.contribute_evidence(
+                    d.module_event_evidence,
+                    vec![EvidenceFile::new(&name, json.into_bytes())],
+                );
+            }
+            Err(e) => self.event_evidence = Some(Err(e)),
+        }
+    }
+
+    /// v1.0 aggregated event lines that belong to EXPC stage `i` only.
+    fn stage_event_lines(&self, i: usize) -> Vec<String> {
+        let Some(Ok((aggs, wu))) = &self.event_evidence else {
+            return Vec::new();
+        };
+        // v1.0: unique actionable groups first (primary metric), then the
+        // raw aggregates (secondary evidence, scope in Event_Evidence JSON).
+        let mut out: Vec<String> = events::actionable(aggs, *wu)
+            .iter()
+            .filter(|g| g.stage == i)
+            .map(|g| {
+                format!(
+                    "Группа · [{}] {} · {} → {}",
+                    g.class.code(),
+                    g.title,
+                    g.first_seen.replace('T', " "),
+                    g.last_seen.replace('T', " ")
+                )
+            })
+            .collect();
+        out.extend(
+            aggs.iter()
+                .filter(|a| {
+                    a.group
+                        .is_some_and(|g| g != events::Group::Other && g.stage() == i)
+                })
+                .map(|a| format!("Events · {}", events::aggregate_line(a))),
+        );
+        if i == 3
+            && let Some(hist) = wu
+        {
+            out.push(format!(
+                "Events · WindowsUpdateClient #20: {}",
+                if *hist {
+                    "historical failure (a later update installed successfully)"
+                } else {
+                    "no successful install after the newest failure"
+                }
+            ));
+        }
+        out
     }
 
     fn poll_engine(&mut self) {
@@ -2494,7 +3167,10 @@ impl WinStateDiagApp {
             || self.benchmark_is_running()
             || self.nvme_rx.is_some()
             || !matches!(self.hardware, HardwareViewState::Idle)
-            || matches!(self.driver_audit, DriverAuditState::Running(_));
+            || matches!(self.driver_audit, DriverAuditState::Running(_))
+            || self.gpo_rx.is_some()
+            || (self.sensors_rx.is_some() && self.sensors_evidence_pending)
+            || self.crash.busy == CrashBusy::Analyzing;
         if busy
             || matches!(
                 self.state,
@@ -2806,6 +3482,17 @@ impl WinStateDiagApp {
         let d = i18n::t(self.language);
 
         // ---- Stages ----
+        // v0.4.4 stage table: results/findings from the EXPC evidence.
+        let stage_details = self.expc_stage_details();
+        let consistency_inputs = (
+            self.audit_view()
+                .map(|r| significant_system_evidence(&r))
+                .unwrap_or(0),
+            match &self.crash.inventory {
+                Some(Ok(inv)) => inv.bugchecks.len(),
+                _ => 0,
+            },
+        );
         let step_count = EXPC_STEP_COUNT as usize;
         let mut stages = Vec::with_capacity(step_count);
         for i in 0..step_count {
@@ -2860,6 +3547,47 @@ impl WinStateDiagApp {
                     );
                 }
             }
+            let detail = stage_details.get(i);
+            let (sys_events, bugchecks) = consistency_inputs;
+            let result = detail.map(|e| e.state).filter(|st| {
+                !matches!(
+                    st,
+                    details::StageState::Waiting | details::StageState::Running
+                )
+            });
+            let repaired = self.deep_check_at(i).is_some_and(|o| {
+                o.finding_class() == Some(crate::deep_checks::ChkdskFinding::Repaired)
+            });
+            let result_text = if repaired && result.is_some() {
+                d.chkdsk_repaired_label.to_string()
+            } else {
+                result
+                    .map(|st| d.expc_state_labels[st.index()].to_string())
+                    .unwrap_or_default()
+            };
+            let mut short_finding = detail
+                .and_then(|e| e.findings.first().cloned())
+                .unwrap_or_default();
+            // v1.0 cross-module consistency (no silent contradiction).
+            if let Some(note) = consistency_note(
+                i,
+                result == Some(details::StageState::Ok),
+                sys_events,
+                bugchecks,
+                d,
+            ) {
+                short_finding = note;
+            }
+            let duration = self.expc_tracker.durations[i]
+                .map(|t| {
+                    let s = t.as_secs();
+                    if s >= 60 {
+                        format!("{}:{:02}", s / 60, s % 60)
+                    } else {
+                        format!("{s} s")
+                    }
+                })
+                .unwrap_or_default();
             stages.push(StageRow {
                 number: i + 1,
                 label: d.stage_short[i].to_string(),
@@ -2869,6 +3597,10 @@ impl WinStateDiagApp {
                 right_text: right,
                 active: running && self.expc_tracker.active_index == Some(i),
                 finding,
+                result,
+                result_text,
+                short_finding,
+                duration,
             });
         }
 
@@ -3032,18 +3764,33 @@ impl WinStateDiagApp {
             BenchmarkUiState::Failed(msg) => SsdVm::Failed(msg.clone()),
             BenchmarkUiState::RetestWaiting { until, result, .. } => {
                 let left = until.saturating_duration_since(Instant::now()).as_secs();
+                let waiting = d.ssd_retest_waiting_fmt.replace("{s}", &left.to_string());
+                let first_previous = self
+                    .retest_identity
+                    .as_ref()
+                    .and_then(|id| self.assessments.get(id))
+                    .and_then(|a| a.first_previous.as_ref());
                 SsdVm::Running {
                     fraction: 0.0,
-                    status: d.ssd_retest_waiting_fmt.replace("{s}", &left.to_string()),
+                    status: waiting.clone(),
                     elapsed: String::new(),
                     note: Some([
                         d.ssd_retest_note_fmt.replace("{first}", &run_brief(result)),
                         d.ssd_unstable_rule_note.to_string(),
                     ]),
+                    blocks: [
+                        TestBlockVm::Done(test_vm(result, first_previous, d)),
+                        TestBlockVm::Waiting(Some(waiting)),
+                    ],
+                    retest: true,
                 }
             }
             BenchmarkUiState::Running {
-                progress, started, ..
+                progress,
+                started,
+                live_write,
+                live_read,
+                ..
             } => {
                 let (fraction, status) = match progress {
                     DiagnosticProgress::Preparation => (0.03, d.ssd_preparing_file.to_string()),
@@ -3056,6 +3803,8 @@ impl WinStateDiagApp {
                         format!("{} {pass}/{total}: READ", d.ssd_pass_word),
                     ),
                     DiagnosticProgress::Complete => (1.0, d.ssd_finishing.to_string()),
+                    // Never stored as `progress` (poll keeps the pass).
+                    DiagnosticProgress::Measured { .. } => (0.5, String::new()),
                 };
                 // The automatic retest says so (with the kept first run)
                 // in the note lines; the status line stays the pass.
@@ -3070,11 +3819,33 @@ impl WinStateDiagApp {
                             d.ssd_unstable_rule_note.to_string(),
                         ]
                     });
+                let assessment = self
+                    .retest_identity
+                    .as_ref()
+                    .and_then(|id| self.assessments.get(id));
+                let mb = |mib: &Option<f64>| mib.map(|v| format!("{:.0}", v * 1.048576));
+                let active = TestBlockVm::Active {
+                    read: mb(live_read),
+                    write: mb(live_write),
+                    elapsed: clock_mm_ss(started.elapsed().as_secs()),
+                };
+                let (blocks, retest) = match assessment {
+                    Some(a) => (
+                        [
+                            TestBlockVm::Done(test_vm(&a.first, a.first_previous.as_ref(), d)),
+                            active,
+                        ],
+                        true,
+                    ),
+                    None => ([active, TestBlockVm::Waiting(None)], false),
+                };
                 SsdVm::Running {
                     fraction,
                     status,
                     elapsed: format!("{:.1} s", started.elapsed().as_secs_f64()),
                     note,
+                    blocks,
+                    retest,
                 }
             }
             BenchmarkUiState::Done {
@@ -3112,7 +3883,17 @@ impl WinStateDiagApp {
                             d.ssd_unstable_rule_note.to_string(),
                         ]
                     });
+                // v0.4.4 Test 1 / Test 2: the first run and, when one ran,
+                // the automatic retest (both kept).
+                let tests = match assessment.and_then(|a| a.second.as_ref().map(|_| a)) {
+                    Some(a) => [
+                        Some(test_vm(&a.first, a.first_previous.as_ref(), d)),
+                        Some(test_vm(result, previous.as_ref(), d)),
+                    ],
+                    None => [Some(test_vm(result, previous.as_ref(), d)), None],
+                };
                 SsdVm::Done {
+                    tests,
                     status,
                     note,
                     read_current: mb(result.summary_read_mib_s),
@@ -3223,7 +4004,10 @@ impl WinStateDiagApp {
         let now = sysinfo::local_time();
         let drivers = match &self.driver_audit {
             DriverAuditState::Running(_) => DriversVm::Running,
-            DriverAuditState::Done(report) => drivers_vm(report, d),
+            DriverAuditState::Done(_) => match self.audit_view() {
+                Some(view) => drivers_vm(&view, d),
+                None => DriversVm::Running,
+            },
             DriverAuditState::Failed(msg) => DriversVm::Unavailable(msg.clone()),
         };
         DashboardVm {
@@ -3269,6 +4053,13 @@ impl WinStateDiagApp {
             time,
             animate: true,
             lang: self.language,
+            page: self.page,
+            crash: self.crash_vm(),
+            sensors: self.sensors_vm(),
+            gpo: self.gpo_vm(),
+            system_state: self.system_state_vm(),
+            smart: self.smart_rows(),
+            passport: self.passport_rows(),
         }
     }
 
@@ -3322,6 +4113,31 @@ impl WinStateDiagApp {
             Action::ShowRawPasses => self.raw_passes_open = true,
             Action::ShowDrivers => self.drivers_open = true,
             Action::ShowExpcDetails => self.expc_details_open = true,
+            // v0.4.4: page switch only changes what is drawn; every module
+            // state (selected disk, benchmark, audit, crash) is untouched.
+            Action::SetPage(page) => self.page = page,
+            Action::AnalyzeDumps => self.start_crash_analysis(),
+            Action::ShowCrashDetails => self.crash_details_open = true,
+            // v1.0: the hidden install is observed to its end and re-detects
+            // the analyzer itself (no blind periodic re-scans).
+            Action::InstallAnalyzer => self.install_analyzer(),
+            Action::RefreshSensors => self.start_sensor_read(true),
+            Action::ShowSensorDetails => self.sensors_details_open = true,
+            Action::RunGpoCheck => self.start_gpo_check(),
+            Action::ShowGpoDetails => self.gpo_details_open = true,
+            Action::CopyClientInfo => {
+                self.clipboard_out = Some(passport::client_clipboard_text(
+                    &self.client_name,
+                    &self.computer_name,
+                    self.language == Language::Ru,
+                ));
+            }
+            Action::ShowStageDetails(i) => {
+                if self.stage_details != Some(i) {
+                    self.stage_export_status = None;
+                }
+                self.stage_details = Some(i);
+            }
         }
     }
 
@@ -3349,6 +4165,16 @@ impl WinStateDiagApp {
                 }
             }
             Err(err) => push_journal(&mut self.journal, format!("[ERROR] {err}")),
+        }
+    }
+
+    /// v1.0 "Открыть папку отчёта" of a Details window (same final-report
+    /// rules as the dashboard button; no Explorer launch under tests).
+    fn open_report_folder_from_details(&mut self) {
+        if cfg!(test) {
+            self.open_final_report_folder(&|_| Ok(()));
+        } else {
+            self.open_final_report_folder(&engine::open_report_folder);
         }
     }
 
@@ -3396,15 +4222,18 @@ impl WinStateDiagApp {
         }
         let mut open = self.drivers_open;
         let mut rerun = false;
+        let mut close_drivers = false;
         let mut export: Option<ExportAction> = None;
         let d = i18n::t(self.language);
         let export_status = self.driver_export_status.as_ref().map(|s| s.text(d));
-        egui::Window::new(d.driver_details_title)
-            .id(egui::Id::new("wsd_driver_details"))
-            .open(&mut open)
-            .default_size(vec2(760.0, 560.0))
-            .collapsible(false)
-            .show(ctx, |ui| match &self.driver_audit {
+        let view = self.audit_view();
+        detail_window(
+            ctx,
+            "wsd_driver_details",
+            d.driver_details_title,
+            [980.0, 760.0],
+            &mut open,
+            |ui| match &self.driver_audit {
                 DriverAuditState::Running(_) => {
                     ui.label(d.driver_popup_running);
                 }
@@ -3412,7 +4241,8 @@ impl WinStateDiagApp {
                     ui.colored_label(c::RED_ERROR, msg);
                     rerun = ui.button(d.driver_popup_retry).clicked();
                 }
-                DriverAuditState::Done(report) => {
+                DriverAuditState::Done(base) => {
+                    let report: &AuditReport = view.as_deref().unwrap_or(base);
                     // v0.4.1 summary header: application UI, not a log line
                     // (no date/time); the rule text lives in the Info tip.
                     let (header_rerun, header_export) =
@@ -3421,126 +4251,165 @@ impl WinStateDiagApp {
                     export = header_export;
                     ui.add_space(4.0);
                     ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (n, it) in report.items.iter().enumerate() {
-                            let col = match it.status {
-                                Severity::Problem => c::RED_ERROR,
-                                Severity::Warning => c::YELLOW_WARNING,
-                                Severity::Ok => c::GREEN_SUCCESS,
-                            };
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new(format!(
-                                    "[{}]  {}  —  {}",
-                                    driver_status_label(d, it.status),
-                                    localized_driver_label(d, &it.label),
-                                    if it.version.is_empty() {
-                                        d.driver_na
-                                    } else {
-                                        &it.version
+                    egui::ScrollArea::vertical()
+                        .id_salt("wsd_driver_details_scroll")
+                        .auto_shrink([false, false])
+                        .max_height((ui.available_height() - 50.0).max(120.0))
+                        .show(ui, |ui| {
+                            for (n, it) in report.items.iter().enumerate() {
+                                let col = match it.status {
+                                    Severity::Problem => c::RED_ERROR,
+                                    Severity::Warning => c::YELLOW_WARNING,
+                                    Severity::Ok => c::GREEN_SUCCESS,
+                                };
+                                egui::CollapsingHeader::new(
+                                    egui::RichText::new(format!(
+                                        "[{}]  {}  —  {}",
+                                        driver_status_label(d, it.status),
+                                        localized_driver_label(d, &it.label),
+                                        if it.version.is_empty() {
+                                            d.driver_na
+                                        } else {
+                                            &it.version
+                                        }
+                                    ))
+                                    .color(col),
+                                )
+                                .id_salt(("drv", n))
+                                .default_open(it.status != Severity::Ok)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        d.driver_popup_device_fmt.replace("{device}", &it.device),
+                                    );
+                                    ui.label(
+                                        d.driver_popup_provider_fmt
+                                            .replace(
+                                                "{provider}",
+                                                if it.provider.is_empty() {
+                                                    d.driver_na
+                                                } else {
+                                                    &it.provider
+                                                },
+                                            )
+                                            .replace(
+                                                "{date}",
+                                                if it.date.is_empty() {
+                                                    d.driver_na
+                                                } else {
+                                                    &it.date
+                                                },
+                                            )
+                                            .replace(
+                                                "{inf}",
+                                                if it.inf.is_empty() {
+                                                    d.driver_na
+                                                } else {
+                                                    &it.inf
+                                                },
+                                            )
+                                            .replace(
+                                                "{service}",
+                                                if it.service.is_empty() {
+                                                    d.driver_na
+                                                } else {
+                                                    &it.service
+                                                },
+                                            ),
+                                    );
+                                    if !it.pnp_id.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&it.pnp_id).color(c::TEXT_MUTED),
+                                        );
                                     }
-                                ))
-                                .color(col),
-                            )
-                            .id_salt(("drv", n))
-                            .default_open(it.status != Severity::Ok)
-                            .show(ui, |ui| {
-                                ui.label(d.driver_popup_device_fmt.replace("{device}", &it.device));
-                                ui.label(
-                                    d.driver_popup_provider_fmt
-                                        .replace(
-                                            "{provider}",
-                                            if it.provider.is_empty() {
-                                                d.driver_na
+                                    for e in &it.evidence {
+                                        ui.label(format!(
+                                            "• {} [{}{}]{}{}",
+                                            e.reason,
+                                            e.source,
+                                            e.event_id
+                                                .map(|i| d
+                                                    .driver_popup_event_fmt
+                                                    .replace("{event_id}", &i.to_string()))
+                                                .unwrap_or_default(),
+                                            if e.count > 1 {
+                                                format!(" ×{}", e.count)
                                             } else {
-                                                &it.provider
+                                                String::new()
                                             },
-                                        )
-                                        .replace(
-                                            "{date}",
-                                            if it.date.is_empty() {
-                                                d.driver_na
+                                            if e.last_seen.is_empty() {
+                                                String::new()
                                             } else {
-                                                &it.date
-                                            },
-                                        )
-                                        .replace(
-                                            "{inf}",
-                                            if it.inf.is_empty() {
-                                                d.driver_na
-                                            } else {
-                                                &it.inf
-                                            },
-                                        )
-                                        .replace(
-                                            "{service}",
-                                            if it.service.is_empty() {
-                                                d.driver_na
-                                            } else {
-                                                &it.service
-                                            },
-                                        ),
-                                );
-                                if !it.pnp_id.is_empty() {
-                                    ui.label(egui::RichText::new(&it.pnp_id).color(c::TEXT_MUTED));
+                                                d.driver_popup_last_seen_fmt
+                                                    .replace("{last_seen}", &e.last_seen)
+                                            }
+                                        ));
+                                    }
+                                });
+                            }
+                            // Engineering detail only: inactive-by-design drivers
+                            // (never counted, never on the card or in the TXT).
+                            if !report.expected_inactive.is_empty() {
+                                ui.separator();
+                                for e in &report.expected_inactive {
+                                    ui.label(
+                                        egui::RichText::new(format!("[INFO] {}", e.reason))
+                                            .color(c::TEXT_MUTED),
+                                    );
                                 }
-                                for e in &it.evidence {
+                            }
+                            if !report.software_findings.is_empty() {
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(d.driver_software_findings_title)
+                                        .strong()
+                                        .color(c::YELLOW_WARNING),
+                                );
+                                for e in &report.software_findings {
                                     ui.label(format!(
-                                        "• {} [{}{}]{}{}",
+                                        "• {} [{}{}] ×{} · {} … {}",
                                         e.reason,
                                         e.source,
-                                        e.event_id
-                                            .map(|i| d
-                                                .driver_popup_event_fmt
-                                                .replace("{event_id}", &i.to_string()))
-                                            .unwrap_or_default(),
-                                        if e.count > 1 {
-                                            format!(" ×{}", e.count)
-                                        } else {
-                                            String::new()
-                                        },
-                                        if e.last_seen.is_empty() {
-                                            String::new()
-                                        } else {
-                                            d.driver_popup_last_seen_fmt
-                                                .replace("{last_seen}", &e.last_seen)
-                                        }
+                                        e.event_id.map(|i| format!(" #{i}")).unwrap_or_default(),
+                                        e.count,
+                                        e.first_seen.replace('T', " "),
+                                        e.last_seen.replace('T', " ")
                                     ));
                                 }
-                            });
-                        }
-                        // Engineering detail only: inactive-by-design drivers
-                        // (never counted, never on the card or in the TXT).
-                        if !report.expected_inactive.is_empty() {
-                            ui.separator();
-                            for e in &report.expected_inactive {
+                            }
+                            if !report.unattributed.is_empty() {
+                                ui.separator();
                                 ui.label(
-                                    egui::RichText::new(format!("[INFO] {}", e.reason))
+                                    egui::RichText::new(d.driver_popup_unattributed_note)
                                         .color(c::TEXT_MUTED),
                                 );
+                                for e in &report.unattributed {
+                                    ui.label(format!("• {} [{}] ×{}", e.reason, e.source, e.count));
+                                }
                             }
-                        }
-                        if !report.unattributed.is_empty() {
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(d.driver_popup_unattributed_note)
-                                    .color(c::TEXT_MUTED),
-                            );
-                            for e in &report.unattributed {
-                                ui.label(format!("• {} [{}] ×{}", e.reason, e.source, e.count));
+                            if !report.errors.is_empty() {
+                                ui.separator();
+                                for e in &report.errors {
+                                    ui.colored_label(
+                                        c::YELLOW_WARNING,
+                                        d.driver_popup_collection_error_fmt.replace("{error}", e),
+                                    );
+                                }
                             }
-                        }
-                        if !report.errors.is_empty() {
-                            ui.separator();
-                            for e in &report.errors {
-                                ui.colored_label(
-                                    c::YELLOW_WARNING,
-                                    d.driver_popup_collection_error_fmt.replace("{error}", e),
-                                );
-                            }
-                        }
-                    });
+                        });
+                    // v1.0 standard action bar (this module's text only).
+                    ui.separator();
+                    match details_action_bar(ui, d, true, None) {
+                        Some(DetailsAct::Copy) => export = Some(ExportAction::Copy),
+                        Some(DetailsAct::Save) => export = Some(ExportAction::Save),
+                        Some(DetailsAct::Close) => close_drivers = true,
+                        _ => {}
+                    }
                 }
-            });
+            },
+        );
+        if close_drivers {
+            open = false;
+        }
         self.drivers_open = open;
         if let Some(action) = export {
             self.driver_issues_export(ctx, action);
@@ -3561,11 +4430,9 @@ impl WinStateDiagApp {
 
     /// The canonical Driver Check issues text of the current audit.
     fn driver_issues_text(&self) -> Option<String> {
-        let DriverAuditState::Done(report) = &self.driver_audit else {
-            return None;
-        };
+        let report = self.audit_view()?;
         let d = i18n::t(self.language);
-        Some(details::driver_issues_text(report, d, &|l| {
+        Some(details::driver_issues_text(&report, d, &|l| {
             localized_driver_label(d, l)
         }))
     }
@@ -3596,7 +4463,20 @@ impl WinStateDiagApp {
             ExportAction::Save => {
                 let name = details::export_file_name(kind, sysinfo::local_time());
                 let dir = journal_logs_dir(&self.reports_root);
-                match save_journal_text(&dir, &name, text) {
+                // v1.0: standard Windows Save As dialog; only THIS module's
+                // text is written. Without a dialog (tests, no comdlg32) the
+                // file goes to the session logs folder as before.
+                let picked = crate::win_dialog::save_as(&dir, &name, d.details_save_as);
+                let saved = match picked {
+                    crate::win_dialog::SavePick::Cancelled => return ExportStatus::Cancelled,
+                    crate::win_dialog::SavePick::Path(path) => {
+                        crate::win_dialog::write_text(&path, text)
+                    }
+                    crate::win_dialog::SavePick::Unavailable => {
+                        save_journal_text(&dir, &name, text)
+                    }
+                };
+                match saved {
                     Ok(path) => {
                         let line = format!("{}: {}", d.export_saved, path.display());
                         push_journal(&mut self.journal, line);
@@ -3644,6 +4524,304 @@ impl WinStateDiagApp {
         )
     }
 
+    /// v0.4.5: evidence lines of ONE EXPC stage — its EXPC check records
+    /// (key, status, detail) plus the stage's own read-only sources (07:
+    /// unexpected shutdowns / BugCheck / dumps / incidents; 14: Driver
+    /// Audit). Never another stage's data.
+    fn stage_evidence_lines(&self, i: usize) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .expc_checks
+            .iter()
+            .filter(|c| details::step_of_key(&c.key) == Some(i))
+            .map(|c| {
+                if c.detail.is_empty() {
+                    format!("EXPC · {} · {}", c.key, c.status)
+                } else {
+                    format!("EXPC · {} · {} · {}", c.key, c.status, c.detail)
+                }
+            })
+            .collect();
+        if let Some(o) = self
+            .deep_check_results
+            .iter()
+            .find(|o| DeepCheck::of_step_index(i) == Some(o.check))
+        {
+            out.push(format!(
+                "{} · {} · {}",
+                o.check.key(),
+                o.effective_result().as_str(),
+                o.detail
+            ));
+            // v1.0: CHKDSK execution vs finding are separate facts.
+            if let Some(f) = o.finding_class() {
+                out.push(format!(
+                    "{} · execution_status=completed · finding_class={}",
+                    o.check.key(),
+                    f.code()
+                ));
+            }
+        }
+        // v1.0 cross-module consistency note of this stage.
+        let ok = self
+            .expc_stage_details()
+            .get(i)
+            .is_some_and(|det| det.state == details::StageState::Ok);
+        let sys_events = self
+            .audit_view()
+            .map(|r| significant_system_evidence(&r))
+            .unwrap_or(0);
+        let bugchecks = match &self.crash.inventory {
+            Some(Ok(inv)) => inv.bugchecks.len(),
+            _ => 0,
+        };
+        if let Some(note) = consistency_note(i, ok, sys_events, bugchecks, i18n::t(self.language)) {
+            out.push(format!("Consistency · {note}"));
+        }
+        // v1.0 aggregated event evidence of THIS stage only (04 System,
+        // 05 VSS / Volsnap, 03 kernel CI, 08 applications / user-mode CI /
+        // SideBySide).
+        out.extend(self.stage_event_lines(i));
+        match i {
+            6 => out.extend(self.crash_stage_evidence()),
+            13 => {
+                if let Some(r) = self.audit_view() {
+                    let count = |s: Severity| r.items.iter().filter(|it| it.status == s).count();
+                    out.push(format!(
+                        "Driver Audit · {} · PROBLEM {} · WARNING {} · OK {} · devices {}",
+                        r.overall.code(),
+                        count(Severity::Problem),
+                        count(Severity::Warning),
+                        count(Severity::Ok),
+                        r.devices_scanned
+                    ));
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Session journal lines that belong to stage `i` (its EXPC title, its
+    /// short name or its deep-check label), newest last, at most 12.
+    fn stage_journal_lines(&self, i: usize) -> Vec<String> {
+        let d = i18n::t(self.language);
+        let mut needles: Vec<String> = vec![
+            EXPC_STEP_LABELS[i].to_string(),
+            d.stage_short[i].to_string(),
+            format!("{:02}/14", i + 1),
+        ];
+        if let Some(k) = DeepCheck::of_step_index(i) {
+            needles.push(format!("{} ", k.key()));
+        }
+        let lines: Vec<String> = self
+            .journal
+            .entries
+            .iter()
+            .filter(|e| {
+                needles
+                    .iter()
+                    .any(|n| !n.trim().is_empty() && e.message.contains(n.as_str()))
+            })
+            .map(SessionJournal::line)
+            .collect();
+        let start = lines.len().saturating_sub(12);
+        lines[start..].to_vec()
+    }
+
+    /// Plain-text export of one stage window (Copy / Save).
+    fn stage_details_text(&self, i: usize) -> String {
+        let d = i18n::t(self.language);
+        let entries = self.expc_stage_details();
+        let mut o = String::new();
+        let title = d
+            .stage_window_title_fmt
+            .replace("{n}", &format!("{:02}", i + 1))
+            .replace("{name}", d.stage_short[i]);
+        o.push_str(&format!("WinStateDiag — {title}\r\n"));
+        o.push_str(&format!(
+            "{}: {}\r\n",
+            d.stage_scope_label, d.stage_scope[i]
+        ));
+        if let Some(det) = entries.get(i) {
+            o.push_str(&format!(
+                "{}: {}\r\n",
+                d.stage_status_label,
+                d.expc_state_labels[det.state.index()]
+            ));
+            if let Some(t) = self.expc_tracker.durations[i] {
+                o.push_str(&format!(
+                    "{}: {} s\r\n",
+                    d.stage_duration_label,
+                    t.as_secs()
+                ));
+            }
+            let ex = details::explain(det, d, &system_drive());
+            if let Some(e) = &ex.explanation {
+                o.push_str(&format!("{e}\r\n"));
+            }
+            for f in &det.findings {
+                o.push_str(&format!("{}: {f}\r\n", d.expc_result_label));
+            }
+            if let Some(cmd) = &ex.suggested_command {
+                o.push_str(&format!(
+                    "{}: {cmd} ({})\r\n",
+                    d.expc_suggested_action, d.expc_not_executed
+                ));
+            }
+        }
+        o.push_str(&format!("\r\n{}:\r\n", d.stage_evidence_label));
+        let ev = self.stage_evidence_lines(i);
+        if ev.is_empty() {
+            o.push_str(&format!("  {}\r\n", d.stage_no_evidence));
+        }
+        for l in ev {
+            o.push_str(&format!("  {l}\r\n"));
+        }
+        o.push_str(&format!("\r\n{}:\r\n", d.stage_journal_label));
+        for l in self.stage_journal_lines(i) {
+            o.push_str(&format!("  {l}\r\n"));
+        }
+        o
+    }
+
+    /// v0.4.5 Details of ONE EXPC stage (row button). Status, result,
+    /// evidence and the stage's own journal lines; Copy / Save / Close.
+    fn stage_details_window(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.stage_details.filter(|i| *i < 14) else {
+            return;
+        };
+        let d = i18n::t(self.language);
+        let entries = self.expc_stage_details();
+        let Some(det) = entries.get(i).cloned() else {
+            self.stage_details = None;
+            return;
+        };
+        let evidence = self.stage_evidence_lines(i);
+        let journal = self.stage_journal_lines(i);
+        let duration = self.expc_tracker.durations[i].map(|t| {
+            let s = t.as_secs();
+            format!("{:02}:{:02}", s / 60, s % 60)
+        });
+        let drive = system_drive();
+        let status = self.stage_export_status.as_ref().map(|s| s.text(d));
+        let title = d
+            .stage_window_title_fmt
+            .replace("{n}", &format!("{:02}", i + 1))
+            .replace("{name}", d.stage_short[i]);
+        let mut open = true;
+        let mut close = false;
+        let mut action: Option<ExportAction> = None;
+        let mut copy_command: Option<String> = None;
+        let not_run = det.state == details::StageState::Waiting;
+        let folder_ok = self.final_report().is_ok();
+        let mut open_folder = false;
+        detail_window(
+            ctx,
+            "wsd_stage_details",
+            &title,
+            [940.0, 780.0],
+            &mut open,
+            |ui| {
+                ui.label(
+                    RichText::new(&title)
+                        .strong()
+                        .size(17.0)
+                        .color(c::TEXT_TITLE),
+                );
+                ui.label(
+                    RichText::new(format!("{}: {}", d.stage_scope_label, d.stage_scope[i]))
+                        .color(c::TEXT_SECONDARY),
+                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}:", d.stage_status_label))
+                            .color(c::TEXT_SECONDARY),
+                    );
+                    ui.label(
+                        RichText::new(d.expc_state_labels[det.state.index()])
+                            .strong()
+                            .color(det.state.color()),
+                    );
+                    if let Some(t) = &duration {
+                        ui.label(
+                            RichText::new(format!("· {}: {t}", d.stage_duration_label))
+                                .color(c::TEXT_SECONDARY),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                let footer = if status.is_some() { 70.0 } else { 46.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_stage_details_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - footer).max(80.0))
+                    .show(ui, |ui| {
+                        if not_run {
+                            ui.label(RichText::new(d.stage_not_run).color(c::TEXT_MUTED));
+                        } else {
+                            expc_stage_card(ui, d, &det, &drive, &mut copy_command);
+                        }
+                        ui.add_space(8.0);
+                        details::section_title(ui, d.stage_evidence_label);
+                        if evidence.is_empty() {
+                            ui.label(RichText::new(d.stage_no_evidence).color(c::TEXT_MUTED));
+                        }
+                        for l in &evidence {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(l).monospace().size(12.5).color(c::TEXT_BODY),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        details::section_title(ui, d.stage_journal_label);
+                        if journal.is_empty() {
+                            ui.label(RichText::new(d.stage_journal_empty).color(c::TEXT_MUTED));
+                        }
+                        for l in &journal {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(l)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(c::TEXT_SECONDARY),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    });
+                ui.separator();
+                if let Some((text, color)) = &status {
+                    ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
+                }
+                match details_action_bar(ui, d, !not_run, Some(folder_ok)) {
+                    Some(DetailsAct::Copy) => action = Some(ExportAction::Copy),
+                    Some(DetailsAct::Save) => action = Some(ExportAction::Save),
+                    Some(DetailsAct::OpenFolder) => open_folder = true,
+                    Some(DetailsAct::Close) => close = true,
+                    None => {}
+                }
+            },
+        );
+        if open_folder {
+            self.open_report_folder_from_details();
+        }
+        if let Some(cmd) = copy_command {
+            ctx.copy_text(cmd);
+            self.stage_export_status = Some(ExportStatus::Copied);
+        }
+        if let Some(action) = action {
+            let text = self.stage_details_text(i);
+            let kind = format!("EXPC_Stage_{:02}", i + 1);
+            self.stage_export_status = Some(self.export_text(ctx, action, &kind, &text));
+        }
+        if !open || close {
+            self.stage_details = None;
+            self.stage_export_status = None;
+        }
+    }
+
     /// v0.4.1: EXPC diagnostic results — explanation of the 14 steps
     /// (dashboard = status, this window = explanation, ZIP = evidence).
     fn expc_details_window(&mut self, ctx: &egui::Context) {
@@ -3663,19 +4841,15 @@ impl WinStateDiagApp {
         let mut action: Option<ExportAction> = None;
         let mut close = false;
         let mut copy_command: Option<String> = None;
-        let screen = ctx.content_rect();
-        egui::Window::new(d.expc_details_title)
-            .id(egui::Id::new("wsd_expc_details"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .constrain(true)
-            .default_size(vec2(
-                620.0_f32.min(screen.width()),
-                600.0_f32.min(screen.height()),
-            ))
-            .min_size(vec2(380.0, 260.0))
-            .show(ctx, |ui| {
+        let folder_ok = self.final_report().is_ok();
+        let mut open_folder = false;
+        detail_window(
+            ctx,
+            "wsd_expc_details",
+            d.expc_details_title,
+            [1000.0, 820.0],
+            &mut open,
+            |ui| {
                 details::section_title(ui, d.expc_details_summary);
                 ui.horizontal_wrapped(|ui| {
                     details::counter_chip(
@@ -3736,19 +4910,18 @@ impl WinStateDiagApp {
                 if let Some((text, color)) = &status {
                     ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Right-to-left: shown as [Copy] [Save] [Close].
-                    if details::secondary_button(ui, d.journal_viewer_close, true).clicked() {
-                        close = true;
-                    }
-                    if details::secondary_button(ui, d.journal_viewer_save, !never_ran).clicked() {
-                        action = Some(ExportAction::Save);
-                    }
-                    if details::secondary_button(ui, d.journal_viewer_copy, !never_ran).clicked() {
-                        action = Some(ExportAction::Copy);
-                    }
-                });
-            });
+                match details_action_bar(ui, d, !never_ran, Some(folder_ok)) {
+                    Some(DetailsAct::Copy) => action = Some(ExportAction::Copy),
+                    Some(DetailsAct::Save) => action = Some(ExportAction::Save),
+                    Some(DetailsAct::OpenFolder) => open_folder = true,
+                    Some(DetailsAct::Close) => close = true,
+                    None => {}
+                }
+            },
+        );
+        if open_folder {
+            self.open_report_folder_from_details();
+        }
         if let Some(cmd) = copy_command {
             ctx.copy_text(cmd);
             self.expc_export_status = Some(ExportStatus::Copied);
@@ -3763,6 +4936,10 @@ impl WinStateDiagApp {
         }
     }
 
+    /// v1.0 Disk Benchmark Details: a large resizable engineering window
+    /// for the selected PHYSICAL disk — identity, Test 1 / Test 2, their
+    /// comparison, SMART / NVMe health, the final storage assessment and
+    /// the last benchmark runs of this disk. Copy / Save as / folder / Close.
     fn raw_passes_window(&mut self, ctx: &egui::Context) {
         if !self.raw_passes_open {
             return;
@@ -3771,80 +4948,291 @@ impl WinStateDiagApp {
             self.raw_passes_open = false;
             return;
         };
-        let mut open = self.raw_passes_open;
+        let result = result.clone();
+        let d = i18n::t(self.language);
+        let sections = self.disk_details_sections(&result);
+        let text = disk_details_text(&self.disk_details_title(), &sections);
+        let title = self.disk_details_title();
+        let status = self.disk_export_status.as_ref().map(|s| s.text(d));
+        let folder_ok = self.final_report().is_ok();
+        let assessment = self.selected_assessment();
+        let first = assessment.map(|a| a.first.clone());
+        let mut open = true;
+        let mut act: Option<DetailsAct> = None;
+        detail_window(
+            ctx,
+            "wsd_disk_details",
+            &title,
+            [980.0, 820.0],
+            &mut open,
+            |ui| {
+                ui.label(
+                    RichText::new(&title)
+                        .strong()
+                        .size(17.0)
+                        .color(c::TEXT_TITLE),
+                );
+                ui.add_space(4.0);
+                let footer = if status.is_some() { 76.0 } else { 50.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_disk_details_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - footer).max(120.0))
+                    .show(ui, |ui| {
+                        for (n, (head, rows)) in sections.iter().enumerate() {
+                            details::section_title(ui, head);
+                            egui::Grid::new(("wsd_disk_sec", n))
+                                .num_columns(2)
+                                .striped(true)
+                                .spacing(vec2(16.0, 4.0))
+                                .show(ui, |ui| {
+                                    for (k, v) in rows {
+                                        if k.is_empty() {
+                                            ui.label("");
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(v).color(c::TEXT_SECONDARY),
+                                                )
+                                                .wrap(),
+                                            );
+                                        } else {
+                                            ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
+                                            ui.add(egui::Label::new(v).wrap());
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(6.0);
+                        }
+                        // Raw passes of both runs (kept for engineers).
+                        egui::CollapsingHeader::new(d.ssd_raw_passes_title)
+                            .id_salt("wsd_disk_raw_passes")
+                            .show(ui, |ui| {
+                                if let Some(f) = &first {
+                                    section_title(ui, d.test1_title);
+                                    pass_grid(ui, "benchmark_first_run_passes", f);
+                                }
+                                section_title(ui, d.ssd_disk_details_current);
+                                pass_grid(ui, "benchmark_raw_passes", &result);
+                            });
+                    });
+                ui.separator();
+                if let Some((t, col)) = &status {
+                    ui.add(egui::Label::new(RichText::new(t).color(*col)).wrap());
+                }
+                act = details_action_bar(ui, d, true, Some(folder_ok));
+            },
+        );
+        match act {
+            Some(DetailsAct::Copy) => {
+                self.disk_export_status =
+                    Some(self.export_text(ctx, ExportAction::Copy, "Disk_Benchmark", &text))
+            }
+            Some(DetailsAct::Save) => {
+                self.disk_export_status =
+                    Some(self.export_text(ctx, ExportAction::Save, "Disk_Benchmark", &text))
+            }
+            Some(DetailsAct::OpenFolder) => self.open_report_folder_from_details(),
+            Some(DetailsAct::Close) => open = false,
+            None => {}
+        }
+        if !open {
+            self.disk_export_status = None;
+        }
+        self.raw_passes_open = open;
+    }
+
+    fn disk_details_title(&self) -> String {
+        let d = i18n::t(self.language);
+        let model = self
+            .selected_ssd_candidate()
+            .map(|c| c.disk.model.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "—".into());
+        format!("{} — {model}", d.disk_details_title)
+    }
+
+    /// v1.0 Disk Details content as (section, rows); shared by the window
+    /// and the Copy / Save as text so both always say the same thing.
+    fn disk_details_sections(
+        &self,
+        current: &StorageDiagnosticSummary,
+    ) -> Vec<(String, Vec<(String, String)>)> {
         let d = i18n::t(self.language);
         let ru = self.language == Language::Ru;
-        let health = self.selected_nvme_health();
-        let assessment = self.selected_assessment();
-        let raw_passes_title = d.ssd_raw_passes_title;
-        egui::Window::new(raw_passes_title)
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                // v0.4.2: with an automatic retest both runs are
-                // shown — the first UNSTABLE run never disappears.
-                let retested = assessment.and_then(|a| a.second.as_ref().map(|_| a));
-                if let Some(a) = retested {
-                    section_title(
-                        ui,
-                        &format!("{} — {}", d.ssd_retest_run_title, run_brief_long(result)),
-                    );
-                    pass_grid(ui, "benchmark_raw_passes", result);
-                    ui.add_space(6.0);
-                    section_title(
-                        ui,
-                        &format!("{} — {}", d.ssd_first_run_title, run_brief_long(&a.first)),
-                    );
-                    pass_grid(ui, "benchmark_first_run_passes", &a.first);
-                } else {
-                    pass_grid(ui, "benchmark_raw_passes", result);
-                }
-                // Storage correlation: state colour comes from here.
-                if let Some(c) = assessment.and_then(|a| a.classification.as_ref()) {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    section_title(ui, d.storage_assessment_title);
-                    ui.label(egui::RichText::new(c.state.text(ru)).strong().color(
-                        match storage_tone(c.state) {
-                            Tone::Success => c::GREEN_SUCCESS,
-                            Tone::Warning => c::YELLOW_WARNING,
-                            Tone::Error => c::RED_ERROR,
-                            _ => c::TEXT_PRIMARY,
+        let mb = |mib: f64| format!("{:.0} MB/s", mib * 1.048576);
+        let mut out: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        // Identity.
+        let mut id_rows = Vec::new();
+        if let Some(cand) = self.selected_ssd_candidate() {
+            let disk = &cand.disk;
+            id_rows.push((d.disk_det_model.into(), disk.model.trim().to_string()));
+            id_rows.push((
+                d.disk_det_physical.into(),
+                format!("PhysicalDrive{}", disk.index),
+            ));
+            id_rows.push((
+                d.disk_det_volume.into(),
+                match &cand.volume {
+                    Some(v) => format!(
+                        "{}{}{}",
+                        v.mount_point.trim_end_matches('\\'),
+                        if v.label.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", v.label)
                         },
-                    ));
-                    for f in &c.findings {
-                        ui.label(
-                            egui::RichText::new(format!("• {}", f.text(ru)))
-                                .small()
-                                .color(c::TEXT_SECONDARY),
-                        );
+                        if cand.is_system {
+                            format!(" · {}", d.disk_det_system)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    None => "—".into(),
+                },
+            ));
+            id_rows.push((d.disk_det_interface.into(), disk.bus_type.clone()));
+            id_rows.push((
+                d.disk_det_capacity.into(),
+                storage_topology::capacity_text(disk),
+            ));
+        }
+        out.push((d.disk_det_identity.into(), id_rows));
+        let assessment = self.selected_assessment();
+        let test_rows = |r: &StorageDiagnosticSummary, dur: Option<f64>| {
+            let level = stability_level(r.read_variation_percent)
+                .max(stability_level(r.write_variation_percent));
+            vec![
+                ("Read".to_string(), mb(r.summary_read_mib_s)),
+                ("Write".to_string(), mb(r.summary_write_mib_s)),
+                (
+                    d.disk_det_read_spread.into(),
+                    format!("{:.2}%", r.read_variation_percent),
+                ),
+                (
+                    d.disk_det_write_spread.into(),
+                    format!("{:.2}%", r.write_variation_percent),
+                ),
+                (
+                    d.disk_det_duration.into(),
+                    dur.map(|s| format!("{s:.1} s"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                (d.disk_det_status.into(), stability_text(level).to_string()),
+            ]
+        };
+        let (t1, t1_dur, t2, t2_dur) = match assessment {
+            Some(a) => (
+                a.first.clone(),
+                Some(a.first_duration),
+                a.second.clone(),
+                a.second_duration,
+            ),
+            None => (current.clone(), None, None, None),
+        };
+        out.push((
+            format!("{} — {}", d.test1_title, d.disk_det_initial),
+            test_rows(&t1, t1_dur),
+        ));
+        match &t2 {
+            Some(r2) => {
+                out.push((
+                    format!("{} — {}", d.test2_title, d.test_retest_label),
+                    test_rows(r2, t2_dur),
+                ));
+                let pct = |a: f64, b: f64| {
+                    if a > 0.0 {
+                        format!("{:+.1}%", (b - a) / a * 100.0)
+                    } else {
+                        "—".into()
                     }
+                };
+                let interp = assessment
+                    .and_then(|a| a.classification.as_ref())
+                    .map(|c| c.state.text(ru).to_string())
+                    .unwrap_or_else(|| "—".into());
+                out.push((
+                    d.disk_det_comparison.into(),
+                    vec![
+                        (
+                            d.disk_det_delta_read.into(),
+                            pct(t1.summary_read_mib_s, r2.summary_read_mib_s),
+                        ),
+                        (
+                            d.disk_det_delta_write.into(),
+                            pct(t1.summary_write_mib_s, r2.summary_write_mib_s),
+                        ),
+                        (d.disk_det_interpretation.into(), interp),
+                    ],
+                ));
+            }
+            None => {
+                let why = assessment
+                    .map(|a| match &a.retest {
+                        storage_health::RetestOutcome::NotNeeded => d.test2_none.to_string(),
+                        other => storage_health::Finding::RetestNotRun(other.clone()).text(ru),
+                    })
+                    .unwrap_or_else(|| d.test2_none.to_string());
+                out.push((d.test2_title.to_string(), vec![(String::new(), why)]));
+            }
+        }
+        // SMART / NVMe health (facts, uncoloured).
+        let mut health_rows = Vec::new();
+        if let Some(h) = self.selected_nvme_health() {
+            for (k, v) in nvme_health_rows(h, d) {
+                health_rows.push((k, v));
+            }
+            health_rows.push((String::new(), d.nvme_health_note.to_string()));
+        } else {
+            health_rows.push((String::new(), d.disk_det_no_health.to_string()));
+        }
+        out.push((d.nvme_health_title.into(), health_rows));
+        // Final storage assessment.
+        let mut final_rows = Vec::new();
+        match assessment.and_then(|a| a.classification.as_ref()) {
+            Some(c) => {
+                final_rows.push((d.disk_det_state.into(), c.state.text(ru).to_string()));
+                for f in &c.findings {
+                    final_rows.push((String::new(), format!("• {}", f.text(ru))));
                 }
-                // Native NVMe Health: facts for the SAME physical
-                // disk, uncoloured — no verdict from a counter.
-                if let Some(health) = health {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    section_title(ui, d.nvme_health_title);
-                    egui::Grid::new("nvme_health_facts")
-                        .striped(true)
-                        .spacing(vec2(12.0, 4.0))
-                        .show(ui, |ui| {
-                            for (label, value) in nvme_health_rows(health, d) {
-                                ui.label(label);
-                                ui.label(value);
-                                ui.end_row();
-                            }
-                        });
-                    ui.label(
-                        egui::RichText::new(d.nvme_health_note)
-                            .small()
-                            .color(c::TEXT_SECONDARY),
-                    );
-                }
-            });
-        self.raw_passes_open = open;
+            }
+            None => final_rows.push((String::new(), d.disk_det_assessment_pending.into())),
+        }
+        out.push((d.storage_assessment_title.into(), final_rows));
+        // History: last 5 runs of THIS physical disk.
+        let identity = self
+            .selected_ssd_candidate()
+            .map(|c| storage_topology::physical_disk_identity(&c.disk));
+        let mut hist: Vec<HistoryEntry> = ssd_history::load_all_history(&self.reports_root)
+            .into_iter()
+            .filter(|h| identity.as_deref() == Some(h.disk_identity.as_str()))
+            .collect();
+        hist.sort_by_key(|h| std::cmp::Reverse(h.timestamp_unix));
+        hist.dedup_by_key(|h| h.timestamp_unix);
+        let mut hist_rows: Vec<(String, String)> = hist
+            .iter()
+            .take(5)
+            .map(|h| {
+                (
+                    crate::ui::sysinfo::local_time_of_unix(h.timestamp_unix)
+                        .map(|t| format!("{} {}", t.date_dmy(), t.hms()))
+                        .unwrap_or_else(|| h.timestamp_unix.to_string()),
+                    format!(
+                        "R {} · W {} · QD{} · {} × {} MiB",
+                        mb(h.read_mib_s),
+                        mb(h.write_mib_s),
+                        h.queue_depth,
+                        h.pass_count,
+                        h.test_file_size / (1024 * 1024)
+                    ),
+                )
+            })
+            .collect();
+        if hist_rows.is_empty() {
+            hist_rows.push((String::new(), d.disk_det_no_history.into()));
+        }
+        out.push((d.disk_det_history.into(), hist_rows));
+        out
     }
 
     /// One journal viewer button. Copy goes through egui's clipboard
@@ -3980,8 +5368,3110 @@ impl WinStateDiagApp {
     }
 }
 
+/// v0.4.4: two pages, Crash Dump analyzer, Power Diagnostics, Group Policy
+/// / ADMX health. Every collector is read-only and runs in the background;
+/// a failure is shown as a status, never a crash.
+impl WinStateDiagApp {
+    fn audit_report(&self) -> Option<&AuditReport> {
+        match &self.driver_audit {
+            DriverAuditState::Done(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// v1.0 the Driver Audit as SHOWN: the base audit plus the dump-driven
+    /// items for a probable third-party kernel module named by a crash dump
+    /// (outside the normal audit scope when needed). Base audit unchanged.
+    fn audit_view(&self) -> Option<std::borrow::Cow<'_, AuditReport>> {
+        let base = self.audit_report()?;
+        if self
+            .crash
+            .analyses
+            .iter()
+            .any(|a| a.third_party_module().is_some())
+        {
+            Some(std::borrow::Cow::Owned(crash_dump::extend_audit(
+                base,
+                &self.crash.analyses,
+            )))
+        } else {
+            Some(std::borrow::Cow::Borrowed(base))
+        }
+    }
+
+    // ---- start-up / triggers ------------------------------------------
+
+    /// Start-up: crash inventory + power sensors (display only; evidence is
+    /// written on explicit actions).
+    fn start_hardware_collectors(&mut self) {
+        self.start_crash_scan();
+        self.start_sensor_read(false);
+        self.start_passport();
+        self.start_ata_scan();
+    }
+
+    /// v1.0 read-only ATA SMART of every physical disk (SMART READ DATA /
+    /// READ THRESHOLDS only). NVMe / bridges / RAID report UNSUPPORTED.
+    fn start_ata_scan(&mut self) {
+        #[cfg(windows)]
+        if self.reference.is_none() && !cfg!(test) && self.ata_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use storage_topology::TopologySource;
+                let src = storage_topology::windows_source::WindowsTopologySource;
+                let list: Vec<AtaDisk> = src
+                    .physical_disks()
+                    .into_iter()
+                    .filter(|d| nvme_health::is_ata_bus(&d.bus_type))
+                    .map(|d| AtaDisk {
+                        smart: crate::ata_smart::read(d.index),
+                        index: d.index,
+                        model: d.model.trim().to_string(),
+                        bus: d.bus_type.clone(),
+                    })
+                    .collect();
+                let _ = tx.send(list);
+            });
+            self.ata_rx = Some(rx);
+        }
+    }
+
+    fn poll_ata_scan(&mut self) {
+        let Some(rx) = &self.ata_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(list) => {
+                self.ata_rx = None;
+                self.accept_ata_scan(list);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ata_rx = None,
+        }
+    }
+
+    fn accept_ata_scan(&mut self, list: Vec<AtaDisk>) {
+        self.ata_scan = Some(list);
+        if self.ata_evidence_pending {
+            self.ata_evidence_pending = false;
+            self.contribute_ata_evidence();
+        }
+    }
+
+    /// `Ata_Smart_<stamp>.json`: every ATA disk with its SMART facts.
+    fn contribute_ata_evidence(&mut self) {
+        let Some(list) = &self.ata_scan else {
+            return;
+        };
+        let items: Vec<String> = list
+            .iter()
+            .map(|a| {
+                format!(
+                    "    {{\"physical_disk_index\": {}, \"model\": {}, \"bus\": {}, \"ata_smart\": {}}}",
+                    a.index,
+                    crate::deep_checks::json::string(&a.model),
+                    crate::deep_checks::json::string(&a.bus),
+                    crate::ata_smart::to_json(&a.smart)
+                )
+            })
+            .collect();
+        let now = sysinfo::local_time();
+        let json = format!(
+            "{{\n  \"format\": \"winstatediag.ata_smart/1\",\n  \"status\": \"COLLECTED\",\n  \"captured_at\": {},\n  \"note\": \"Read-only SMART READ DATA / READ THRESHOLDS. UNSUPPORTED means the driver path does not pass SMART through, not a disk failure.\",\n  \"disks\": [\n{}\n  ]\n}}\n",
+            crate::deep_checks::json::string(&local_iso(now)),
+            items.join(",\n")
+        );
+        let name = format!("Ata_Smart_{}.json", evidence_stamp(now));
+        let d = i18n::t(self.language);
+        self.contribute_evidence(
+            d.nvme_module_name,
+            vec![EvidenceFile::new(&name, json.into_bytes())],
+        );
+    }
+
+    /// v0.4.5: Windows / CPU / RAM / board passport (display only).
+    fn start_passport(&mut self) {
+        #[cfg(windows)]
+        if self.reference.is_none() && !cfg!(test) && self.passport_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(passport::collect(PS_HOST));
+            });
+            self.passport_rx = Some(rx);
+        }
+    }
+
+    fn poll_passport(&mut self) {
+        let Some(rx) = &self.passport_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.passport_rx = None;
+                self.passport = Some(res);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.passport_rx = None,
+        }
+    }
+
+    /// Stage 07 sources: crash inventory counts (unexpected shutdowns /
+    /// BugCheck / dumps) and the freeze/hang incidents.
+    fn crash_stage_evidence(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(Ok(inv)) = &self.crash.inventory {
+            out.push(crash_dump::counts_line(inv));
+            for b in inv.bugchecks.iter().take(5) {
+                out.push(format!(
+                    "BugCheck 0x{:08X} · {} · {}",
+                    b.code,
+                    b.time,
+                    match b.source {
+                        crash_dump::BugcheckSource::Wer1001 => "WER 1001",
+                        crash_dump::BugcheckSource::KernelPower41 => "Kernel-Power 41",
+                    }
+                ));
+            }
+            for inc in inv.incidents.iter().take(5) {
+                out.push(crash_dump::incident_line(inc));
+            }
+        }
+        out
+    }
+
+    fn passport_rows(&self) -> Vec<InfoRow> {
+        let d = i18n::t(self.language);
+        let labels = [
+            d.passport_windows,
+            d.passport_cpu,
+            d.passport_ram,
+            d.passport_board,
+            d.passport_bios,
+        ];
+        let ru = self.language == Language::Ru;
+        match &self.passport {
+            // Still collecting: the card shows its own placeholder.
+            None if self.passport_rx.is_some() => Vec::new(),
+            Some(Ok(p)) => labels
+                .into_iter()
+                .zip([
+                    p.windows.clone(),
+                    p.cpu.clone(),
+                    p.ram_text(ru),
+                    p.board.clone(),
+                    p.bios.clone(),
+                ])
+                .map(|(l, v)| {
+                    let v = if v.is_empty() {
+                        d.passport_no_data
+                    } else {
+                        v.as_str()
+                    };
+                    InfoRow::new(l, v, Tone::Idle)
+                })
+                .collect(),
+            _ => {
+                // No collector result: the OS line is still known locally.
+                let (product, build) = sysinfo::windows_edition_and_full_build();
+                let os = format!("{product} ({build})");
+                labels
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        InfoRow::new(
+                            l,
+                            if i == 0 {
+                                os.as_str()
+                            } else {
+                                d.passport_no_data
+                            },
+                            Tone::Idle,
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn start_crash_scan(&mut self) {
+        #[cfg(windows)]
+        if self.reference.is_none() && !cfg!(test) && self.crash_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(CrashMsg::Inventory(crash_dump::collect_inventory(PS_HOST)));
+            });
+            self.crash_rx = Some(rx);
+            self.crash.busy = CrashBusy::Scanning;
+        }
+    }
+
+    fn start_crash_analysis(&mut self) {
+        let Some(Ok(inv)) = &self.crash.inventory else {
+            return;
+        };
+        let crash_dump::DebuggerStatus::Installed { cdb } = &inv.debugger else {
+            return;
+        };
+        if self.crash_rx.is_some() {
+            return;
+        }
+        let queue: Vec<(crash_dump::DumpFile, Option<crash_dump::BugcheckEvent>)> = inv
+            .analysis_queue()
+            .into_iter()
+            .map(|dmp| (dmp.clone(), inv.bugcheck_for(dmp).cloned()))
+            .collect();
+        if queue.is_empty() {
+            return;
+        }
+        let cdb = cdb.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let total = queue.len();
+        self.crash.progress = Some(AnalysisProgress {
+            stage: crash_dump::AnalysisStage::PrepareDump,
+            started: Instant::now(),
+            dump_index: 0,
+            dump_total: total,
+            dump_name: queue[0].0.name.clone(),
+            symbols_downloading: false,
+        });
+        #[cfg(not(test))]
+        std::thread::spawn(move || {
+            let cache = symbol_cache_dir();
+            let mut out: Vec<AnalyzedDump> = Vec::new();
+            for (i, (dmp, bc)) in queue.into_iter().enumerate() {
+                let stage = |s| CrashMsg::Stage(s, i, total, dmp.name.clone());
+                let _ = tx.send(stage(crash_dump::AnalysisStage::PrepareDump));
+                // The original dump is only READ (copied into the report).
+                let bytes = std::fs::read(&dmp.path).ok();
+                // Symbol download watcher: the cache growing = Microsoft
+                // symbols are being downloaded right now (real signal).
+                let watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                {
+                    let watching = std::sync::Arc::clone(&watching);
+                    let tx = tx.clone();
+                    let cache = cache.clone();
+                    std::thread::spawn(move || {
+                        let mut last = dir_size(&cache);
+                        let mut was = false;
+                        while watching.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(1500));
+                            let now = dir_size(&cache);
+                            let growing = now > last;
+                            last = now;
+                            if growing != was {
+                                was = growing;
+                                let _ = tx.send(CrashMsg::Symbols(growing));
+                            }
+                        }
+                        if was {
+                            let _ = tx.send(CrashMsg::Symbols(false));
+                        }
+                    });
+                }
+                let line_tx = tx.clone();
+                let name = dmp.name.clone();
+                let mut best = crash_dump::AnalysisStage::PrepareDump;
+                let (status, raw) = crash_dump::run_analysis_observed(
+                    &cdb,
+                    &dmp.path,
+                    &cache,
+                    Duration::from_secs(crash_dump::ANALYSIS_TIMEOUT_SECS),
+                    move |line| {
+                        if let Some(s) = crash_dump::stage_of_cdb_line(line)
+                            && s > best
+                        {
+                            best = s;
+                            let _ = line_tx.send(CrashMsg::Stage(s, i, total, name.clone()));
+                        }
+                    },
+                );
+                watching.store(false, Ordering::Relaxed);
+                // v1.0 dump-driven correlation: lmvm + installed driver.
+                let _ = tx.send(stage(crash_dump::AnalysisStage::CorrelateDriverAudit));
+                let third_party = crash_dump::DumpAnalysis::build(
+                    dmp.clone(),
+                    None,
+                    status.clone(),
+                    raw.clone(),
+                    None,
+                )
+                .third_party_module();
+                let (module_info, resolution) = match &third_party {
+                    Some(m) => (
+                        crash_dump::run_lmvm(&cdb, &dmp.path, &cache, m, Duration::from_secs(180)),
+                        Some(crash_dump::resolve_driver(PS_HOST, m)),
+                    ),
+                    None => (None, None),
+                };
+                let _ = tx.send(stage(crash_dump::AnalysisStage::BuildReport));
+                out.push(AnalyzedDump {
+                    dump: dmp,
+                    bugcheck: bc,
+                    status,
+                    raw,
+                    bytes,
+                    module_info,
+                    resolution,
+                });
+            }
+            let _ = tx.send(CrashMsg::Analyzed(out));
+        });
+        #[cfg(test)]
+        {
+            let _ = (cdb, queue, tx);
+        }
+        self.crash_rx = Some(rx);
+        self.crash.busy = CrashBusy::Analyzing;
+    }
+
+    fn poll_crash(&mut self) {
+        self.poll_install();
+        let Some(rx) = &self.crash_rx else {
+            return;
+        };
+        let mut msgs = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(m) => msgs.push(m),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        for msg in msgs {
+            self.accept_crash_msg(msg);
+        }
+        if disconnected && self.crash_rx.is_some() {
+            self.crash_rx = None;
+            self.crash.busy = CrashBusy::Idle;
+            self.crash.progress = None;
+        }
+    }
+
+    fn accept_crash_msg(&mut self, msg: CrashMsg) {
+        // Final results end the worker; progress messages do not.
+        if matches!(msg, CrashMsg::Inventory(_) | CrashMsg::Analyzed(_)) {
+            self.crash_rx = None;
+            self.crash.busy = CrashBusy::Idle;
+            self.crash.progress = None;
+        }
+        match msg {
+            CrashMsg::Stage(stage, i, total, name) => {
+                if let Some(p) = &mut self.crash.progress {
+                    if i != p.dump_index || stage > p.stage {
+                        p.stage = stage;
+                    }
+                    p.dump_index = i;
+                    p.dump_total = total;
+                    p.dump_name = name;
+                }
+            }
+            CrashMsg::Symbols(on) => {
+                if let Some(p) = &mut self.crash.progress {
+                    p.symbols_downloading = on;
+                }
+            }
+            CrashMsg::Inventory(inv) => {
+                self.crash.inventory = Some(inv);
+                // v1.0 installer: winget said "installed" → the re-scan
+                // confirms the analyzer (or reports what is still missing).
+                if self.crash.install == InstallState::Verifying {
+                    let found = matches!(
+                        &self.crash.inventory,
+                        Some(Ok(crash_dump::Inventory {
+                            debugger: crash_dump::DebuggerStatus::Installed { .. },
+                            ..
+                        }))
+                    );
+                    // v1.0 item 41: package present ≠ analysis available.
+                    let state = match &self.crash.inventory {
+                        Some(Ok(inv)) => inv.debugger.clone(),
+                        Some(Err(e)) => crash_dump::DebuggerStatus::Error(e.clone()),
+                        None => crash_dump::DebuggerStatus::NotInstalled,
+                    };
+                    self.crash.install = if found {
+                        InstallState::Succeeded
+                    } else {
+                        InstallState::Failed(crate::crash_report::debugger_line(
+                            &state,
+                            self.language == Language::Ru,
+                        ))
+                    };
+                    self.crash
+                        .install_log
+                        .push(format!("re-detect: {}", state.code()));
+                }
+                // The scan started with a diagnostic run joins its report.
+                if self.is_running() {
+                    self.contribute_incidents();
+                }
+            }
+            CrashMsg::Analyzed(list) => self.accept_crash_analyses(list),
+        }
+    }
+
+    /// v0.4.5 freeze / hang incident evidence (`Incidents_<stamp>.json`):
+    /// every incident with its conservative verdict and correlated events.
+    fn contribute_incidents(&mut self) {
+        let Some(Ok(inv)) = &self.crash.inventory else {
+            return;
+        };
+        let verdicts = crash_dump::incident_verdicts(inv);
+        let json = incidents::to_json(
+            &verdicts,
+            inv.unexpected_shutdowns.max(inv.incidents.len()),
+            &inv.live_kernel_reports,
+        );
+        let d = i18n::t(self.language);
+        if let Some((_, v)) = verdicts.first() {
+            push_journal(
+                &mut self.journal,
+                format!("{}: {}", d.module_incidents, v.headline()),
+            );
+        }
+        let name = format!(
+            "{}{}.json",
+            incidents::EVIDENCE_PREFIX,
+            evidence_stamp(sysinfo::local_time())
+        );
+        self.contribute_evidence(
+            d.module_incidents,
+            vec![EvidenceFile::new(&name, json.into_bytes())],
+        );
+    }
+
+    /// Builds the analyses (correlated with the current Driver Audit) and
+    /// adds the original dumps, raw outputs and summaries to the report.
+    fn accept_crash_analyses(&mut self, list: Vec<AnalyzedDump>) {
+        let stamp = evidence_stamp(sysinfo::local_time());
+        let cdb = match &self.crash.inventory {
+            Some(Ok(crash_dump::Inventory {
+                debugger: crash_dump::DebuggerStatus::Installed { cdb },
+                ..
+            })) => Some(cdb.clone()),
+            _ => None,
+        };
+        let mut files = Vec::new();
+        let mut analyses = Vec::new();
+        for (n, item) in list.into_iter().enumerate() {
+            let AnalyzedDump {
+                dump: dmp,
+                bugcheck: bc,
+                status,
+                raw,
+                bytes,
+                module_info,
+                resolution,
+            } = item;
+            // Confidence uses the BASE Driver Audit only: the dump-driven
+            // item derived from this very dump never corroborates it.
+            let a = crash_dump::DumpAnalysis::build(dmp, bc, status, raw, self.audit_report())
+                .with_module(module_info, resolution);
+            let (txt, js, dmp_name) = crash_dump::evidence_names(&stamp, n + 1, &a.dump.name);
+            let copied = bytes.map(|b| {
+                files.push(EvidenceFile::new(&dmp_name, b));
+                dmp_name.clone()
+            });
+            files.push(EvidenceFile::new(
+                &txt,
+                crash_dump::analysis_txt(&a, cdb.as_deref()),
+            ));
+            files.push(EvidenceFile::new(
+                &js,
+                crash_dump::summary_json(&a, copied.as_deref(), &txt).into_bytes(),
+            ));
+            analyses.push(a);
+        }
+        let d = i18n::t(self.language);
+        if let Some(latest) = analyses.first() {
+            push_journal(
+                &mut self.journal,
+                d.journal_crash_done_fmt
+                    .replace("{n}", &analyses.len().to_string())
+                    .replace("{conf}", latest.confidence.code()),
+            );
+        }
+        self.crash.analyses = analyses;
+        if !files.is_empty() {
+            self.contribute_evidence(d.module_crash, files);
+        }
+    }
+
+    /// v1.0 embedded installer: ONLY after the explicit click, the official
+    /// `winget install --id Microsoft.WinDbg` runs hidden (no console
+    /// window), its output is captured line by line into real stages and the
+    /// local install journal; afterwards the analyzer is re-detected. UAC,
+    /// when Windows asks for it, is the normal system prompt (never hidden
+    /// or bypassed).
+    fn install_analyzer(&mut self) {
+        if matches!(
+            self.crash.install,
+            InstallState::Running { .. } | InstallState::Verifying
+        ) {
+            return;
+        }
+        let d = i18n::t(self.language);
+        self.crash.install = InstallState::Running {
+            stage: crash_dump::InstallStage::Preparing,
+            percent: None,
+        };
+        self.crash.install_log.clear();
+        self.crash.install_log.push(format!(
+            "winget {}",
+            crash_dump::winget_install_args().join(" ")
+        ));
+        push_journal(&mut self.journal, d.journal_crash_install.to_string());
+        #[cfg(windows)]
+        if !cfg!(test) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let line_tx = tx.clone();
+                let result = crash_dump::run_debugger_install(move |l| {
+                    let _ = line_tx.send(InstallMsg::Line(l.to_string()));
+                });
+                let _ = tx.send(InstallMsg::Done(result));
+            });
+            self.install_rx = Some(rx);
+        }
+    }
+
+    fn poll_install(&mut self) {
+        let Some(rx) = &self.install_rx else {
+            return;
+        };
+        let mut msgs = Vec::new();
+        let mut gone = false;
+        loop {
+            match rx.try_recv() {
+                Ok(m) => msgs.push(m),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    gone = true;
+                    break;
+                }
+            }
+        }
+        for m in msgs {
+            self.accept_install_msg(m);
+        }
+        if gone {
+            self.install_rx = None;
+            if matches!(self.crash.install, InstallState::Running { .. }) {
+                self.crash.install = InstallState::Failed("installer ended unexpectedly".into());
+            }
+        }
+    }
+
+    fn accept_install_msg(&mut self, msg: InstallMsg) {
+        let d = i18n::t(self.language);
+        match msg {
+            InstallMsg::Line(line) => {
+                let (stage, pct) = crash_dump::install_progress_of_line(&line);
+                if let InstallState::Running { stage: s, percent } = &mut self.crash.install {
+                    if let Some(st) = stage
+                        && st > *s
+                    {
+                        *s = st;
+                    }
+                    if pct.is_some() {
+                        *percent = pct;
+                    }
+                }
+                if self.crash.install_log.len() < 400 {
+                    self.crash.install_log.push(line);
+                }
+            }
+            InstallMsg::Done(result) => {
+                self.install_rx = None;
+                self.crash
+                    .install_log
+                    .push(format!("result: {}", result.exit_text));
+                // v1.0 item 41: the final state is NEVER decided by the
+                // winget exit text ("no newer package" when WinDbg is
+                // already installed is not a failure) — always re-detect
+                // the package and its analysis backend independently.
+                if !result.success {
+                    push_journal(
+                        &mut self.journal,
+                        d.journal_crash_install_failed_fmt
+                            .replace("{error}", &result.exit_text),
+                    );
+                }
+                self.crash.install = InstallState::Verifying;
+                self.start_crash_scan();
+            }
+        }
+    }
+
+    /// Re-detects the debugger after an explicit install click (the official
+    /// winget install runs in its own visible window, so its end is not
+    /// observable): one inventory re-scan every 20 s for up to 10 minutes,
+    /// stopping as soon as the debugger is found.
+    fn poll_crash_redetect(&mut self) {
+        let Some((launched, last)) = self.crash_redetect else {
+            return;
+        };
+        let installed = matches!(
+            &self.crash.inventory,
+            Some(Ok(crash_dump::Inventory {
+                debugger: crash_dump::DebuggerStatus::Installed { .. },
+                ..
+            }))
+        );
+        if installed || launched.elapsed() > Duration::from_secs(600) {
+            self.crash_redetect = None;
+            return;
+        }
+        if self.crash_rx.is_none() && last.elapsed() >= Duration::from_secs(20) {
+            self.crash_redetect = Some((launched, Instant::now()));
+            self.start_crash_scan();
+        }
+    }
+
+    /// Starts one read-only sensor sampling window (~10 s, 1 sample/s, no
+    /// load applied). Evidence is written for explicit refreshes and for
+    /// diagnostic sessions.
+    fn start_sensor_read(&mut self, evidence: bool) {
+        #[cfg(windows)]
+        if self.reference.is_none() && !cfg!(test) && self.sensors_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let base = std::env::temp_dir().join("WinStateDiag");
+            std::thread::spawn(move || {
+                let _ = tx.send(sensors::collect(PS_HOST, &base, 10, 1000));
+            });
+            self.sensors_rx = Some(rx);
+        }
+        if self.sensors_rx.is_some() && self.sensors_started.is_none() {
+            self.sensors_started = Some(Instant::now());
+            self.sensors_error = None;
+        }
+        self.sensors_evidence_pending |= evidence;
+    }
+
+    /// v1.0 item 8: READ indicator state (Idle / Reading + elapsed / Error).
+    fn sensor_read_vm(&self) -> crate::ui::vm::SensorReadVm {
+        use crate::ui::vm::SensorReadVm;
+        if self.sensors_rx.is_some() {
+            return SensorReadVm::Reading {
+                elapsed_s: self
+                    .sensors_started
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0),
+            };
+        }
+        match &self.sensors_error {
+            Some(m) => SensorReadVm::Error { message: m.clone() },
+            None => SensorReadVm::Idle,
+        }
+    }
+
+    /// The sensor read ended: success clears the indicator, a lost worker
+    /// or a snapshot where every provider failed is an ERROR state.
+    fn finish_sensor_read(&mut self, snap: Option<&sensors::Snapshot>) {
+        self.sensors_started = None;
+        self.sensors_error = match snap {
+            None => Some("sensor reader ended without a result".into()),
+            Some(s) if s.state() == sensors::ProviderState::ProviderError => {
+                Some(format!("sensor providers failed ({})", s.state().code()))
+            }
+            Some(_) => None,
+        };
+    }
+
+    fn poll_sensors(&mut self) {
+        let Some(rx) = &self.sensors_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(snap) => {
+                self.sensors_rx = None;
+                self.finish_sensor_read(Some(&snap));
+                self.accept_sensors(snap);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.sensors_rx = None;
+                self.finish_sensor_read(None);
+            }
+        }
+    }
+
+    fn accept_sensors(&mut self, snap: sensors::Snapshot) {
+        self.sensors = Some(snap);
+        if std::mem::take(&mut self.sensors_evidence_pending)
+            && let Some(merged) = self.sensors_with_storage()
+        {
+            let d = i18n::t(self.language);
+            let summary = sensors::summarize(&merged.sensors);
+            push_journal(
+                &mut self.journal,
+                d.journal_sensors_fmt
+                    .replace("{state}", merged.state().code())
+                    .replace("{power}", summary.power_status().code()),
+            );
+            let name = format!(
+                "{}{}.json",
+                sensors::EVIDENCE_PREFIX,
+                evidence_stamp(sysinfo::local_time())
+            );
+            self.contribute_evidence(
+                d.module_sensors,
+                vec![EvidenceFile::new(
+                    name,
+                    sensors::to_json(&merged).into_bytes(),
+                )],
+            );
+        }
+    }
+
+    /// The sensor snapshot plus the storage temperatures WinStateDiag
+    /// already holds (NVMe Health — the authoritative disk temperature —
+    /// and the SATA Storage Reliability counters), so no contradictory
+    /// duplicate SSD temperature is shown.
+    /// Drive-reported (warning, critical) temperature of the disk named by
+    /// a sensor label (NVMe Identify WCTEMP / CCTEMP); (None, None) when the
+    /// drive reports none.
+    fn disk_temp_thresholds(&self, label: &str) -> (Option<f64>, Option<f64>) {
+        let base = match label.rsplit_once(" #") {
+            Some((b, n)) if n.chars().all(|c| c.is_ascii_digit()) => b,
+            _ => label,
+        };
+        let key = sensors::disk_key(base);
+        self.nvme_health
+            .values()
+            .find(|h| sensors::disk_key(&h.model) == key)
+            .map(|h| (h.temp_warning_c, h.temp_critical_c))
+            .unwrap_or((None, None))
+    }
+
+    fn sensors_with_storage(&self) -> Option<sensors::Snapshot> {
+        let mut snap = self.sensors.clone()?;
+        let mut keys: Vec<&String> = self.nvme_health.keys().collect();
+        keys.sort();
+        for k in keys {
+            let h = &self.nvme_health[k];
+            let reading = |provider, value: f64, id: String| sensors::Sensor {
+                provider,
+                hw_id: format!("disk/{}", h.disk_index),
+                hw_name: h.model.clone(),
+                category: sensors::HwCategory::Storage,
+                sensor_id: id,
+                name: "Temperature".into(),
+                kind: sensors::SensorKind::Temperature,
+                value,
+                min: value,
+                max: value,
+                samples: 1,
+                confidence: if provider == sensors::Provider::NvmeHealth {
+                    sensors::Confidence::High
+                } else {
+                    sensors::Confidence::Medium
+                },
+                timestamp: h.captured_at.clone(),
+            };
+            if let Some(t) = h.smart.as_ref().and_then(|s| s.composite_temperature_c())
+                && sensors::plausible(sensors::SensorKind::Temperature, f64::from(t))
+            {
+                snap.sensors.push(reading(
+                    sensors::Provider::NvmeHealth,
+                    f64::from(t),
+                    format!("nvme/{}/composite", h.disk_index),
+                ));
+            }
+            if let Some(t) = h.reliability.as_ref().and_then(|r| r.temperature_c)
+                && sensors::plausible(sensors::SensorKind::Temperature, t)
+            {
+                snap.sensors.push(reading(
+                    sensors::Provider::StorageReliability,
+                    t,
+                    format!("storrel/{}", h.disk_index),
+                ));
+            }
+        }
+        // v1.0: SATA disks (HDDs too) from the read-only ATA SMART scan, so
+        // every physical disk is an expected row of the sensor matrix.
+        for a in self.ata_scan.iter().flatten() {
+            if let Some(t) = a.smart.temperature_c() {
+                let v = f64::from(t);
+                snap.sensors.push(sensors::Sensor {
+                    provider: sensors::Provider::AtaSmart,
+                    hw_id: format!("disk/{}", a.index),
+                    hw_name: a.model.clone(),
+                    category: sensors::HwCategory::Storage,
+                    sensor_id: format!("ata/{}/194", a.index),
+                    name: "Temperature".into(),
+                    kind: sensors::SensorKind::Temperature,
+                    value: v,
+                    min: v,
+                    max: v,
+                    samples: 1,
+                    confidence: sensors::Confidence::High,
+                    timestamp: snap.captured_at.clone(),
+                });
+            }
+        }
+        Some(snap)
+    }
+
+    fn start_gpo_check(&mut self) {
+        #[cfg(windows)]
+        if self.reference.is_none() && !cfg!(test) && self.gpo_rx.is_none() {
+            let reference_dir = exe_dir().join("Reference");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(gpo_admx::collect(PS_HOST, &reference_dir));
+            });
+            self.gpo_rx = Some(rx);
+        }
+    }
+
+    fn poll_gpo(&mut self) {
+        let Some(rx) = &self.gpo_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.gpo_rx = None;
+                self.accept_gpo(res);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gpo_rx = None,
+        }
+    }
+
+    fn accept_gpo(&mut self, res: Result<gpo_admx::GpoInputs, String>) {
+        let d = i18n::t(self.language);
+        match res {
+            Ok(inputs) => {
+                let result = gpo_admx::classify(&inputs);
+                let stamp = evidence_stamp(sysinfo::local_time());
+                let json = gpo_admx::to_json(&inputs, &result);
+                let txt = gpo_text(&inputs, &result);
+                push_journal(
+                    &mut self.journal,
+                    d.journal_gpo_fmt.replace("{status}", result.status.code()),
+                );
+                self.contribute_evidence(
+                    d.module_gpo,
+                    vec![
+                        EvidenceFile::new(
+                            gpo_admx::evidence_name(&stamp, "json"),
+                            json.into_bytes(),
+                        ),
+                        EvidenceFile::new(gpo_admx::evidence_name(&stamp, "txt"), txt),
+                    ],
+                );
+                self.gpo = Some(Ok((inputs, result)));
+            }
+            Err(e) => self.gpo = Some(Err(e)),
+        }
+    }
+
+    // ---- view models ----------------------------------------------------
+
+    fn crash_vm(&self) -> CrashVm {
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let busy = self.crash.busy != CrashBusy::Idle;
+        let (headline, tone) = match (&self.crash.busy, &self.crash.inventory) {
+            (CrashBusy::Scanning, _) => (d.crash_scanning.to_string(), Tone::Running),
+            (CrashBusy::Analyzing, _) => (d.crash_analyzing.to_string(), Tone::Running),
+            (_, None) => (d.crash_not_scanned.to_string(), Tone::Idle),
+            (_, Some(Err(_))) => (d.crash_scan_failed.to_string(), Tone::Warning),
+            // v0.4.5: one consistent wording — a BSOD is only claimed with
+            // a BugCheck; an unexpected shutdown alone says so.
+            (_, Some(Ok(inv))) => match inv.state() {
+                crash_dump::CrashState::NoCrashes if inv.unexpected_shutdowns > 0 => {
+                    (d.crash_unexpected_only.to_string(), Tone::Warning)
+                }
+                crash_dump::CrashState::NoCrashes => (d.crash_none.to_string(), Tone::Success),
+                crash_dump::CrashState::BugcheckNoDump => {
+                    (d.crash_no_dump.to_string(), Tone::Warning)
+                }
+                crash_dump::CrashState::DumpsFound => (
+                    d.crash_found_fmt.replace(
+                        "{status}",
+                        &self
+                            .crash
+                            .analyses
+                            .first()
+                            .map(|a| a.confidence.code().to_string())
+                            .unwrap_or_else(|| d.crash_analysis_pending.to_string()),
+                    ),
+                    Tone::Warning,
+                ),
+            },
+        };
+        let debugger = match &self.crash.inventory {
+            Some(Ok(inv)) => inv.debugger.clone(),
+            Some(Err(e)) => crash_dump::DebuggerStatus::Error(e.clone()),
+            None => crash_dump::DebuggerStatus::NotInstalled,
+        };
+        let (dbg_text, dbg_tone) = match &debugger {
+            crash_dump::DebuggerStatus::Installed { .. } => (d.crash_dbg_installed, Tone::Success),
+            crash_dump::DebuggerStatus::PackageOnly { .. } => {
+                (d.crash_dbg_package_only, Tone::Warning)
+            }
+            crash_dump::DebuggerStatus::NotInstalled => (d.crash_dbg_missing, Tone::Warning),
+            crash_dump::DebuggerStatus::Error(_) => (d.crash_dbg_error, Tone::Error),
+        };
+        let inventory_known = matches!(self.crash.inventory, Some(Ok(_)));
+        let mut rows = Vec::new();
+        match self.crash.analyses.first() {
+            Some(a) => {
+                let code = a
+                    .bugcheck_code()
+                    .map(|c| format!("0x{c:08X}"))
+                    .unwrap_or_else(|| "—".into());
+                rows.push(InfoRow::new(
+                    d.crash_row_bugcheck,
+                    match &a.parsed.bugcheck_name {
+                        Some(n) => format!("{code} {n}"),
+                        None => code,
+                    },
+                    Tone::Warning,
+                ));
+                rows.push(InfoRow::new(
+                    d.crash_row_dump,
+                    format!("{} · {}", a.dump.name, a.dump.modified.replace('T', " ")),
+                    Tone::Idle,
+                ));
+                rows.push(InfoRow::new(
+                    d.crash_row_module,
+                    a.probable_module()
+                        .unwrap_or_else(|| d.crash_not_determined.to_string()),
+                    if a.probable_module().is_some() {
+                        Tone::Warning
+                    } else {
+                        Tone::Idle
+                    },
+                ));
+                rows.push(InfoRow::new(
+                    d.crash_row_process,
+                    a.parsed.process_name.clone().unwrap_or_else(|| "—".into()),
+                    Tone::Idle,
+                ));
+                rows.push(InfoRow::new(
+                    d.crash_row_confidence,
+                    a.confidence.code(),
+                    match a.confidence {
+                        crash_dump::Confidence::High => Tone::Warning,
+                        _ => Tone::Idle,
+                    },
+                ));
+                rows.push(InfoRow::new(
+                    d.crash_row_stack,
+                    a.parsed
+                        .stack_text
+                        .iter()
+                        .filter_map(|l| l.rsplit(" : ").next())
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" ← "),
+                    Tone::Idle,
+                ));
+                let dump_driven = a.third_party_module().map(|m| {
+                    let r = a.resolution.as_ref();
+                    format!(
+                        "{} · {}",
+                        a.parsed
+                            .image_name
+                            .clone()
+                            .unwrap_or_else(|| format!("{m}.sys")),
+                        match r {
+                            Some(r) if !r.present => d.crash_driver_removed.to_string(),
+                            Some(r) if !r.service_name.is_empty() => format!(
+                                "{} {} ({}){}",
+                                d.crash_driver_service,
+                                r.service_name,
+                                r.service_state,
+                                r.devices
+                                    .first()
+                                    .map(|dv| format!(" · {}", dv.name))
+                                    .unwrap_or_default()
+                            ),
+                            _ => d.crash_driver_dump_item.to_string(),
+                        }
+                    )
+                });
+                rows.push(InfoRow::new(
+                    d.crash_row_driver,
+                    a.linked
+                        .first()
+                        .map(|l| {
+                            format!(
+                                "[{}] {} — {} ×{}",
+                                if ru {
+                                    l.status.label_ru()
+                                } else {
+                                    l.status.code()
+                                },
+                                l.device,
+                                l.kind.code(),
+                                l.count.max(1)
+                            )
+                        })
+                        .or(dump_driven.clone())
+                        .unwrap_or_else(|| "—".into()),
+                    a.linked
+                        .first()
+                        .map(|l| severity_tone(l.status))
+                        .or(dump_driven.map(|_| Tone::Warning))
+                        .unwrap_or(Tone::Idle),
+                ));
+                if a.memory_test_recommended {
+                    rows.push(InfoRow::new("", d.crash_memory_hint, Tone::Warning));
+                }
+            }
+            None => {
+                if let Some(Ok(inv)) = &self.crash.inventory {
+                    if let Some(b) = inv.bugchecks.first() {
+                        rows.push(InfoRow::new(
+                            d.crash_row_bugcheck,
+                            format!("0x{:08X} · {}", b.code, b.time.replace('T', " ")),
+                            Tone::Warning,
+                        ));
+                    }
+                    if let Some(dmp) = inv.dumps.first() {
+                        rows.push(InfoRow::new(
+                            d.crash_row_dump,
+                            format!("{} · {}", dmp.name, dmp.modified.replace('T', " ")),
+                            Tone::Idle,
+                        ));
+                    }
+                }
+                rows.push(InfoRow::new("", d.crash_no_analysis, Tone::Idle));
+            }
+        }
+        if let Some(Ok(inv)) = &self.crash.inventory
+            && let Some((_, v)) = crash_dump::incident_verdicts(inv).first()
+        {
+            rows.push(InfoRow::new(
+                d.crash_row_incident,
+                v.headline(),
+                if v.hang_confirmed || v.bsod_registered {
+                    Tone::Warning
+                } else {
+                    Tone::Idle
+                },
+            ));
+        }
+        // v1.0 item 40: the same counters as Details / export / evidence.
+        let counts = match &self.crash.inventory {
+            Some(Ok(inv)) => {
+                let c = crate::crash_report::Counters::of(inv);
+                d.crash_counts_fmt
+                    .replace("{s}", &c.unexpected_shutdowns.to_string())
+                    .replace("{b}", &c.bugchecks.to_string())
+                    .replace("{d}", &c.dumps.to_string())
+            }
+            _ => String::new(),
+        };
+        CrashVm {
+            headline,
+            tone,
+            counts,
+            debugger: dbg_text.to_string(),
+            debugger_tone: dbg_tone,
+            debugger_missing: inventory_known
+                && !matches!(debugger, crash_dump::DebuggerStatus::Installed { .. }),
+            busy,
+            can_analyze: matches!(debugger, crash_dump::DebuggerStatus::Installed { .. })
+                && matches!(&self.crash.inventory, Some(Ok(inv)) if !inv.analysis_queue().is_empty()),
+            has_details: inventory_known || !self.crash.analyses.is_empty(),
+            rows,
+            analysis: self.analysis_progress_vm(),
+            outcome: crash_dump::analysis_outcome(&self.crash.analyses)
+                .filter(|_| self.crash.busy == CrashBusy::Idle)
+                .map(|o| match o {
+                    crash_dump::AnalysisOutcome::Completed => {
+                        (d.crash_outcome_ok.to_string(), Tone::Success)
+                    }
+                    crash_dump::AnalysisOutcome::CompletedIncomplete => {
+                        (d.crash_outcome_incomplete.to_string(), Tone::Warning)
+                    }
+                    crash_dump::AnalysisOutcome::Failed => {
+                        (d.crash_outcome_failed.to_string(), Tone::Error)
+                    }
+                }),
+            install: self.install_vm(),
+        }
+    }
+
+    /// v1.0 running analysis: real stages (done / active / pending), the
+    /// elapsed time and the symbol-download note. No percentage.
+    fn analysis_progress_vm(&self) -> Option<AnalysisProgressVm> {
+        let p = self.crash.progress.as_ref()?;
+        if self.crash.busy != CrashBusy::Analyzing {
+            return None;
+        }
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let stages = crash_dump::AnalysisStage::ALL
+            .iter()
+            .map(|s| {
+                let mark = match s.cmp(&p.stage) {
+                    std::cmp::Ordering::Less => StageMark::Done,
+                    std::cmp::Ordering::Equal => StageMark::Active,
+                    std::cmp::Ordering::Greater => StageMark::Pending,
+                };
+                (s.text(ru).to_string(), mark)
+            })
+            .collect();
+        let secs = p.started.elapsed().as_secs();
+        Some(AnalysisProgressVm {
+            stages,
+            elapsed: format!("{:02}:{:02}", secs / 60, secs % 60),
+            note: p
+                .symbols_downloading
+                .then(|| d.crash_symbols_download.to_string()),
+            dump_label: d
+                .crash_dump_of_fmt
+                .replace("{i}", &(p.dump_index + 1).to_string())
+                .replace("{n}", &p.dump_total.to_string())
+                .replace("{name}", &p.dump_name),
+        })
+    }
+
+    /// v1.0 embedded installer status (above the install button).
+    fn install_vm(&self) -> Option<InstallVm> {
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let lines = |current: Option<crash_dump::InstallStage>, all_done: bool| {
+            [
+                crash_dump::InstallStage::Preparing,
+                crash_dump::InstallStage::Downloading,
+                crash_dump::InstallStage::Installing,
+                crash_dump::InstallStage::Verifying,
+            ]
+            .iter()
+            .map(|s| {
+                let mark = if all_done {
+                    StageMark::Done
+                } else {
+                    match current.map(|c| s.cmp(&c)) {
+                        Some(std::cmp::Ordering::Less) => StageMark::Done,
+                        Some(std::cmp::Ordering::Equal) => StageMark::Active,
+                        _ => StageMark::Pending,
+                    }
+                };
+                (s.text(ru).to_string(), mark)
+            })
+            .collect::<Vec<_>>()
+        };
+        let vm = |lines, percent, running, failed, succeeded, status: String| InstallVm {
+            title: d.install_title.to_string(),
+            lines,
+            percent,
+            running,
+            failed,
+            succeeded,
+            status,
+        };
+        // v1.0 item 41: an installed, usable analyzer is shown as such
+        // whatever an earlier install attempt reported.
+        let usable = matches!(&self.crash.inventory, Some(Ok(inv)) if inv.debugger.usable());
+        if usable && matches!(self.crash.install, InstallState::Failed(_)) {
+            return Some(vm(
+                lines(None, true),
+                None,
+                false,
+                false,
+                true,
+                d.install_installed.to_string(),
+            ));
+        }
+        match &self.crash.install {
+            InstallState::Idle => None,
+            InstallState::Running { stage, percent } => Some(vm(
+                lines(Some(*stage), false),
+                *percent,
+                true,
+                false,
+                false,
+                String::new(),
+            )),
+            InstallState::Verifying => Some(vm(
+                lines(Some(crash_dump::InstallStage::Verifying), false),
+                None,
+                true,
+                false,
+                false,
+                String::new(),
+            )),
+            InstallState::Succeeded => Some(vm(
+                lines(None, true),
+                None,
+                false,
+                false,
+                true,
+                d.install_installed.to_string(),
+            )),
+            InstallState::Failed(e) => Some(vm(
+                Vec::new(),
+                None,
+                false,
+                true,
+                false,
+                format!("{} ({e})", d.install_failed),
+            )),
+        }
+    }
+
+    fn sensors_vm(&self) -> SensorsVm {
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let busy = self.sensors_rx.is_some();
+        let Some(snap) = self.sensors_with_storage() else {
+            return SensorsVm {
+                matrix: Vec::new(),
+                refs: Vec::new(),
+                temps: Vec::new(),
+                rails: Vec::new(),
+                power_state: if busy {
+                    d.sensors_reading
+                } else {
+                    d.sensors_not_read
+                }
+                .into(),
+                power_tone: if busy { Tone::Running } else { Tone::Idle },
+                power_message: String::new(),
+                power: Vec::new(),
+                fans: Vec::new(),
+                status_line: String::new(),
+                busy,
+                has_data: false,
+                read: self.sensor_read_vm(),
+            };
+        };
+        let sum = sensors::summarize(&snap.sensors);
+        let status_tone = |st: sensors::PowerStatus| match st {
+            sensors::PowerStatus::Excellent => Tone::Success,
+            sensors::PowerStatus::Attention | sensors::PowerStatus::CheckSensor => Tone::Warning,
+            sensors::PowerStatus::Critical => Tone::Error,
+            sensors::PowerStatus::NoData => Tone::Idle,
+        };
+        let level_tone = |l: sensors::ReadingLevel| match l {
+            sensors::ReadingLevel::Unknown => Tone::Idle,
+            sensors::ReadingLevel::Normal => Tone::Success,
+            sensors::ReadingLevel::Near => Tone::Warning,
+            sensors::ReadingLevel::Critical => Tone::Error,
+        };
+        // v0.4.5: CPU (core average), GPU, hotspot, board, PCH, RAM, disks —
+        // never per-core values. References only where reliably known.
+        let temps = sum
+            .temps
+            .iter()
+            .filter(|c| sensors::on_dashboard(&c.role))
+            .map(|c| {
+                let (level, reference) = match &c.role {
+                    sensors::Role::DiskTemp(_) => {
+                        let (w, cr) = self.disk_temp_thresholds(&c.label);
+                        (
+                            sensors::disk_temp_level(c.value, w, cr),
+                            sensors::disk_reference(w, cr)
+                                .unwrap_or_else(|| d.sensors_ref_none.to_string()),
+                        )
+                    }
+                    _ => (
+                        sensors::ReadingLevel::Unknown,
+                        d.sensors_ref_none.to_string(),
+                    ),
+                };
+                SensorChip::new(
+                    sensor_label(&c.role, &c.label, d),
+                    format!("{:.0}°C", c.value),
+                    level_tone(level),
+                )
+                .with_ref(reference)
+            })
+            .collect();
+        let mut rails: Vec<SensorChip> = sum
+            .rails
+            .iter()
+            .map(|(rail, c, st)| {
+                SensorChip::new(
+                    rail.label(),
+                    format!("{:.2} V", c.value),
+                    level_tone(sensors::rail_level(*st)),
+                )
+                .with_ref(sensors::rail_reference(*rail))
+            })
+            .collect();
+        rails.extend(sum.dynamic_voltages.iter().take(3).map(|c| {
+            SensorChip::new(
+                sensor_label(&c.role, &c.label, d),
+                format!("{:.3} V", c.value),
+                Tone::Idle,
+            )
+            .with_ref(d.sensors_ref_dynamic)
+        }));
+        let power = sum
+            .power
+            .iter()
+            .filter(|c| sensors::on_dashboard(&c.role))
+            .map(|c| {
+                SensorChip::new(
+                    sensor_label(&c.role, &c.label, d),
+                    format!("{:.0} W", c.value),
+                    Tone::Idle,
+                )
+                .with_ref(d.sensors_ref_none)
+            })
+            .collect();
+        let fans = sum
+            .fans
+            .iter()
+            .filter(|c| sensors::on_dashboard(&c.role))
+            .map(|c| {
+                SensorChip::new(
+                    sensor_label(&c.role, &c.label, d),
+                    format!("{:.0} RPM", c.value),
+                    Tone::Idle,
+                )
+            })
+            .collect();
+        let ps = sum.power_status();
+        let mut status = vec![snap.state().code().to_string()];
+        if let Some(p) = snap.main_provider() {
+            status.push(p.short().to_string());
+        }
+        if let Some(r) = snap.providers.iter().find(|r| {
+            r.provider == sensors::Provider::LhmInternal
+                && r.state != sensors::ProviderState::Available
+        }) {
+            status.push(format!("LHM: {}", r.state.code()));
+        }
+        if !sum.mismatches.is_empty() {
+            status.push(d.sensors_mismatch.to_string());
+        }
+        let (matrix, refs) =
+            sensor_matrix(&sum, &|label: &str| self.disk_temp_thresholds(label), d);
+        SensorsVm {
+            matrix,
+            refs,
+            temps,
+            rails,
+            power_state: ps.text(ru).into(),
+            power_tone: status_tone(ps),
+            power_message: ps.message(ru).into(),
+            power,
+            fans,
+            status_line: status.join(" · "),
+            busy,
+            has_data: !sum.is_empty(),
+            read: self.sensor_read_vm(),
+        }
+    }
+
+    fn gpo_vm(&self) -> GpoVm {
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let busy = self.gpo_rx.is_some();
+        match &self.gpo {
+            None => GpoVm {
+                status: if busy { d.gpo_running } else { d.gpo_not_run }.to_string(),
+                tone: if busy { Tone::Running } else { Tone::Idle },
+                rows: Vec::new(),
+                busy,
+                has_result: false,
+            },
+            Some(Err(e)) => GpoVm {
+                status: gpo_admx::GpoStatus::InsufficientData.text(ru).into(),
+                tone: Tone::Idle,
+                rows: vec![InfoRow::new("", e.clone(), Tone::Idle)],
+                busy,
+                has_result: false,
+            },
+            Some(Ok((i, r))) => {
+                let store = i.central.as_ref().filter(|c| c.exists).unwrap_or(&i.local);
+                let lang = if i.ui_language.is_empty() {
+                    "en-US"
+                } else {
+                    &i.ui_language
+                };
+                let central = if !i.domain_joined {
+                    d.gpo_standalone.to_string()
+                } else if !i.sysvol_reachable {
+                    d.gpo_unreachable.to_string()
+                } else if i.central.as_ref().is_some_and(|c| c.exists) {
+                    d.gpo_found.to_string()
+                } else {
+                    d.gpo_not_found.to_string()
+                };
+                let tone_of = |s: gpo_admx::GpoStatus| match s {
+                    gpo_admx::GpoStatus::Ok => Tone::Success,
+                    gpo_admx::GpoStatus::Outdated
+                    | gpo_admx::GpoStatus::Mismatch
+                    | gpo_admx::GpoStatus::CentralStoreNotFound => Tone::Warning,
+                    _ => Tone::Idle,
+                };
+                let tone = tone_of(r.status);
+                // v1.0: Central Store and the LOCAL store are two verdicts;
+                // a standalone PC is "not applicable" for the Central Store
+                // but its local PolicyDefinitions health is still shown.
+                let (status, tone) = if i.domain_joined {
+                    (r.status.text(ru).to_string(), tone)
+                } else {
+                    (
+                        format!(
+                            "{} · {}: {}",
+                            r.status.text(ru),
+                            d.gpo_local_short,
+                            r.local_status.text(ru)
+                        ),
+                        tone_of(r.local_status),
+                    )
+                };
+                GpoVm {
+                    status,
+                    tone,
+                    rows: vec![
+                        InfoRow::new(
+                            d.gpo_domain,
+                            if i.domain.is_empty() {
+                                "—".to_string()
+                            } else {
+                                i.domain.to_uppercase()
+                            },
+                            Tone::Idle,
+                        ),
+                        InfoRow::new(d.gpo_central, central, Tone::Idle),
+                        InfoRow::new(
+                            d.gpo_windows,
+                            format!(
+                                "{} ({})",
+                                if i.windows_release.is_empty() {
+                                    "?"
+                                } else {
+                                    &i.windows_release
+                                },
+                                i.windows_build
+                            ),
+                            Tone::Idle,
+                        ),
+                        InfoRow::new(d.gpo_templates, r.status.text(ru), tone),
+                        InfoRow::new(d.gpo_admx, store.admx.len().to_string(), Tone::Idle),
+                        InfoRow::new(
+                            d.gpo_missing_adml,
+                            if store.exists {
+                                store.missing_adml(lang).len().to_string()
+                            } else {
+                                "—".into()
+                            },
+                            Tone::Idle,
+                        ),
+                    ],
+                    busy,
+                    has_result: true,
+                }
+            }
+        }
+    }
+
+    fn system_state_vm(&self) -> SystemStateVm {
+        let d = i18n::t(self.language);
+        let hardware = self.system_state_vm_hardware_only();
+        self.system_state_vm_with(d, hardware)
+    }
+
+    fn system_state_vm_hardware_only(&self) -> InfoRow {
+        let d = i18n::t(self.language);
+        // Hardware: sensors + storage correlation (never "computer healthy").
+        let mut hw: Option<Tone> = None;
+        let mut worst = |t: Tone| {
+            let rank = |t: Tone| match t {
+                Tone::Error => 3,
+                Tone::Warning => 2,
+                Tone::Success => 1,
+                _ => 0,
+            };
+            if hw.is_none_or(|h| rank(t) > rank(h)) {
+                hw = Some(t);
+            }
+        };
+        // Only trusted rail readings count; CHECK SENSOR is not a finding.
+        if let Some(snap) = &self.sensors {
+            match sensors::summarize(&snap.sensors).power_status() {
+                sensors::PowerStatus::Excellent => worst(Tone::Success),
+                sensors::PowerStatus::Attention => worst(Tone::Warning),
+                sensors::PowerStatus::Critical => worst(Tone::Error),
+                sensors::PowerStatus::CheckSensor | sensors::PowerStatus::NoData => {}
+            }
+        }
+        // v1.0: SATA SMART verdicts (the drive's own threshold / sector
+        // counters; UNSUPPORTED is not a finding).
+        for a in self.ata_scan.iter().flatten() {
+            match a.smart.health() {
+                "SMART: OK" => worst(Tone::Success),
+                "SMART: THRESHOLD EXCEEDED" => worst(Tone::Error),
+                h if h.starts_with("SMART: ATTENTION") => worst(Tone::Warning),
+                _ => {}
+            }
+        }
+        for a in self.assessments.values() {
+            if let Some(c) = &a.classification {
+                worst(match c.state {
+                    storage_health::StorageState::StorageProblem => Tone::Error,
+                    storage_health::StorageState::StorageAttention
+                    | storage_health::StorageState::BenchmarkAnomalyCheck
+                    | storage_health::StorageState::BenchmarkAnomalyRetest => Tone::Warning,
+                    storage_health::StorageState::InsufficientData => Tone::Idle,
+                    _ => Tone::Success,
+                });
+            }
+        }
+        let hw_text = |t: Option<Tone>| match t {
+            Some(Tone::Error) => d.state_critical,
+            Some(Tone::Warning) => d.state_attention,
+            Some(Tone::Success) => d.state_ok,
+            _ => d.state_no_data,
+        };
+        InfoRow::new(d.hw_state_label, hw_text(hw), hw.unwrap_or(Tone::Idle))
+    }
+
+    fn system_state_vm_with(&self, d: &i18n::Dict, hardware: InfoRow) -> SystemStateVm {
+        // System: confirmed BSOD / unexpected shutdowns / hangs / driver
+        // problems are never hidden behind a hardware "OK".
+        let (code, _) = self.state_codes();
+        let system = match code.as_str() {
+            "ATTENTION_BSOD" => {
+                let n = match &self.crash.inventory {
+                    Some(Ok(inv)) => inv.bugchecks.len(),
+                    _ => 0,
+                };
+                InfoRow::new(
+                    d.sys_state_label,
+                    d.sys_bsod_fmt.replace("{n}", &n.to_string()),
+                    Tone::Warning,
+                )
+            }
+            "ATTENTION_HANG" => InfoRow::new(d.sys_state_label, d.sys_hang, Tone::Warning),
+            "ATTENTION_UNEXPECTED_SHUTDOWN" => {
+                InfoRow::new(d.sys_state_label, d.sys_unexpected_shutdown, Tone::Warning)
+            }
+            "ATTENTION_DRIVER_PROBLEM" => {
+                InfoRow::new(d.sys_state_label, d.sys_driver_problem, Tone::Warning)
+            }
+            "OK" => InfoRow::new(d.sys_state_label, d.state_ok, Tone::Success),
+            _ => InfoRow::new(d.sys_state_label, d.state_no_data, Tone::Idle),
+        };
+        SystemStateVm {
+            hardware,
+            system,
+            note: d.system_state_note.into(),
+        }
+    }
+
+    /// v1.0 machine-readable (system, hardware) state codes — two separate
+    /// concepts: "Hardware state: OK" never means "computer healthy".
+    fn state_codes(&self) -> (String, String) {
+        let inv = match &self.crash.inventory {
+            Some(Ok(inv)) => Some(inv),
+            _ => None,
+        };
+        let hang = inv.is_some_and(|inv| {
+            crash_dump::incident_verdicts(inv)
+                .iter()
+                .any(|(_, v)| v.hang_confirmed)
+        });
+        let driver_problem = self
+            .audit_view()
+            .is_some_and(|r| r.overall == Severity::Problem);
+        let system = match inv {
+            Some(inv) if !inv.bugchecks.is_empty() => "ATTENTION_BSOD",
+            _ if hang => "ATTENTION_HANG",
+            Some(inv) if inv.unexpected_shutdowns > 0 => "ATTENTION_UNEXPECTED_SHUTDOWN",
+            _ if driver_problem => "ATTENTION_DRIVER_PROBLEM",
+            Some(_) => "OK",
+            None => "NO_DATA",
+        };
+        let hw = {
+            let d = i18n::t(Language::En);
+            let _ = d;
+            let row = self.system_state_hardware_tone();
+            match row {
+                Some(Tone::Error) => "CRITICAL",
+                Some(Tone::Warning) => "ATTENTION",
+                Some(Tone::Success) => "OK",
+                _ => "NO_DATA",
+            }
+        };
+        (system.to_string(), hw.to_string())
+    }
+
+    /// Worst hardware tone (sensors, SATA SMART, storage correlation).
+    fn system_state_hardware_tone(&self) -> Option<Tone> {
+        let vm = self.system_state_vm_hardware_only();
+        (vm.tone != Tone::Idle).then_some(vm.tone)
+    }
+
+    /// v1.0 item 11: SMART / NVMe block — one row PER PHYSICAL DISK
+    /// ("Samsung … · NVMe · OK · 48°C", "TOSHIBA … #2 · SATA · OK"), never
+    /// a bus/provider category as if it were a disk; then the selected NVMe
+    /// disk's facts. Still reading → "Чтение…".
+    fn smart_rows(&self) -> Vec<InfoRow> {
+        let d = i18n::t(self.language);
+        let mut disks: Vec<(String, String, Tone)> = Vec::new();
+        // NVMe disks (SSD candidates): their NVMe health record.
+        for cand in &self.ssd_candidates {
+            if nvme_health::is_ata_bus(&cand.disk.bus_type) {
+                continue; // listed below from the ATA scan of every disk
+            }
+            let id = storage_topology::physical_disk_identity(&cand.disk);
+            let (value, tone) = match self.nvme_health.get(&id) {
+                Some(h) => {
+                    let (_, status) = nvme_health::health_source_status(h);
+                    let temp = nvme_health::temperature_provenance(h)
+                        .map(|(c, _)| format!(" · {c:.0}°C"))
+                        .unwrap_or_default();
+                    let tone = match status {
+                        "OK" => Tone::Success,
+                        "ATTENTION" => Tone::Warning,
+                        "PROBLEM" => Tone::Error,
+                        _ => Tone::Idle,
+                    };
+                    (format!("{} · {status}{temp}", cand.disk.bus_type), tone)
+                }
+                None if self.assessments.get(&id).is_some_and(|a| a.health_pending) => (
+                    format!("{} · {}", cand.disk.bus_type, d.smart_reading),
+                    Tone::Running,
+                ),
+                None => (
+                    format!("{} · {}", cand.disk.bus_type, d.smart_not_read),
+                    Tone::Idle,
+                ),
+            };
+            disks.push((sensors::disk_short(&cand.disk.model), value, tone));
+        }
+        // ATA / SATA disks (HDDs too) with their read-only SMART.
+        match &self.ata_scan {
+            Some(list) => {
+                for a in list {
+                    let health = a.smart.health().trim_start_matches("SMART: ").to_string();
+                    let tone = match a.smart.health() {
+                        "SMART: OK" => Tone::Success,
+                        "SMART: THRESHOLD EXCEEDED" => Tone::Error,
+                        h if h.starts_with("SMART: ATTENTION") => Tone::Warning,
+                        _ => Tone::Idle,
+                    };
+                    let temp = a
+                        .smart
+                        .temperature_c()
+                        .map(|t| format!(" · {t}°C"))
+                        .unwrap_or_default();
+                    disks.push((
+                        sensors::disk_short(&a.model),
+                        format!("{} · {health}{temp}", a.bus),
+                        tone,
+                    ));
+                }
+            }
+            None if self.ata_rx.is_some() => disks.push((
+                d.smart_sata_disks.to_string(),
+                d.smart_reading.to_string(),
+                Tone::Running,
+            )),
+            None => {}
+        }
+        // Same model twice → "#1" / "#2" (physical disks, not categories).
+        let names: Vec<String> = disks.iter().map(|x| x.0.clone()).collect();
+        let mut rows: Vec<InfoRow> = Vec::new();
+        for (k, (name, value, tone)) in disks.into_iter().enumerate() {
+            let total = names.iter().filter(|n| **n == name).count();
+            let label = if total > 1 {
+                let nth = names[..k].iter().filter(|n| **n == name).count() + 1;
+                format!("{name} #{nth}")
+            } else {
+                name
+            };
+            rows.push(InfoRow::new(label, value, tone));
+        }
+        if rows.is_empty() {
+            rows.push(InfoRow::new("", d.smart_no_disk, Tone::Idle));
+        }
+        rows.extend(self.selected_smart_rows());
+        rows
+    }
+
+    /// Facts of the selected NVMe disk (no verdict colours). The per-disk
+    /// status line itself is in `smart_rows`.
+    fn selected_smart_rows(&self) -> Vec<InfoRow> {
+        let d = i18n::t(self.language);
+        let Some(s) = self.selected_nvme_health().and_then(|h| h.smart.as_ref()) else {
+            return Vec::new();
+        };
+        vec![
+            InfoRow::new(
+                d.nvme_critical_warning,
+                s.critical_warning.to_string(),
+                Tone::Idle,
+            ),
+            InfoRow::new(
+                d.nvme_percentage_used,
+                format!(
+                    "{} % · {} {} % / {} %",
+                    s.percentage_used,
+                    d.nvme_available_spare,
+                    s.available_spare_percent,
+                    s.available_spare_threshold_percent
+                ),
+                Tone::Idle,
+            ),
+            InfoRow::new(
+                d.nvme_media_errors,
+                format!(
+                    "{} · {} {}",
+                    s.media_and_data_integrity_errors,
+                    d.nvme_error_log_entries,
+                    s.error_information_log_entries
+                ),
+                Tone::Idle,
+            ),
+        ]
+    }
+
+    // ---- detail windows ---------------------------------------------------
+
+    fn crash_details_window(&mut self, ctx: &egui::Context) {
+        if !self.crash_details_open {
+            return;
+        }
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let mut open = true;
+        let status = self.crash_export_status.as_ref().map(|s| s.text(d));
+        let text = self.crash_details_text();
+        let folder_ok = self.final_report().is_ok();
+        let mut act: Option<DetailsAct> = None;
+        detail_window(
+            ctx,
+            "wsd_crash_details",
+            d.crash_details_title,
+            [1040.0, 820.0],
+            &mut open,
+            |ui| {
+                let footer = if status.is_some() { 76.0 } else { 50.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_crash_details_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - footer).max(120.0))
+                    .show(ui, |ui| {
+                        // v1.0 item 38: СОСТОЯНИЕ → ЧТО ОБНАРУЖЕНО →
+                        // ИНЦИДЕНТЫ → ВЕРОЯТНАЯ ПРИЧИНА → ЧТО ПРОВЕРИТЬ,
+                        // then the detailed dump analysis (raw collapsed).
+                        if let Some(Ok(inv)) = &self.crash.inventory {
+                            let r = crate::crash_report::build(inv, &self.crash.analyses, ru);
+                            let level_col = match r.level {
+                                crate::crash_report::Level::Ok => c::GREEN_SUCCESS,
+                                crate::crash_report::Level::Info => c::TEXT_TITLE,
+                                crate::crash_report::Level::Attention => c::YELLOW_WARNING,
+                                crate::crash_report::Level::Problem => c::RED_ERROR,
+                            };
+                            details::section_title(ui, d.crash_sec_state);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&r.state).strong().size(15.0).color(level_col),
+                                )
+                                .wrap(),
+                            );
+                            ui.label(
+                                RichText::new(crate::crash_report::debugger_line(
+                                    &inv.debugger,
+                                    ru,
+                                ))
+                                .color(c::TEXT_SECONDARY),
+                            );
+                            // v1.0 item 42: the analyzer install mini-journal
+                            // (4–6 lines) right under the state; the full
+                            // installer output stays collapsed at the end.
+                            if !self.crash.install_log.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(d.install_log_title)
+                                        .strong()
+                                        .color(c::TEXT_TITLE),
+                                );
+                                for l in self.install_journal_lines() {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(l).color(c::TEXT_BODY))
+                                            .wrap(),
+                                    );
+                                }
+                            }
+                            ui.add_space(6.0);
+                            details::section_title(ui, d.crash_sec_found);
+                            ui.label(
+                                RichText::new(format!("• {}", r.counters.line(ru)))
+                                    .color(c::TEXT_SECONDARY),
+                            );
+                            for l in &r.found {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("• {l}")).color(c::TEXT_BODY),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                            ui.add_space(6.0);
+                            details::section_title(ui, d.crash_sec_incidents);
+                            if r.incidents.is_empty() {
+                                ui.label(RichText::new(d.crash_incident_none).color(c::TEXT_MUTED));
+                            } else {
+                                egui::Grid::new("wsd_crash_incident_table")
+                                    .num_columns(5)
+                                    .spacing(vec2(16.0, 4.0))
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for h in d.crash_incident_header {
+                                            ui.label(
+                                                RichText::new(h).strong().color(c::TEXT_TITLE),
+                                            );
+                                        }
+                                        ui.end_row();
+                                        for i in &r.incidents {
+                                            for v in [&i.time, &i.kind, &i.code, &i.dump, &i.cause]
+                                            {
+                                                ui.label(RichText::new(v).color(c::TEXT_BODY));
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                            ui.add_space(6.0);
+                            details::section_title(ui, d.crash_sec_cause);
+                            for l in &r.cause {
+                                ui.add(
+                                    egui::Label::new(RichText::new(l).color(c::TEXT_PRIMARY))
+                                        .wrap(),
+                                );
+                            }
+                            ui.add_space(6.0);
+                            details::section_title(ui, d.crash_sec_check);
+                            for l in &r.checks {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("• {l}")).color(c::TEXT_PRIMARY),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                            ui.separator();
+                            if !self.crash.analyses.is_empty() {
+                                details::section_title(ui, d.crash_sec_dumps);
+                            }
+                        }
+                        for (n, a) in self.crash.analyses.iter().enumerate() {
+                            details::section_title(
+                                ui,
+                                &format!(
+                                    "{} — {} — {}",
+                                    a.dump.name,
+                                    a.status.code(),
+                                    a.confidence.code()
+                                ),
+                            );
+                            egui::Grid::new(("wsd_crash_kv", n))
+                                .num_columns(2)
+                                .spacing(vec2(14.0, 4.0))
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (k, v) in crash_analysis_rows(a, d) {
+                                        ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
+                                        ui.add(egui::Label::new(v).wrap());
+                                        ui.end_row();
+                                    }
+                                });
+                            if !a.parsed.stack_text.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("STACK_TEXT").color(c::TEXT_TITLE));
+                                for line in &a.parsed.stack_text {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(line)
+                                                .monospace()
+                                                .size(11.5)
+                                                .color(c::TEXT_BODY),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            }
+                            if let Some(m) = &a.module_info {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!("lmvm {}", m.module))
+                                        .color(c::TEXT_TITLE),
+                                );
+                                ui.add(
+                                    egui::Label::new(RichText::new(&m.raw).monospace().size(11.5))
+                                        .wrap(),
+                                );
+                            }
+                            if let Some(r) = &a.resolution {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(d.crash_resolution_title).color(c::TEXT_TITLE),
+                                );
+                                for l in crash_dump::resolution_lines(r, ru) {
+                                    ui.label(RichText::new(l).color(c::TEXT_BODY));
+                                }
+                            }
+                            if !a.linked.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(d.crash_row_driver).color(c::TEXT_TITLE));
+                                for l in &a.linked {
+                                    ui.label(format!(
+                                        "→ [{}] {} — {} ×{} {}",
+                                        l.status.code(),
+                                        l.device,
+                                        l.kind.code(),
+                                        l.count.max(1),
+                                        l.text
+                                    ));
+                                }
+                            }
+                            if a.memory_test_recommended {
+                                ui.label(
+                                    RichText::new(d.crash_memory_hint).color(c::YELLOW_WARNING),
+                                );
+                            }
+                            egui::CollapsingHeader::new(d.crash_raw_title)
+                                .id_salt(("wsd_crash_raw", n))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&a.raw_output).monospace().size(11.0),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            ui.separator();
+                        }
+                        if let Some(Ok(inv)) = &self.crash.inventory {
+                            // v0.4.5 freeze / hang incident timelines.
+                            details::section_title(ui, d.crash_incidents_title);
+                            let verdicts = crash_dump::incident_verdicts(inv);
+                            if verdicts.is_empty() {
+                                ui.label(RichText::new(d.crash_incident_none).color(c::TEXT_MUTED));
+                            }
+                            for (inc, v) in &verdicts {
+                                ui.label(RichText::new(v.headline()).strong().color(
+                                    if v.hang_confirmed || v.bsod_registered {
+                                        c::YELLOW_WARNING
+                                    } else {
+                                        c::TEXT_TITLE
+                                    },
+                                ));
+                                ui.label(
+                                    RichText::new(crash_dump::incident_line(inc))
+                                        .color(c::TEXT_SECONDARY),
+                                );
+                                for sig in &v.signals {
+                                    ui.label(
+                                        RichText::new(format!("  - {sig}")).monospace().size(12.0),
+                                    );
+                                }
+                                if !inc.events.is_empty() {
+                                    egui::CollapsingHeader::new(format!(
+                                        "{} ({})",
+                                        d.crash_incident_events,
+                                        inc.events.len()
+                                    ))
+                                    .id_salt(("wsd_incident", &inc.logged))
+                                    .show(ui, |ui| {
+                                        for e in &inc.events {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(format!(
+                                                        "{} · {} · {} #{} · {}",
+                                                        e.time.replace('T', " "),
+                                                        e.log,
+                                                        e.provider,
+                                                        e.id,
+                                                        e.message
+                                                    ))
+                                                    .monospace()
+                                                    .size(11.5),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    });
+                                }
+                                ui.add_space(4.0);
+                            }
+                            if !inv.live_kernel_reports.is_empty() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "LiveKernelReports: {}",
+                                        inv.live_kernel_reports
+                                            .iter()
+                                            .take(8)
+                                            .map(|r| format!(
+                                                "{}\\{} ({})",
+                                                r.folder,
+                                                r.name,
+                                                r.time.replace('T', " ")
+                                            ))
+                                            .collect::<Vec<_>>()
+                                            .join(" · ")
+                                    ))
+                                    .color(c::TEXT_SECONDARY),
+                                );
+                            }
+                            ui.separator();
+                        }
+                        if !self.crash.install_log.is_empty() {
+                            // v1.0 item 42: 4–6 line mini-journal; the raw
+                            // installer output stays collapsed below it.
+                            egui::CollapsingHeader::new(d.install_raw_title)
+                                .id_salt("wsd_install_raw")
+                                .show(ui, |ui| {
+                                    for l in &self.crash.install_log {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(l)
+                                                    .monospace()
+                                                    .size(11.5)
+                                                    .color(c::TEXT_BODY),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                });
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    d.install_note,
+                                    crash_dump::WINDBG_DOWNLOAD_URL
+                                ))
+                                .small()
+                                .color(c::TEXT_MUTED),
+                            );
+                            ui.separator();
+                        }
+                        ui.label(
+                            RichText::new(d.crash_heuristic_note)
+                                .small()
+                                .color(c::TEXT_MUTED),
+                        );
+                    });
+                ui.separator();
+                if let Some((t, col)) = &status {
+                    ui.add(egui::Label::new(RichText::new(t).color(*col)).wrap());
+                }
+                act = details_action_bar(ui, d, !text.trim().is_empty(), Some(folder_ok));
+            },
+        );
+        match act {
+            Some(DetailsAct::Copy) => {
+                self.crash_export_status =
+                    Some(self.export_text(ctx, ExportAction::Copy, "CrashDump_Details", &text))
+            }
+            Some(DetailsAct::Save) => {
+                self.crash_export_status =
+                    Some(self.export_text(ctx, ExportAction::Save, "CrashDump_Details", &text))
+            }
+            Some(DetailsAct::OpenFolder) => self.open_report_folder_from_details(),
+            Some(DetailsAct::Close) => open = false,
+            None => {}
+        }
+        if !open {
+            self.crash_export_status = None;
+        }
+        self.crash_details_open = open;
+    }
+
+    /// v1.0 plain-text export of the crash Details (Copy / Save as): this
+    /// module only.
+    fn crash_details_text(&self) -> String {
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let mut o = format!("WinStateDiag — {}\r\n", d.crash_details_title);
+        if let Some(Ok(inv)) = &self.crash.inventory {
+            // v1.0 item 49: the same sections as the window, same counters.
+            let r = crate::crash_report::build(inv, &self.crash.analyses, ru);
+            o.push_str(&crate::crash_report::to_text(&r, ru));
+            o.push_str(&format!(
+                "{}\r\n\r\n",
+                crate::crash_report::debugger_line(&inv.debugger, ru)
+            ));
+            o.push_str(&format!(
+                "{} · {}\r\n",
+                crash_dump::counts_line(inv),
+                inv.debugger.code()
+            ));
+            for b in &inv.bugchecks {
+                o.push_str(&format!(
+                    "BugCheck 0x{:08X} · {} · {:?}\r\n",
+                    b.code,
+                    b.time.replace('T', " "),
+                    b.source
+                ));
+            }
+            for (inc, v) in crash_dump::incident_verdicts(inv) {
+                o.push_str(&format!(
+                    "{} · {}\r\n",
+                    crash_dump::incident_line(&inc),
+                    v.headline()
+                ));
+            }
+        }
+        for a in &self.crash.analyses {
+            o.push_str("\r\n------------------------------------------------------------\r\n");
+            for (k, v) in crash_analysis_rows(a, d) {
+                o.push_str(&format!("{k}: {v}\r\n"));
+            }
+            if !a.parsed.stack_text.is_empty() {
+                o.push_str("STACK_TEXT:\r\n");
+                for l in &a.parsed.stack_text {
+                    o.push_str(&format!("  {l}\r\n"));
+                }
+            }
+            if let Some(m) = &a.module_info {
+                o.push_str(&format!("lmvm {}:\r\n{}\r\n", m.module, m.raw));
+            }
+            if let Some(r) = &a.resolution {
+                for l in crash_dump::resolution_lines(r, ru) {
+                    o.push_str(&format!("{l}\r\n"));
+                }
+            }
+            for l in &a.linked {
+                o.push_str(&format!(
+                    "Driver Audit: [{}] {} — {} ×{} {}\r\n",
+                    l.status.code(),
+                    l.device,
+                    l.kind.code(),
+                    l.count.max(1),
+                    l.text
+                ));
+            }
+        }
+        if !self.crash.install_log.is_empty() {
+            o.push_str(&format!("\r\n{}:\r\n", d.install_log_title));
+            for l in self.install_journal_lines() {
+                o.push_str(&format!("  {l}\r\n"));
+            }
+            o.push_str(&format!("{}:\r\n", d.install_raw_title));
+            for l in &self.crash.install_log {
+                o.push_str(&format!("  {l}\r\n"));
+            }
+        }
+        o.push_str(&format!("\r\n{}\r\n", d.crash_heuristic_note));
+        o
+    }
+
+    /// v1.0 item 42: the 4–6 line installer mini-journal; the debugger
+    /// state is added only once the install was re-detected.
+    fn install_journal_lines(&self) -> Vec<String> {
+        let after = match (&self.crash.install, &self.crash.inventory) {
+            (InstallState::Succeeded | InstallState::Failed(_), Some(Ok(inv))) => {
+                Some(inv.debugger.clone())
+            }
+            _ => None,
+        };
+        crate::crash_report::install_journal(
+            &self.crash.install_log,
+            after.as_ref(),
+            self.language == Language::Ru,
+        )
+    }
+
+    /// v0.4.5 Hardware Sensors details: the full technical table in the
+    /// WinStateDiag card style (TEMPERATURE / VOLTAGE / POWER / FANS,
+    /// providers, source mismatches). Min/Max are session sample values.
+    fn sensors_details_window(&mut self, ctx: &egui::Context) {
+        if !self.sensors_details_open {
+            return;
+        }
+        let Some(snap) = self.sensors_with_storage() else {
+            self.sensors_details_open = false;
+            return;
+        };
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let sum = sensors::summarize(&snap.sensors);
+        let mut open = true;
+        let mut close = false;
+        let mut action: Option<ExportAction> = None;
+        let export_status = self.sensors_export_status.as_ref().map(|s| s.text(d));
+        let dashboard_status = self.sensors_vm().status_line;
+        let head = |ui: &mut egui::Ui, text: &str| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(text).size(15.0).strong().color(c::TEXT_TITLE));
+            ui.add_space(2.0);
+        };
+        let conf_color = |cf: sensors::Confidence| match cf {
+            sensors::Confidence::High => c::GREEN_SUCCESS,
+            sensors::Confidence::Medium => c::TEXT_PRIMARY,
+            sensors::Confidence::Low | sensors::Confidence::Unknown => c::YELLOW_WARNING,
+        };
+        let header = |ui: &mut egui::Ui, status_col: bool| {
+            let mut cols = vec![
+                d.sensors_col_sensor,
+                d.sensors_col_current,
+                d.sensors_col_min,
+                d.sensors_col_max,
+                d.sensors_col_unit,
+            ];
+            if status_col {
+                cols.push(d.sensors_col_status);
+            }
+            cols.extend([
+                d.sensors_ref_title,
+                d.sensors_col_source,
+                d.sensors_col_conf,
+            ]);
+            for h in cols {
+                ui.label(RichText::new(h).small().color(c::TEXT_MUTED));
+            }
+            ui.end_row();
+        };
+        let row = |ui: &mut egui::Ui,
+                   cn: &sensors::Canonical,
+                   status: Option<(String, egui::Color32)>| {
+            let digits = match cn.kind {
+                sensors::SensorKind::Voltage => 3,
+                sensors::SensorKind::Power => 1,
+                _ => 0,
+            };
+            let v = |x: f64| format!("{x:.digits$}");
+            ui.label(RichText::new(sensor_label(&cn.role, &cn.label, d)).color(c::TEXT_PRIMARY));
+            ui.label(RichText::new(v(cn.value)).strong().color(c::TEXT_PRIMARY));
+            ui.label(RichText::new(v(cn.min)).color(c::TEXT_SECONDARY));
+            ui.label(RichText::new(v(cn.max)).color(c::TEXT_SECONDARY));
+            ui.label(RichText::new(cn.kind.unit()).color(c::TEXT_SECONDARY));
+            if let Some((st, col)) = status {
+                ui.label(RichText::new(st).color(col));
+            }
+            ui.label(RichText::new(self.sensor_reference(cn, d)).color(c::TEXT_SECONDARY));
+            ui.label(RichText::new(cn.provider.short()).color(c::TEXT_SECONDARY));
+            ui.label(RichText::new(cn.confidence.code()).color(conf_color(cn.confidence)));
+            ui.end_row();
+        };
+        detail_window(
+            ctx,
+            "wsd_sensors_details",
+            d.sensors_details_title,
+            [1100.0, 820.0],
+            &mut open,
+            |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} · {} × {} ms · {}",
+                        snap.state().code(),
+                        snap.captured_at.replace('T', " "),
+                        snap.samples,
+                        snap.interval_ms,
+                        snap.main_provider()
+                            .map(sensors::Provider::code)
+                            .unwrap_or("—")
+                    ))
+                    .color(c::TEXT_SECONDARY),
+                );
+                let footer = if export_status.is_some() { 70.0 } else { 46.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_sensors_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - footer).max(80.0))
+                    .show(ui, |ui| {
+                        if !sum.temps.is_empty() {
+                            head(ui, d.sensors_sec_temperature);
+                            egui::Grid::new("sens_t")
+                                .striped(true)
+                                .spacing([18.0, 4.0])
+                                .show(ui, |ui| {
+                                    header(ui, false);
+                                    for cn in &sum.temps {
+                                        row(ui, cn, None);
+                                    }
+                                });
+                        }
+                        if !sum.rails.is_empty() || !sum.dynamic_voltages.is_empty() {
+                            head(ui, d.sensors_sec_voltage);
+                            egui::Grid::new("sens_v")
+                                .striped(true)
+                                .spacing([18.0, 4.0])
+                                .show(ui, |ui| {
+                                    header(ui, true);
+                                    for (_, cn, st) in &sum.rails {
+                                        let col = match st {
+                                            sensors::PowerStatus::Excellent => c::GREEN_SUCCESS,
+                                            sensors::PowerStatus::Critical => c::RED_ERROR,
+                                            sensors::PowerStatus::NoData => c::TEXT_MUTED,
+                                            _ => c::YELLOW_WARNING,
+                                        };
+                                        row(ui, cn, Some((st.text(ru).to_string(), col)));
+                                    }
+                                    for cn in &sum.dynamic_voltages {
+                                        row(ui, cn, Some(("—".into(), c::TEXT_MUTED)));
+                                    }
+                                });
+                            ui.label(
+                                RichText::new(d.sensors_dynamic_note)
+                                    .small()
+                                    .color(c::TEXT_MUTED),
+                            );
+                            let ps = sum.power_status();
+                            if ps != sensors::PowerStatus::NoData {
+                                ui.label(RichText::new(ps.message(ru)).color(c::TEXT_SECONDARY));
+                            }
+                        }
+                        if !sum.power.is_empty() {
+                            head(ui, d.sensors_sec_power);
+                            egui::Grid::new("sens_p")
+                                .striped(true)
+                                .spacing([18.0, 4.0])
+                                .show(ui, |ui| {
+                                    header(ui, false);
+                                    for cn in &sum.power {
+                                        row(ui, cn, None);
+                                    }
+                                });
+                        }
+                        if !sum.fans.is_empty() {
+                            head(ui, d.sensors_sec_fans);
+                            egui::Grid::new("sens_f")
+                                .striped(true)
+                                .spacing([18.0, 4.0])
+                                .show(ui, |ui| {
+                                    header(ui, false);
+                                    for cn in &sum.fans {
+                                        row(ui, cn, None);
+                                    }
+                                });
+                        }
+                        if !sum.mismatches.is_empty() {
+                            head(ui, d.sensors_mismatch);
+                            for m in &sum.mismatches {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:?}: {:.2} {} ({}) / {:.2} {} ({})",
+                                        m.role,
+                                        m.canonical.1,
+                                        m.unit,
+                                        m.canonical.0.short(),
+                                        m.other.1,
+                                        m.unit,
+                                        m.other.0.short()
+                                    ))
+                                    .color(c::YELLOW_WARNING),
+                                );
+                            }
+                        }
+                        // v1.0 CPU load context of the sampling window.
+                        head(ui, d.sensors_sec_cpu_context);
+                        match &snap.process_context {
+                            Some(pc) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}: {:.0}% · {} · {} CPU",
+                                        d.sensors_cpu_load,
+                                        pc.system_cpu_percent,
+                                        pc.timestamp.replace('T', " "),
+                                        pc.logical_processors
+                                    ))
+                                    .color(if pc.high_load {
+                                        c::YELLOW_WARNING
+                                    } else {
+                                        c::TEXT_SECONDARY
+                                    }),
+                                );
+                                for t in &pc.top {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "  {:<28} PID {:>6}  {:>5.1}%",
+                                            t.name, t.pid, t.cpu_percent
+                                        ))
+                                        .monospace()
+                                        .color(c::TEXT_BODY),
+                                    );
+                                }
+                                ui.label(
+                                    RichText::new(d.sensors_cpu_note)
+                                        .small()
+                                        .color(c::TEXT_MUTED),
+                                );
+                            }
+                            None => {
+                                ui.label(RichText::new(d.sensors_cpu_none).color(c::TEXT_MUTED));
+                            }
+                        }
+                        head(ui, d.sensors_sec_providers);
+                        // v0.4.5: the provider / layer state lives here, not on
+                        // the dashboard.
+                        if !dashboard_status.is_empty() {
+                            ui.label(
+                                RichText::new(&dashboard_status)
+                                    .monospace()
+                                    .color(c::TEXT_SECONDARY),
+                            );
+                        }
+                        for p in &snap.providers {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} — {} — {}",
+                                    p.provider.code(),
+                                    p.state.code(),
+                                    p.detail
+                                ))
+                                .color(c::TEXT_SECONDARY),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(d.sensors_session_note)
+                                .small()
+                                .color(c::TEXT_MUTED),
+                        );
+                        ui.label(RichText::new(d.sensors_note).small().color(c::TEXT_MUTED));
+                    });
+                ui.separator();
+                if let Some((text, color)) = &export_status {
+                    ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
+                }
+                match details_action_bar(ui, d, true, None) {
+                    Some(DetailsAct::Copy) => action = Some(ExportAction::Copy),
+                    Some(DetailsAct::Save) => action = Some(ExportAction::Save),
+                    Some(DetailsAct::Close) => close = true,
+                    _ => {}
+                }
+            },
+        );
+        if let Some(action) = action {
+            let text = self.sensors_details_text(&snap);
+            self.sensors_export_status =
+                Some(self.export_text(ctx, action, "Hardware_Sensors_Details", &text));
+        }
+        if !open || close {
+            self.sensors_details_open = false;
+            self.sensors_export_status = None;
+        }
+    }
+
+    /// Reference column of one sensor (dashboard and Details): ATX band,
+    /// drive-reported NVMe thresholds, "динамический", else "без фикс.
+    /// эталона" — never an invented limit.
+    fn sensor_reference(&self, cn: &sensors::Canonical, d: &i18n::Dict) -> String {
+        match &cn.role {
+            sensors::Role::AtxRail(r) => sensors::rail_reference(*r),
+            sensors::Role::DynamicVoltage(_) => d.sensors_ref_dynamic.into(),
+            sensors::Role::DiskTemp(_) => {
+                let (w, c) = self.disk_temp_thresholds(&cn.label);
+                sensors::disk_reference(w, c).unwrap_or_else(|| d.sensors_ref_none.into())
+            }
+            _ if cn.kind == sensors::SensorKind::Fan => "—".into(),
+            _ => d.sensors_ref_none.into(),
+        }
+    }
+
+    /// Plain-text export of the sensor Details window.
+    fn sensors_details_text(&self, snap: &sensors::Snapshot) -> String {
+        let d = i18n::t(self.language);
+        let sum = sensors::summarize(&snap.sensors);
+        let mut o = format!(
+            "WinStateDiag — {}\r\n{} · {} · {} × {} ms\r\n",
+            d.sensors_details_title,
+            snap.state().code(),
+            snap.captured_at.replace('T', " "),
+            snap.samples,
+            snap.interval_ms
+        );
+        if let Some(pc) = &snap.process_context {
+            o.push_str(&format!(
+                "\r\n{}\r\n  {}: {:.0}% ({})\r\n",
+                d.sensors_sec_cpu_context,
+                d.sensors_cpu_load,
+                pc.system_cpu_percent,
+                pc.timestamp.replace('T', " ")
+            ));
+            for t in &pc.top {
+                o.push_str(&format!(
+                    "  {:<28} PID {:>6} {:>5.1}%\r\n",
+                    t.name, t.pid, t.cpu_percent
+                ));
+            }
+        }
+        let mut section = |title: &str, list: Vec<&sensors::Canonical>| {
+            if list.is_empty() {
+                return;
+            }
+            o.push_str(&format!("\r\n{title}\r\n"));
+            for cn in list {
+                o.push_str(&format!(
+                    "  {:<28} {:>9.3} {:>9.3} {:>9.3} {:<4} | {} | {} | {}\r\n",
+                    sensor_label(&cn.role, &cn.label, d),
+                    cn.value,
+                    cn.min,
+                    cn.max,
+                    cn.kind.unit(),
+                    self.sensor_reference(cn, d),
+                    cn.provider.short(),
+                    cn.confidence.code()
+                ));
+            }
+        };
+        section(d.sensors_sec_temperature, sum.temps.iter().collect());
+        section(
+            d.sensors_sec_voltage,
+            sum.rails
+                .iter()
+                .map(|(_, c, _)| c)
+                .chain(sum.dynamic_voltages.iter())
+                .collect(),
+        );
+        section(d.sensors_sec_power, sum.power.iter().collect());
+        section(d.sensors_sec_fans, sum.fans.iter().collect());
+        o.push_str(&format!("\r\n{}\r\n", d.sensors_sec_providers));
+        o.push_str(&format!("  {}\r\n", self.sensors_vm().status_line));
+        for p in &snap.providers {
+            o.push_str(&format!(
+                "  {} — {} — {}\r\n",
+                p.provider.code(),
+                p.state.code(),
+                p.detail
+            ));
+        }
+        o.push_str(&format!(
+            "\r\n{}\r\n{}\r\n",
+            d.sensors_session_note, d.sensors_note
+        ));
+        o
+    }
+
+    fn gpo_details_window(&mut self, ctx: &egui::Context) {
+        if !self.gpo_details_open {
+            return;
+        }
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let mut open = true;
+        let status = self.gpo_export_status.as_ref().map(|s| s.text(d));
+        let text = match &self.gpo {
+            Some(Ok((i, r))) => String::from_utf8_lossy(&gpo_text(i, r))
+                .trim_start_matches('\u{feff}')
+                .to_string(),
+            _ => String::new(),
+        };
+        let mut act: Option<DetailsAct> = None;
+        detail_window(
+            ctx,
+            "wsd_gpo_details",
+            d.gpo_details_title,
+            [900.0, 680.0],
+            &mut open,
+            |ui| {
+                let footer = if status.is_some() { 76.0 } else { 50.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_gpo_details_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - footer).max(120.0))
+                    .show(ui, |ui| match &self.gpo {
+                        Some(Ok((i, r))) => {
+                            ui.label(
+                                RichText::new(format!("Central Store: {}", r.status.text(ru)))
+                                    .strong()
+                                    .color(c::TEXT_TITLE),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}: {}",
+                                    d.gpo_local_store,
+                                    r.local_status.text(ru)
+                                ))
+                                .strong()
+                                .color(c::TEXT_TITLE),
+                            );
+                            for f in &r.local_findings {
+                                ui.label(format!("• {f}"));
+                            }
+                            ui.separator();
+                            ui.label(format!(
+                                "{}: {}",
+                                d.gpo_domain,
+                                if i.domain.is_empty() {
+                                    "—"
+                                } else {
+                                    &i.domain
+                                }
+                            ));
+                            ui.label(format!(
+                                "{}: {} · {} ADMX",
+                                d.gpo_local_store,
+                                i.local.path,
+                                i.local.admx.len()
+                            ));
+                            if let Some(cs) = &i.central {
+                                ui.label(format!(
+                                    "{}: {} · {} ADMX",
+                                    d.gpo_central,
+                                    if cs.exists {
+                                        d.gpo_found
+                                    } else {
+                                        d.gpo_not_found
+                                    },
+                                    cs.admx.len()
+                                ));
+                            }
+                            ui.separator();
+                            ui.label(RichText::new(d.gpo_findings).strong());
+                            for f in r
+                                .mismatch_findings
+                                .iter()
+                                .chain(&r.version_findings)
+                                .chain(&r.info)
+                            {
+                                ui.label(format!("• {f}"));
+                            }
+                            if !r.missing_adml.is_empty() {
+                                ui.label(format!(
+                                    "{}: {}",
+                                    d.gpo_missing_adml,
+                                    r.missing_adml
+                                        .iter()
+                                        .take(20)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ));
+                            }
+                            ui.separator();
+                            ui.label(
+                                RichText::new(d.gpo_reference_note)
+                                    .small()
+                                    .color(c::TEXT_MUTED),
+                            );
+                            ui.label(
+                                RichText::new(gpo_admx::MS_26H2_REFERENCE)
+                                    .small()
+                                    .color(c::TEXT_SECONDARY),
+                            );
+                            ui.label(
+                                RichText::new(d.gpo_readonly_note)
+                                    .small()
+                                    .color(c::TEXT_MUTED),
+                            );
+                        }
+                        Some(Err(e)) => {
+                            ui.label(e);
+                        }
+                        None => {
+                            ui.label(d.gpo_not_run);
+                        }
+                    });
+                ui.separator();
+                if let Some((t, col)) = &status {
+                    ui.add(egui::Label::new(RichText::new(t).color(*col)).wrap());
+                }
+                act = details_action_bar(ui, d, !text.is_empty(), None);
+            },
+        );
+        match act {
+            Some(DetailsAct::Copy) => {
+                self.gpo_export_status =
+                    Some(self.export_text(ctx, ExportAction::Copy, "GroupPolicy_ADMX", &text))
+            }
+            Some(DetailsAct::Save) => {
+                self.gpo_export_status =
+                    Some(self.export_text(ctx, ExportAction::Save, "GroupPolicy_ADMX", &text))
+            }
+            Some(DetailsAct::Close) => open = false,
+            Some(DetailsAct::OpenFolder) | None => {}
+        }
+        if !open {
+            self.gpo_export_status = None;
+        }
+        self.gpo_details_open = open;
+    }
+}
+
+/// Readable TXT companion of the Group Policy evidence (UTF-8 BOM, CRLF).
+/// v1.0 main sensor view: the 4-column matrix (Наименование | T°C | Volt |
+/// Watt) and the "Эталон" reference table, from the canonical summary.
+///
+/// Every EXPECTED row is always present — CPU, motherboard, PCH, RAM, GPU,
+/// GPU hotspot, each disk with a temperature, +12V / +5V / +3.3V — and a
+/// value that should exist but was not read is `NoData` ("Нет данных"),
+/// never a hidden row and never a misleading 0. Cells that make no sense for
+/// a row are `NotApplicable` ("—"). Only the number is coloured: rails by
+/// their ATX band, disks by the drive-reported thresholds; everything
+/// without a reliable reference stays neutral.
+pub(crate) fn sensor_matrix(
+    sum: &sensors::Summary,
+    disk_thresholds: &dyn Fn(&str) -> (Option<f64>, Option<f64>),
+    d: &i18n::Dict,
+) -> (Vec<SensorMatrixRow>, Vec<SensorRefRow>) {
+    use sensors::Role;
+    let level_tone = |l: sensors::ReadingLevel| match l {
+        sensors::ReadingLevel::Unknown => Tone::Idle,
+        sensors::ReadingLevel::Normal => Tone::Success,
+        sensors::ReadingLevel::Near => Tone::Warning,
+        sensors::ReadingLevel::Critical => Tone::Error,
+    };
+    let temp_of = |role: &Role| sum.temps.iter().find(|c| &c.role == role);
+    let temp_cell = |c: Option<&sensors::Canonical>| match c {
+        Some(c) => SensorCell::value(format!("{:.0}°C", c.value), Tone::Idle),
+        None => SensorCell::NoData,
+    };
+    let dyn_volt = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|n| {
+                sum.dynamic_voltages
+                    .iter()
+                    .find(|c| c.role == Role::DynamicVoltage((*n).to_string()))
+            })
+            .map(|c| SensorCell::value(format!("{:.3} V", c.value), Tone::Idle))
+            .unwrap_or(SensorCell::NoData)
+    };
+    // A power counter that reports 0 W (or less) is unavailable, not idle.
+    let watt = |role: Role| {
+        sum.power
+            .iter()
+            .find(|c| c.role == role && c.value > 0.05)
+            .map(|c| SensorCell::value(format!("{:.0} W", c.value), Tone::Idle))
+            .unwrap_or(SensorCell::NoData)
+    };
+    let row = |label: &str, temp, volt, watt| SensorMatrixRow {
+        label: label.to_string(),
+        temp,
+        volt,
+        watt,
+    };
+    let na = || SensorCell::NotApplicable;
+    let cpu_temp = temp_of(&Role::CpuCoreAverage).or_else(|| temp_of(&Role::CpuPackage));
+    let mut rows = vec![
+        row(
+            d.sensors_lbl_cpu,
+            temp_cell(cpu_temp),
+            dyn_volt(&["CPU Vcore", "CPU VID"]),
+            watt(Role::CpuPackagePower),
+        ),
+        row(
+            d.sensors_lbl_board,
+            temp_cell(temp_of(&Role::BoardTemp)),
+            na(),
+            na(),
+        ),
+        row(
+            d.sensors_lbl_pch,
+            temp_cell(temp_of(&Role::ChipsetTemp)),
+            na(),
+            na(),
+        ),
+        row(
+            d.sensors_lbl_ram,
+            temp_cell(temp_of(&Role::RamTemp)),
+            na(),
+            na(),
+        ),
+        row(
+            d.sensors_lbl_gpu,
+            temp_cell(temp_of(&Role::GpuTemp)),
+            dyn_volt(&["GPU Core"]),
+            watt(Role::GpuPower),
+        ),
+        row(
+            d.sensors_lbl_hotspot,
+            temp_cell(temp_of(&Role::GpuHotspot)),
+            na(),
+            na(),
+        ),
+    ];
+    let mut refs: Vec<SensorRefRow> = Vec::new();
+    // Each physical disk keeps its own row (same model twice: "#1", "#2").
+    for c in sum
+        .temps
+        .iter()
+        .filter(|c| matches!(c.role, Role::DiskTemp(_)))
+    {
+        let (w, cr) = disk_thresholds(&c.label);
+        let label = sensors::disk_compact(&sensor_label(&c.role, &c.label, d));
+        rows.push(row(
+            &label,
+            SensorCell::value(
+                format!("{:.0}°C", c.value),
+                level_tone(sensors::disk_temp_level(c.value, w, cr)),
+            ),
+            na(),
+            na(),
+        ));
+        if let Some(range) = sensors::disk_reference(w, cr) {
+            refs.push(SensorRefRow { label, range });
+        }
+    }
+    // Fixed ATX rails: always expected (Нет данных without a sensor).
+    for rail in [
+        crate::power::Rail::V12,
+        crate::power::Rail::V5,
+        crate::power::Rail::V3_3,
+    ] {
+        let volt = sum
+            .rails
+            .iter()
+            .find(|(r, _, _)| *r == rail)
+            .map(|(_, c, st)| {
+                SensorCell::value(
+                    format!("{:.2} V", c.value),
+                    level_tone(sensors::rail_level(*st)),
+                )
+            })
+            .unwrap_or(SensorCell::NoData);
+        rows.push(row(rail.label(), na(), volt, na()));
+    }
+    if let Some((_, c, st)) = sum
+        .rails
+        .iter()
+        .find(|(r, _, _)| *r == crate::power::Rail::V5Sb)
+    {
+        rows.push(row(
+            crate::power::Rail::V5Sb.label(),
+            na(),
+            SensorCell::value(
+                format!("{:.2} V", c.value),
+                level_tone(sensors::rail_level(*st)),
+            ),
+            na(),
+        ));
+    }
+    let mut fixed: Vec<SensorRefRow> = [
+        crate::power::Rail::V12,
+        crate::power::Rail::V5,
+        crate::power::Rail::V3_3,
+    ]
+    .into_iter()
+    .map(|r| SensorRefRow {
+        label: r.label().to_string(),
+        range: sensors::rail_reference(r),
+    })
+    .collect();
+    fixed.extend(refs);
+    fixed.push(SensorRefRow {
+        label: "Vcore / VID".into(),
+        range: d.sensors_ref_dynamic.into(),
+    });
+    fixed.push(SensorRefRow {
+        label: "GPU Core".into(),
+        range: d.sensors_ref_dynamic.into(),
+    });
+    fixed.push(SensorRefRow {
+        label: d.sensors_ref_cpu_gpu_temp.into(),
+        range: d.sensors_ref_none.into(),
+    });
+    (rows, fixed)
+}
+
+/// v1.0 cross-module consistency: an EXPC stage that says OK must not
+/// contradict another module that accepted significant evidence for the
+/// same domain — stage 04 (System events) vs Driver Audit's significant
+/// System-log evidence, stage 07 (shutdowns / BSOD) vs BugChecks found by
+/// the crash inventory. Returns the qualification line, if any.
+pub(crate) fn consistency_note(
+    stage: usize,
+    stage_ok: bool,
+    significant_system_events: usize,
+    bugchecks: usize,
+    d: &i18n::Dict,
+) -> Option<String> {
+    if !stage_ok {
+        return None;
+    }
+    match stage {
+        3 if significant_system_events > 0 => Some(
+            d.consistency_driver_events_fmt
+                .replace("{n}", &significant_system_events.to_string()),
+        ),
+        6 if bugchecks > 0 => Some(d.consistency_bsod.to_string()),
+        _ => None,
+    }
+}
+
+/// Driver Audit evidence that came from the System log and that the audit
+/// counts as significant (WARNING / PROBLEM).
+pub(crate) fn significant_system_evidence(report: &AuditReport) -> usize {
+    report
+        .items
+        .iter()
+        .flat_map(|it| it.evidence.iter())
+        .filter(|e| e.source.starts_with("System") && e.severity >= Severity::Warning)
+        .count()
+}
+
+/// v1.0 plain-text export of the Disk Details (this disk only).
+fn disk_details_text(title: &str, sections: &[(String, Vec<(String, String)>)]) -> String {
+    let mut o = format!("WinStateDiag — {title}\r\n");
+    for (head, rows) in sections {
+        o.push_str(&format!("\r\n{head}\r\n"));
+        for (k, v) in rows {
+            if k.is_empty() {
+                o.push_str(&format!("  {v}\r\n"));
+            } else {
+                o.push_str(&format!("  {k}: {v}\r\n"));
+            }
+        }
+    }
+    o
+}
+
+/// v1.0 key facts of one analyzed dump (Details grid and text export).
+fn crash_analysis_rows(a: &crash_dump::DumpAnalysis, d: &i18n::Dict) -> Vec<(String, String)> {
+    let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
+    let mut rows = vec![
+        (
+            "BugCheck".to_string(),
+            format!(
+                "{} {}",
+                a.bugcheck_code()
+                    .map(|c| format!("0x{c:08X}"))
+                    .unwrap_or_else(|| "—".into()),
+                a.parsed.bugcheck_name.clone().unwrap_or_default()
+            ),
+        ),
+        (
+            d.crash_row_dump.to_string(),
+            format!("{} · {}", a.dump.name, a.dump.modified.replace('T', " ")),
+        ),
+        ("FAILURE_BUCKET_ID".into(), opt(&a.parsed.failure_bucket_id)),
+        ("MODULE_NAME".into(), opt(&a.parsed.module_name)),
+        ("IMAGE_NAME".into(), opt(&a.parsed.image_name)),
+        ("PROCESS_NAME".into(), opt(&a.parsed.process_name)),
+        (
+            d.crash_row_module.to_string(),
+            a.probable_module()
+                .unwrap_or_else(|| d.crash_not_determined.into()),
+        ),
+        (
+            d.crash_row_confidence.to_string(),
+            a.confidence.code().to_string(),
+        ),
+        (
+            "Symbols".into(),
+            a.parsed.symbol_status().code().to_string(),
+        ),
+        ("Analysis".into(), a.status.code().to_string()),
+    ];
+    if let Some(m) = &a.module_info {
+        let ver = [&m.file_version, &m.product_version]
+            .iter()
+            .find(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "—".into());
+        rows.push((
+            "lmvm".into(),
+            format!(
+                "{} · {} · {} · {}",
+                if m.image_name.is_empty() {
+                    &m.module
+                } else {
+                    &m.image_name
+                },
+                ver,
+                if m.company.is_empty() {
+                    "—"
+                } else {
+                    &m.company
+                },
+                if m.timestamp.is_empty() {
+                    "—"
+                } else {
+                    &m.timestamp
+                }
+            ),
+        ));
+    }
+    rows
+}
+
+/// UI label of a canonical sensor role (identity stays in `Role`).
+fn sensor_label(role: &sensors::Role, label: &str, d: &i18n::Dict) -> String {
+    use sensors::Role::*;
+    match role {
+        CpuCoreAverage => d.sensors_lbl_cpu.into(),
+        CpuPackage => d.sensors_lbl_cpu_pkg.into(),
+        GpuTemp | GpuPower => d.sensors_lbl_gpu.into(),
+        GpuHotspot => d.sensors_lbl_hotspot.into(),
+        GpuMemory => d.sensors_lbl_gpu_mem.into(),
+        BoardTemp => d.sensors_lbl_board.into(),
+        ChipsetTemp => d.sensors_lbl_pch.into(),
+        VrmTemp => d.sensors_lbl_vrm.into(),
+        RamTemp => d.sensors_lbl_ram.into(),
+        DiskTemp(_) => match label.rsplit_once(" #") {
+            // Same model twice: keep the "#n" distinction on the dashboard.
+            Some((base, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                format!("{} #{n}", sensors::disk_short(base))
+            }
+            _ => sensors::disk_short(label),
+        },
+        CpuPackagePower => d.sensors_lbl_cpu.into(),
+        CpuCorePower => d.sensors_lbl_cpu_cores.into(),
+        CpuUncorePower => d.sensors_lbl_cpu_uncore.into(),
+        Gpu12vhpwrPower => d.sensors_lbl_gpu_12v.into(),
+        GpuPciePower => d.sensors_lbl_gpu_pcie.into(),
+        CpuFan => d.sensors_lbl_cpu_fan.into(),
+        Pump => d.sensors_lbl_pump.into(),
+        AtxRail(r) => r.label().into(),
+        SystemFan(n) | GpuFan(n) | DynamicVoltage(n) => n.clone(),
+        CpuCore => label.into(),
+    }
+}
+
+fn gpo_text(i: &gpo_admx::GpoInputs, r: &gpo_admx::GpoResult) -> Vec<u8> {
+    let mut t = String::new();
+    t.push_str("WinStateDiag — Group Policy / ADMX Health (read-only)\r\n");
+    t.push_str(&format!("Status: {}\r\n", r.status.code()));
+    t.push_str(&format!(
+        "Machine: {}{}\r\n",
+        if i.domain_joined {
+            "domain-joined "
+        } else {
+            "standalone"
+        },
+        i.domain
+    ));
+    t.push_str(&format!(
+        "Windows: {} ({})\r\n",
+        i.windows_release, i.windows_build
+    ));
+    t.push_str(&format!(
+        "Local PolicyDefinitions: {} ADMX · local status {}\r\n",
+        i.local.admx.len(),
+        r.local_status.code()
+    ));
+    for f in &r.local_findings {
+        t.push_str(&format!("- local: {f}\r\n"));
+    }
+    if let Some(cs) = &i.central {
+        t.push_str(&format!(
+            "Central Store: exists={} · {} ADMX\r\n",
+            cs.exists,
+            cs.admx.len()
+        ));
+    }
+    for f in r
+        .mismatch_findings
+        .iter()
+        .chain(&r.version_findings)
+        .chain(&r.info)
+    {
+        t.push_str(&format!("- {f}\r\n"));
+    }
+    t.push_str(&format!(
+        "Reference (26H2): {}\r\n",
+        gpo_admx::MS_26H2_REFERENCE
+    ));
+    let mut out = vec![0xEF, 0xBB, 0xBF];
+    out.extend_from_slice(t.as_bytes());
+    out
+}
+
 impl eframe::App for WinStateDiagApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let viewports = ctx.input(|i| i.raw.viewports.len());
+        self.window_icons.update(viewports);
         self.poll_engine();
         self.poll_benchmark();
         self.poll_nvme_health();
@@ -3989,6 +8479,13 @@ impl eframe::App for WinStateDiagApp {
         self.poll_driver_audit();
         self.poll_hardware();
         self.poll_crypto();
+        self.poll_crash();
+        self.poll_sensors();
+        self.poll_gpo();
+        self.poll_passport();
+        self.poll_crash_redetect();
+        self.poll_events();
+        self.poll_ata_scan();
         if self.reference.is_none() {
             self.finalize_report_if_idle();
         }
@@ -3998,6 +8495,9 @@ impl eframe::App for WinStateDiagApp {
             || self.benchmark_is_running()
             || self.nvme_rx.is_some()
             || matches!(self.driver_audit, DriverAuditState::Running(_))
+            || self.crash_rx.is_some()
+            || self.sensors_rx.is_some()
+            || self.gpo_rx.is_some()
         {
             ctx.request_repaint();
         } else {
@@ -4033,8 +8533,17 @@ impl eframe::App for WinStateDiagApp {
 
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
         let time = ctx.input(|i| i.time);
+        let scene = self
+            .reference
+            .as_ref()
+            .map(|r| r.scene.clone())
+            .unwrap_or_default();
         let vm = if reference_mode {
-            fixture::master_vm()
+            if qa_scenes::is_details_scene(&scene) {
+                // Details windows embedded into the captured framebuffer.
+                ctx.set_embed_viewports(true);
+            }
+            self.qa_scene_vm(&scene)
         } else {
             self.build_vm(dt, time)
         };
@@ -4071,11 +8580,18 @@ impl eframe::App for WinStateDiagApp {
                 self.apply(action);
             }
         }
+        if let Some(text) = self.clipboard_out.take() {
+            ctx.copy_text(text);
+        }
         self.raw_passes_window(&ctx);
         self.drivers_window(&ctx);
         self.journal_window(&ctx);
         self.expc_details_window(&ctx);
+        self.stage_details_window(&ctx);
         self.hardware_progress_window(&ctx);
+        self.crash_details_window(&ctx);
+        self.gpo_details_window(&ctx);
+        self.sensors_details_window(&ctx);
     }
 }
 
@@ -5562,10 +10078,13 @@ mod journal_viewer_tests {
             let ctx = egui::Context::default();
             fonts::install(&ctx);
             let vm = app.build_vm(0.0, 0.0);
-            let b = l::JOURNAL_OPEN_BUTTON;
+            // v0.4.4: the Diagnostics page carries the compact journal.
+            let b = l::JOURNAL_COMPACT_OPEN_BUTTON;
             let at = egui::pos2(
                 b[0] - CANVAS_ORIGIN_IN_MASTER[0] + b[2] / 2.0,
-                b[1] - CANVAS_ORIGIN_IN_MASTER[1] + b[3] / 2.0,
+                b[1] - CANVAS_ORIGIN_IN_MASTER[1]
+                    + b[3] / 2.0
+                    + crate::ui::tokens::layout::BODY_SHIFT,
             );
             let press = |pressed| egui::Event::PointerButton {
                 pos: at,
@@ -6534,13 +11053,16 @@ mod v041_tests {
             };
             assert!(has(&f, d.expc_details_button), "{lang:?}");
             // Inside the stages card header, right of the title, above row 1.
-            let b = l::STAGES_DETAILS_BUTTON;
-            let card = l::STAGES_CARD;
+            // v0.4.4: header of the stage table on the Diagnostics page.
+            let b = l::STAGE_TABLE_DETAILS_BUTTON;
+            let card = l::STAGE_TABLE_CARD;
             assert!(b[0] + b[2] <= card[0] + card[2] - 12.0);
-            assert!(b[1] >= card[1] && b[1] + b[3] < l::STAGE_ROW_FIRST_Y);
+            assert!(b[1] >= card[1] && b[1] + b[3] < card[1] + 46.0);
             let at = egui::pos2(
                 b[0] - CANVAS_ORIGIN_IN_MASTER[0] + b[2] / 2.0,
-                b[1] - CANVAS_ORIGIN_IN_MASTER[1] + b[3] / 2.0,
+                b[1] - CANVAS_ORIGIN_IN_MASTER[1]
+                    + b[3] / 2.0
+                    + crate::ui::tokens::layout::BODY_SHIFT,
             );
             let mut all = Vec::new();
             for ev in click(at) {
@@ -6618,7 +11140,8 @@ mod v041_tests {
                 d.expc_not_executed,
                 d.expc_copy_command,
                 d.journal_viewer_copy,
-                d.journal_viewer_save,
+                d.details_save_as,
+                d.details_open_folder,
                 d.journal_viewer_close,
             ] {
                 assert!(has(&f, t), "{lang:?}: {t}");
@@ -6748,6 +11271,341 @@ mod v041_tests {
         assert!(has(&f, i18n::RU.expc_not_started));
         let _ = std::fs::remove_dir_all(exe.parent().unwrap());
         let _ = std::fs::remove_dir_all(exe2.parent().unwrap());
+    }
+
+    // ---- v0.4.5 consolidation ------------------------------------------
+
+    fn render_stage(app: &mut WinStateDiagApp, ctx: &egui::Context, ev: Vec<egui::Event>) -> Frame {
+        let mut last = run(ctx, vec![], |ui| app.stage_details_window(ui.ctx()));
+        for _ in 0..2 {
+            last = run(ctx, vec![], |ui| app.stage_details_window(ui.ctx()));
+        }
+        if !ev.is_empty() {
+            last = run(ctx, ev, |ui| app.stage_details_window(ui.ctx()));
+        }
+        last
+    }
+
+    /// Row [Детали] opens ONLY that stage; the header button keeps the
+    /// global summary.
+    #[test]
+    fn stage_row_details_button_opens_only_its_own_stage() {
+        let (mut app, exe) = app_in("rowbtn");
+        finished_run(&mut app);
+        let d = &i18n::RU;
+        let ctx = egui::Context::default();
+        fonts::install(&ctx);
+        dashboard_frame(&mut app, &ctx, vec![]);
+        let (f, _) = dashboard_frame(&mut app, &ctx, vec![]);
+        let card = l::STAGE_TABLE_CARD;
+        let mid = card[0] - CANVAS_ORIGIN_IN_MASTER[0] + card[2] / 2.0;
+        let mut rows: Vec<Rect> = f
+            .texts
+            .iter()
+            .filter(|(t, r)| t == d.stage_details_short && r.center().x > mid)
+            .map(|(_, r)| *r)
+            .collect();
+        rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        assert!(
+            rows.len() >= 14,
+            "14 row buttons (+ header): {}",
+            rows.len()
+        );
+        // The header button reads "Детали" too; row buttons are the last 14.
+        let rows = &rows[rows.len() - 14..];
+        let mut all = Vec::new();
+        for ev in click(rows[11].center()) {
+            all.extend(dashboard_frame(&mut app, &ctx, ev).1);
+        }
+        assert!(
+            all.iter()
+                .any(|a| matches!(a, Action::ShowStageDetails(11))),
+            "{all:?}"
+        );
+        assert!(
+            !all.iter().any(|a| matches!(a, Action::ShowExpcDetails)),
+            "never the global window"
+        );
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn stage_window_shows_the_selected_stage_and_nothing_else() {
+        for (lang, d) in [(Language::Ru, &i18n::RU), (Language::En, &i18n::EN)] {
+            let (mut app, exe) = app_in("stagewin");
+            app.language = lang;
+            finished_run(&mut app);
+            push_journal(
+                &mut app.journal,
+                format!("{} — завершено", EXPC_STEP_LABELS[11]),
+            );
+            push_journal(
+                &mut app.journal,
+                format!("{} — завершено", EXPC_STEP_LABELS[9]),
+            );
+            app.apply(Action::ShowStageDetails(11));
+            let ctx = egui::Context::default();
+            let f = render_stage(&mut app, &ctx, vec![]);
+            let title = d
+                .stage_window_title_fmt
+                .replace("{n}", "12")
+                .replace("{name}", d.stage_short[11]);
+            assert!(has(&f, &title), "{lang:?}");
+            assert!(f.texts.iter().any(|(t, _)| t.contains(d.stage_scope[11])));
+            assert!(
+                f.texts
+                    .iter()
+                    .any(|(t, _)| t.contains("The component store is repairable."))
+            );
+            for t in [
+                d.stage_status_label,
+                d.stage_evidence_label,
+                d.stage_journal_label,
+                d.journal_viewer_copy,
+                d.journal_viewer_save,
+                d.journal_viewer_close,
+            ] {
+                assert!(f.texts.iter().any(|(x, _)| x.contains(t)), "{lang:?}: {t}");
+            }
+            // Stage 10 (Defender) data never leaks into stage 12.
+            assert!(!f.texts.iter().any(|(t, _)| t.contains("всё включено")));
+            assert!(!f.texts.iter().any(|(t, _)| t.contains(EXPC_STEP_LABELS[9])));
+            assert!(
+                f.texts
+                    .iter()
+                    .any(|(t, _)| t.contains(EXPC_STEP_LABELS[11])),
+                "stage journal"
+            );
+            // Copy exports this stage only.
+            let text = app.stage_details_text(11);
+            assert!(text.contains("DISM"));
+            assert!(!text.contains("всё включено"));
+            // Another row switches the window to that stage.
+            app.apply(Action::ShowStageDetails(9));
+            let f = render_stage(&mut app, &ctx, vec![]);
+            assert!(f.texts.iter().any(|(t, _)| t.contains("всё включено")));
+            assert!(
+                !f.texts
+                    .iter()
+                    .any(|(t, _)| t.contains("The component store is repairable."))
+            );
+            let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn stage_seven_evidence_is_the_crash_inventory_and_incidents() {
+        let (mut app, exe) = app_in("stage7");
+        finished_run(&mut app);
+        let mut inv = crash_inventory_with_incident();
+        inv.bugchecks.clear();
+        app.crash.inventory = Some(Ok(inv));
+        let ev = app.stage_evidence_lines(6);
+        assert!(
+            ev.iter()
+                .any(|l| l.starts_with("Unexpected shutdowns: 1 · BugCheck / BSOD: 0 · Dumps: 0")),
+            "{ev:?}"
+        );
+        assert!(
+            ev.iter()
+                .any(|l| l.starts_with("Incident 2026-10-04 21:14:10")),
+            "{ev:?}"
+        );
+        assert!(
+            app.stage_evidence_lines(11)
+                .iter()
+                .all(|l| !l.contains("Incident"))
+        );
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    fn crash_inventory_with_incident() -> crash_dump::Inventory {
+        crash_dump::Inventory {
+            bugchecks: Vec::new(),
+            dumps: Vec::new(),
+            debugger: crash_dump::DebuggerStatus::NotInstalled,
+            notes: Vec::new(),
+            unexpected_shutdowns: 1,
+            incidents: vec![crate::incidents::tests::incident(
+                vec![crate::incidents::tests::ev(
+                    "2026-10-04T20:57:44",
+                    "nvlddmkm",
+                    153,
+                    2,
+                    "Restarting TDR occurred",
+                )],
+                0,
+            )],
+            live_kernel_reports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unexpected_shutdown_without_bugcheck_never_claims_a_bsod() {
+        for (lang, d) in [(Language::Ru, &i18n::RU), (Language::En, &i18n::EN)] {
+            let (mut app, exe) = app_in("unexp");
+            app.language = lang;
+            app.crash.inventory = Some(Ok(crash_inventory_with_incident()));
+            let vm = app.crash_vm();
+            assert_eq!(vm.headline, d.crash_unexpected_only);
+            assert_eq!(
+                vm.counts,
+                d.crash_counts_fmt
+                    .replace("{s}", "1")
+                    .replace("{b}", "0")
+                    .replace("{d}", "0")
+            );
+            let row = vm
+                .rows
+                .iter()
+                .find(|r| r.label == d.crash_row_incident)
+                .expect("incident row");
+            assert!(row.value.contains("BSOD NOT REGISTERED"), "{}", row.value);
+            assert!(
+                !row.value.contains("nvlddmkm"),
+                "no culprit binary in the verdict"
+            );
+            let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        }
+        assert_eq!(
+            i18n::RU.crash_no_dump,
+            "BugCheck обнаружен, dump не найден."
+        );
+        assert_eq!(
+            i18n::RU.crash_unexpected_only,
+            "Внимание — обнаружено неожиданное выключение. BSOD не подтверждён."
+        );
+    }
+
+    #[test]
+    fn incidents_evidence_joins_the_report_and_the_manifest() {
+        let (mut app, exe) = app_in("incev");
+        app.crash.inventory = Some(Ok(crash_inventory_with_incident()));
+        app.contribute_incidents();
+        let zip = report_package::lock(&app.package).final_zip().expect("zip");
+        let files = crate::report_package::read_zip(&zip).unwrap();
+        let ev = files
+            .iter()
+            .find(|f| f.name.starts_with(incidents::EVIDENCE_PREFIX))
+            .expect("Incidents_ evidence");
+        let text = String::from_utf8_lossy(&ev.bytes);
+        assert!(text.contains("\"probable_subsystem\": \"GPU\""));
+        assert!(text.contains("\"bsod\": \"NOT_REGISTERED\""));
+        let manifest = files
+            .iter()
+            .find(|f| f.name == "manifest.json")
+            .expect("manifest");
+        let m = String::from_utf8_lossy(&manifest.bytes);
+        assert!(m.contains("\"freeze_hang_incidents\""), "{m}");
+        assert!(m.contains("\"incident_count\": 1"), "{m}");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn client_copy_button_copies_client_and_computer_without_state_change() {
+        let (mut app, exe) = app_in("copy");
+        app.computer_name = "MSI".into();
+        app.client_name = "Алексей".into();
+        let before = (app.client_name.clone(), app.page, app.journal.entries.len());
+        app.apply(Action::CopyClientInfo);
+        assert_eq!(
+            app.clipboard_out.as_deref(),
+            Some("Клиент: Алексей\nКомпьютер: MSI")
+        );
+        assert_eq!(
+            before,
+            (app.client_name.clone(), app.page, app.journal.entries.len())
+        );
+        app.client_name.clear();
+        app.language = Language::En;
+        app.apply(Action::CopyClientInfo);
+        assert_eq!(app.clipboard_out.as_deref(), Some("Computer: MSI"));
+        // The copy icon sits between the "Клиент" label and the field.
+        let b = l::CLIENT_COPY_BUTTON;
+        assert!(b[0] > l::CLIENT_LABEL_X + 60.0 && b[0] + b[2] < l::CLIENT_FIELD[0]);
+        let ctx = egui::Context::default();
+        fonts::install(&ctx);
+        app.language = Language::Ru;
+        app.client_name = "ACME".into();
+        dashboard_frame(&mut app, &ctx, vec![]);
+        let at = egui::pos2(
+            b[0] - CANVAS_ORIGIN_IN_MASTER[0] + b[2] / 2.0,
+            b[1] - CANVAS_ORIGIN_IN_MASTER[1] + b[3] / 2.0 + crate::ui::tokens::layout::BODY_SHIFT,
+        );
+        let mut all = Vec::new();
+        for ev in click(at) {
+            all.extend(dashboard_frame(&mut app, &ctx, ev).1);
+        }
+        assert!(
+            all.iter().any(|a| matches!(a, Action::CopyClientInfo)),
+            "{all:?}"
+        );
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn passport_shows_windows_cpu_ram_board_only() {
+        let (mut app, exe) = app_in("passport");
+        app.passport = Some(Ok(passport::Passport {
+            windows: "Windows 11 Pro 25H2 (26200.6584)".into(),
+            cpu: "Intel(R) Core(TM) i7-14700K · 20C/28T".into(),
+            ram: "32 GB DDR5-6000 (2×16 GB)".into(),
+            board: String::new(),
+            bios: "7E06v1A (2025-03-14)".into(),
+            ram_onboard_devices: None,
+        }));
+        let rows = app.passport_rows();
+        let d = &i18n::RU;
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                d.passport_windows,
+                d.passport_cpu,
+                d.passport_ram,
+                d.passport_board,
+                d.passport_bios
+            ]
+        );
+        assert_eq!(
+            rows[4].value, "7E06v1A (2025-03-14)",
+            "BIOS line after Плата"
+        );
+        assert_eq!(
+            rows[3].value, d.passport_no_data,
+            "missing board is said, not invented"
+        );
+        // The collector failing still shows the locally known OS line.
+        app.passport = Some(Err("x".into()));
+        assert!(app.passport_rows()[0].value.contains('('));
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    /// Details windows are OS viewports; without a multi-viewport backend
+    /// (and in tests) egui embeds them, so they always render.
+    #[test]
+    fn detail_windows_fall_back_to_embedded_windows() {
+        let ctx = egui::Context::default();
+        assert!(ctx.embed_viewports());
+        let mut open = true;
+        let mut f = run(&ctx, vec![], |_| {});
+        for _ in 0..3 {
+            f = run(&ctx, vec![], |ui| {
+                detail_window(
+                    ui.ctx(),
+                    "wsd_test_viewport",
+                    "Тест",
+                    [700.0, 500.0],
+                    &mut open,
+                    |ui| {
+                        ui.label("inside");
+                    },
+                );
+            });
+        }
+        assert!(has(&f, "inside"));
+        assert!(has(&f, "Тест"));
+        assert!(open);
     }
 }
 
@@ -7002,8 +11860,15 @@ mod nvme_health_tests {
         assert!(shown.contains("Controller facts, not a verdict"), "{shown}");
         app.ssd_selected = 1;
         let other = render(&mut app);
-        assert!(other.contains("PASS"), "benchmark passes still shown");
-        assert!(!other.contains("NVMe HEALTH"), "no cross-disk health");
+        let d = i18n::t(app.language);
+        // v1.0 Disk Details: raw passes stay available (collapsible) and
+        // the other disk shows "no health data" — never Samsung's facts.
+        assert!(
+            other.contains(d.ssd_raw_passes_title),
+            "benchmark passes still offered"
+        );
+        assert!(other.contains(d.disk_det_no_health), "{other}");
+        assert!(!other.contains("Critical Warning"), "no cross-disk health");
         let _ = std::fs::remove_dir_all(exe.parent().unwrap());
     }
 
@@ -7160,6 +12025,186 @@ mod storage_correlation_tests {
             .and_then(|a| a.classification.as_ref())
             .map(|c| c.state)
             .expect("classified")
+    }
+
+    /// v1.0 real case: a SATA SSD "measured" 2571–3065 MB/s. Physically
+    /// impossible on SATA 6 Gb/s → BENCHMARK INVALID; never history, never
+    /// a stability verdict; a plausible ~538 / 515 MB/s run is accepted.
+    #[test]
+    fn impossible_sata_benchmark_is_invalid_and_plausible_one_is_accepted() {
+        let (mut app, root) = new_app("sata_invalid");
+        app.ssd_candidates[0].disk.bus_type = "SATA".into();
+        app.ssd_candidates[0].disk.model = "Samsung SSD 870 EVO 1TB".into();
+        let mut fast = summary(1.0);
+        fast.read_max_mib_s = 3065.0 / 1.048_576;
+        fast.write_max_mib_s = 2571.0 / 1.048_576;
+        assert!(crate::storage_benchmark::implausible_reason("SATA", &fast).is_some());
+        app.start_benchmark();
+        finish(&mut app, Ok(fast));
+        match &app.benchmark_state {
+            BenchmarkUiState::Failed(m) => {
+                assert!(
+                    m.starts_with("BENCHMARK INVALID / RESULT NOT TRUSTED"),
+                    "{m}"
+                )
+            }
+            _ => panic!("expected Failed (invalid benchmark)"),
+        }
+        assert!(app.ssd_results.is_empty(), "never cached as a result");
+        assert!(app.selected_assessment().is_none(), "never classified");
+        let names = package_names(&app);
+        assert!(
+            names.iter().any(|n| n.ends_with("_INVALID.json")),
+            "{names:?}"
+        );
+        assert!(
+            crate::ssd_history::load_all_history(&app.reports_root).is_empty(),
+            "never in history"
+        );
+        // A physically plausible SATA run is a normal result.
+        let mut ok = summary(1.0);
+        ok.read_max_mib_s = 538.0 / 1.048_576;
+        ok.write_max_mib_s = 515.0 / 1.048_576;
+        ok.summary_read_mib_s = 530.0 / 1.048_576;
+        ok.summary_write_mib_s = 510.0 / 1.048_576;
+        assert!(crate::storage_benchmark::implausible_reason("SATA", &ok).is_none());
+        app.start_benchmark();
+        finish(&mut app, Ok(ok));
+        assert!(matches!(app.benchmark_state, BenchmarkUiState::Done { .. }));
+        // NVMe has no fixed ceiling here; 7000 MB/s stays valid.
+        assert!(crate::storage_benchmark::implausible_reason("NVMe", &summary(1.0)).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// v1.0: the target directory always comes from the selected candidate
+    /// (never a stale UI path), so a result cannot be attributed to the
+    /// wrong physical disk.
+    #[test]
+    fn benchmark_target_is_derived_from_the_selected_candidate() {
+        let (mut app, root) = new_app("target_bind");
+        app.benchmark_path = "Z:\\stale".into();
+        app.start_benchmark();
+        assert!(app.benchmark_is_running());
+        assert_ne!(app.benchmark_path, "Z:\\stale");
+        assert_eq!(
+            app.benchmark_path,
+            app.ssd_candidates[0].volume.as_ref().unwrap().mount_point
+        );
+        finish(&mut app, Err("stop".into()));
+        // A candidate whose volume belongs to another physical disk is
+        // refused (no silent cross-disk run).
+        app.ssd_candidates[0]
+            .volume
+            .as_mut()
+            .unwrap()
+            .physical_disk_index = 99;
+        app.benchmark_state = BenchmarkUiState::Idle;
+        app.start_benchmark();
+        assert!(!app.benchmark_is_running());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// v0.4.5 Test 1 / Test 2 live visibility: the active block shows the
+    /// live MB/s and an mm:ss clock, Test 2 stays waiting; after run 1 the
+    /// first block is marked done (final values kept) and the retest block
+    /// is labelled as the confirmation retest.
+    #[test]
+    fn live_test_blocks_follow_the_run_and_the_retest() {
+        let (mut app, _root) = new_app("liveblocks");
+        let id = identity(&app);
+        let samsung = app.ssd_candidates[0].disk.clone();
+        app.nvme_health
+            .insert(id.clone(), collect(&Src(samsung_page()), &samsung, "t"));
+        app.start_benchmark();
+        match &app.build_vm(0.0, 0.0).ssd {
+            SsdVm::Running { blocks, retest, .. } => {
+                assert!(!retest);
+                assert!(matches!(
+                    &blocks[0],
+                    TestBlockVm::Active {
+                        read: None,
+                        write: None,
+                        ..
+                    }
+                ));
+                assert_eq!(blocks[1], TestBlockVm::Waiting(None));
+            }
+            other => panic!("{other:?}"),
+        }
+        let tx = app.bench_test_tx.clone().expect("a run was launched");
+        tx.send(BenchmarkEvent::Progress(DiagnosticProgress::Measured {
+            pass: 1,
+            write_mib_s: 1000.0,
+            read_mib_s: None,
+        }))
+        .unwrap();
+        app.poll_benchmark();
+        tx.send(BenchmarkEvent::Progress(DiagnosticProgress::Measured {
+            pass: 1,
+            write_mib_s: 1000.0,
+            read_mib_s: Some(2000.0),
+        }))
+        .unwrap();
+        app.poll_benchmark();
+        match &app.build_vm(0.0, 0.0).ssd {
+            SsdVm::Running { blocks, status, .. } => {
+                match &blocks[0] {
+                    TestBlockVm::Active {
+                        read,
+                        write,
+                        elapsed,
+                    } => {
+                        assert_eq!(read.as_deref(), Some("2097"), "MiB/s -> MB/s");
+                        assert_eq!(write.as_deref(), Some("1049"));
+                        assert_eq!(elapsed.len(), 5, "mm:ss clock: {elapsed}");
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert!(!status.is_empty(), "Measured never blanks the pass status");
+            }
+            other => panic!("{other:?}"),
+        }
+        finish(&mut app, Ok(summary(18.4)));
+        match &app.build_vm(0.0, 0.0).ssd {
+            SsdVm::Running { blocks, retest, .. } => {
+                assert!(retest, "confirmation retest pending");
+                assert!(
+                    matches!(&blocks[0], TestBlockVm::Done(t) if t.stability.starts_with("UNSTABLE"))
+                );
+                assert!(
+                    matches!(&blocks[1], TestBlockVm::Waiting(Some(t)) if t.starts_with("Retest in"))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        app.poll_retest();
+        match &app.build_vm(0.0, 0.0).ssd {
+            SsdVm::Running { blocks, retest, .. } => {
+                assert!(retest);
+                assert!(
+                    matches!(&blocks[0], TestBlockVm::Done(_)),
+                    "Test 1 kept as done"
+                );
+                assert!(
+                    matches!(&blocks[1], TestBlockVm::Active { .. }),
+                    "Test 2 now active"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_clock_and_captions() {
+        assert_eq!(clock_mm_ss(6), "00:06");
+        assert_eq!(clock_mm_ss(125), "02:05");
+        let ru = i18n::t(Language::Ru);
+        assert_eq!(ru.test_done, "ГОТОВ");
+        assert_eq!(ru.test_running, "ВЫПОЛНЯЕТСЯ");
+        assert_eq!(
+            ru.test_retest_label,
+            "ПОВТОРНЫЙ ТЕСТ — подтверждение результата"
+        );
     }
 
     /// Real Samsung/Netac-equivalent case: run 1 WRITE spread above the
@@ -7440,3 +12485,14 @@ mod storage_correlation_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+#[path = "app_qa_scenes.rs"]
+mod qa_scenes;
+
+#[cfg(test)]
+#[path = "app_v10_tests.rs"]
+mod v10_tests;
+
+#[cfg(test)]
+#[path = "app_v044_tests.rs"]
+mod v044_tests;

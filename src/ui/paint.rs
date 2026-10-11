@@ -136,7 +136,7 @@ pub fn conic(stops: &[(f32, Color32)], deg: f32) -> Color32 {
     stops.last().map(|s| s.1).unwrap_or(Color32::WHITE)
 }
 
-fn with_alpha(col: Color32, a: f32) -> Color32 {
+pub fn with_alpha(col: Color32, a: f32) -> Color32 {
     col.gamma_multiply(a.clamp(0.0, 1.0))
 }
 
@@ -311,6 +311,26 @@ pub fn icon_error(painter: &Painter, center: Pos2, diameter: f32) {
     let st = Stroke::new(2.2, Color32::WHITE);
     painter.line_segment([center + vec2(-d, -d), center + vec2(d, d)], st);
     painter.line_segment([center + vec2(-d, d), center + vec2(d, -d)], st);
+}
+
+/// v0.4.5 "copy" glyph: two overlapping rounded sheets.
+pub fn icon_copy(painter: &Painter, rect: Rect, col: Color32) {
+    let s = rect.width().min(rect.height()) * 0.42;
+    let c = rect.center();
+    let back = Rect::from_min_size(
+        egui::pos2(c.x - s * 0.75, c.y - s * 0.95),
+        egui::vec2(s * 1.15, s * 1.4),
+    );
+    let front = back.translate(egui::vec2(s * 0.45, s * 0.5));
+    let stroke = Stroke::new(1.4, col);
+    painter.rect_stroke(back, CornerRadius::same(2), stroke, StrokeKind::Middle);
+    painter.rect(
+        front,
+        CornerRadius::same(2),
+        super::tokens::color::BG_CARD,
+        stroke,
+        StrokeKind::Middle,
+    );
 }
 
 pub fn icon_document(painter: &Painter, rect: Rect, col: Color32) {

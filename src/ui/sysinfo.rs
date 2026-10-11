@@ -71,6 +71,38 @@ mod imp {
             .collect()
     }
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FileTimeToSystemTime(ft: *const u64, st: *mut SystemTime) -> i32;
+        fn SystemTimeToTzSpecificLocalTime(
+            tz: *const std::ffi::c_void,
+            utc: *const SystemTime,
+            local: *mut SystemTime,
+        ) -> i32;
+    }
+
+    /// Local wall-clock time of a Unix timestamp (current time zone rules).
+    pub fn local_time_of_unix(unix: u64) -> Option<LocalTime> {
+        let ft: u64 = (unix + 11_644_473_600) * 10_000_000;
+        let mut utc = SystemTime::default();
+        let mut local = SystemTime::default();
+        unsafe {
+            if FileTimeToSystemTime(&ft, &mut utc) == 0
+                || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0
+            {
+                return None;
+            }
+        }
+        Some(LocalTime {
+            year: local.year,
+            month: local.month,
+            day: local.day,
+            hour: local.hour,
+            minute: local.minute,
+            second: local.second,
+        })
+    }
+
     pub fn local_time() -> LocalTime {
         let mut st = SystemTime::default();
         unsafe { GetLocalTime(&mut st) };
@@ -151,6 +183,38 @@ mod imp {
     }
     pub fn current_version_dword(_name: &str) -> Option<u32> {
         None
+    }
+}
+
+/// Local time of a Unix timestamp (Windows: current time zone; elsewhere
+/// UTC — only used for display).
+pub fn local_time_of_unix(unix: u64) -> Option<LocalTime> {
+    #[cfg(windows)]
+    {
+        imp::local_time_of_unix(unix)
+    }
+    #[cfg(not(windows))]
+    {
+        let days = (unix / 86_400) as i64;
+        let secs = unix % 86_400;
+        // Civil-from-days (H. Hinnant).
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u16;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u16;
+        let year = (yoe + era * 400 + i64::from(month <= 2)) as u16;
+        Some(LocalTime {
+            year,
+            month,
+            day,
+            hour: (secs / 3600) as u16,
+            minute: (secs % 3600 / 60) as u16,
+            second: (secs % 60) as u16,
+        })
     }
 }
 

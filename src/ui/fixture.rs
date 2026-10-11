@@ -13,6 +13,7 @@ pub const CLIENT_NAME: &str = "AlexHDman";
 pub const COMPUTER_NAME: &str = "MSI";
 pub const BENCHMARK_PATH: &str = "C:\\";
 
+#[allow(dead_code)] // canonical RU master (scenes use master_vm_in)
 pub fn master_vm() -> DashboardVm {
     master_vm_in(Language::Ru)
 }
@@ -32,6 +33,20 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
             right_text: "100%".into(),
             active: false,
             finding: None,
+            result: Some(if i == 4 {
+                crate::details::StageState::Info
+            } else {
+                crate::details::StageState::Ok
+            }),
+            result_text: d.expc_state_labels[if i == 4 {
+                crate::details::StageState::Info
+            } else {
+                crate::details::StageState::Ok
+            }
+            .index()]
+            .to_string(),
+            short_finding: String::new(),
+            duration: format!("00:{:02}", 1 + i % 5),
         })
         .collect();
 
@@ -100,6 +115,26 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
         ssd: SsdVm::Done {
             status: None,
             note: None,
+            tests: [
+                Some(TestVm {
+                    read: "6943".into(),
+                    write: "6029".into(),
+                    stability: "STABLE · R 0.4% / W 2.1%".into(),
+                    tone: Tone::Success,
+                    delta: None,
+                }),
+                Some(TestVm {
+                    read: "7027".into(),
+                    write: "5892".into(),
+                    stability: "ACCEPT · R 0.3% / W 10.4%".into(),
+                    tone: Tone::Warning,
+                    delta: Some(
+                        d.test_delta_fmt
+                            .replace("{r}", "+1.2%")
+                            .replace("{w}", "-2.3%"),
+                    ),
+                }),
+            ],
             read_current: "7027".into(),
             read_previous: Some("6943".into()),
             read_delta: Some(1.2),
@@ -177,6 +212,77 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
         ],
         time: 0.0,
         animate: false,
+        page: Page::Diagnostics,
+        crash: CrashVm {
+            headline: d.crash_none.into(),
+            tone: Tone::Success,
+            counts: d
+                .crash_counts_fmt
+                .replace("{s}", "0")
+                .replace("{b}", "0")
+                .replace("{d}", "0"),
+            debugger: d.crash_dbg_missing.into(),
+            debugger_tone: Tone::Warning,
+            debugger_missing: true,
+            busy: false,
+            can_analyze: false,
+            has_details: true,
+            rows: vec![InfoRow::new(d.crash_row_bugcheck, "—", Tone::Idle)],
+            analysis: None,
+            outcome: None,
+            install: None,
+        },
+        sensors: SensorsVm {
+            matrix: Vec::new(),
+            refs: Vec::new(),
+            temps: Vec::new(),
+            rails: Vec::new(),
+            power_state: d.sensors_no_data.into(),
+            power_tone: Tone::Idle,
+            power_message: String::new(),
+            power: Vec::new(),
+            fans: Vec::new(),
+            status_line: String::new(),
+            busy: false,
+            has_data: false,
+            read: super::vm::SensorReadVm::Idle,
+        },
+        gpo: GpoVm {
+            status: d.gpo_not_run.into(),
+            tone: Tone::Idle,
+            rows: vec![InfoRow::new(d.gpo_domain, d.gpo_standalone, Tone::Idle)],
+            busy: false,
+            has_result: false,
+        },
+        system_state: SystemStateVm {
+            hardware: InfoRow::new(d.hw_state_label, d.state_ok, Tone::Success),
+            system: InfoRow::new(d.sys_state_label, d.state_ok, Tone::Success),
+            note: d.system_state_note.into(),
+        },
+        smart: vec![InfoRow::new(
+            "Samsung 9100 PRO 1TB",
+            "NVMe · OK",
+            Tone::Success,
+        )],
+        passport: vec![
+            InfoRow::new(
+                d.passport_windows,
+                "Windows 11 Pro 25H2 (26200.6584)",
+                Tone::Idle,
+            ),
+            InfoRow::new(
+                d.passport_cpu,
+                "Intel(R) Core(TM) i7-14700K · 20C/28T",
+                Tone::Idle,
+            ),
+            InfoRow::new(d.passport_ram, "32 GB DDR5-6000 (2×16 GB)", Tone::Idle),
+            InfoRow::new(
+                d.passport_board,
+                "MSI PRO Z790-P WIFI (MS-7E06)",
+                Tone::Idle,
+            ),
+            InfoRow::new(d.passport_bios, "7E06v1A (2025-03-14)", Tone::Idle),
+        ],
     }
 }
 

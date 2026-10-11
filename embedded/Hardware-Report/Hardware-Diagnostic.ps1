@@ -76,10 +76,13 @@ function New-HardwareReportLines {
     $lines.Add((Format-HardwareLine 'State' $Passport.Ram.State))
     $lines.Add((Format-HardwareLine 'Total / detected modules' ("$($Passport.Ram.Total) / $($Passport.Ram.ModuleCount)")))
     $lines.Add((Format-HardwareLine 'SMBIOS declared memory devices/slots' $Passport.Ram.DeclaredSlots))
-    if ($Passport.Ram.ModuleCount -lt $Passport.Ram.DeclaredSlots) {
+    if ($Passport.Ram.Topology -eq 'ONBOARD_LPDDR') {
+        $lines.Add((Format-HardwareLine 'Memory topology' ('on-board LPDDR (soldered); SMBIOS memory devices: {0} (channels/packages, not modules)' -f $Passport.Ram.ModuleCount)))
+    } elseif ($Passport.Ram.ModuleCount -lt $Passport.Ram.DeclaredSlots) {
         $lines.Add('Note: SMBIOS may not reflect full physical topology (soldered/onboard RAM, incomplete SMBIOS). An unpopulated physical slot is not confirmed.')
     }
     foreach ($reason in @($Passport.Ram.Reasons)) { $lines.Add("Reason: $reason") }
+    foreach ($ctx in @($Passport.Ram.Context)) { $lines.Add("Context (INFO): $ctx") }
     foreach ($module in @($Passport.Ram.Modules)) { $lines.Add("- $($module.DeviceLocator): $($module.Manufacturer) $($module.PartNumber), $($module.Capacity) $($module.Type), rated $(Format-HardwareMemoryRate $module.RatedSpeedMHz), configured $(Format-HardwareMemoryRate $module.ConfiguredClockMHz) (SMBIOS-reported data rate, not measured)") }
     $lines.Add('')
     $lines.Add('[STORAGE]')
@@ -88,7 +91,7 @@ function New-HardwareReportLines {
         $lines.Add("- $($disk.Model), $($disk.Capacity), $($disk.MediaType) / $($disk.BusType)")
         $lines.Add("  Serial: $($disk.Serial); firmware: $($disk.Firmware); health: $($disk.Health)")
         $lines.Add("  Reason: $($disk.HealthReason)")
-        if ($disk.Reliability) { $lines.Add("  Reliability: temperature $($disk.Reliability.TemperatureC) C; wear $($disk.Reliability.WearPercent)%; power-on $($disk.Reliability.PowerOnHours) h; read/write errors $($disk.Reliability.ReadErrorsTotal)/$($disk.Reliability.WriteErrorsTotal)") }
+        if ($disk.Reliability) { $lines.Add("  Reliability: temperature $($disk.Reliability.TemperatureC) C; wear $(if (($disk.Reliability.WearPercent -as [double]) -gt 0) { "$($disk.Reliability.WearPercent)%" } else { 'no reliable data' }); power-on $($disk.Reliability.PowerOnHours) h; read/write errors $($disk.Reliability.ReadErrorsTotal)/$($disk.Reliability.WriteErrorsTotal)") }
     }
     $lines.Add('')
     $lines.Add('[GPU]')
@@ -258,7 +261,7 @@ function Update-HardwareGui {
     $cpu=@{Model=$p.Cpu.Models-join '; ';Manufacturer=$p.Cpu.Manufacturers-join '; ';Cores=$p.Cpu.PhysicalCores;Logical=$p.Cpu.LogicalProcessors;Socket=$p.Cpu.Sockets-join '; ';MaxClock="$($p.Cpu.MaxClockMHz) MHz";CurrentClock="$($p.Cpu.CurrentClockMHz) MHz";MaxBoost='Not reliably reported by Windows';Architecture=$p.Cpu.Architecture;Cache="L2 $($p.Cpu.L2CacheKB) KB; L3 $($p.Cpu.L3CacheKB) KB"}
     foreach($key in $cpu.Keys){$State.CpuValues[$key].Text=[string]$cpu[$key]}
     Set-HardwareGridRows $State.RamGrid @($p.Ram.Modules|ForEach-Object{,@($_.DeviceLocator,$_.Manufacturer,$_.PartNumber,$_.Capacity,(Format-HardwareMemoryRate $_.RatedSpeedMHz),(Format-HardwareMemoryRate $_.ConfiguredClockMHz),$_.Serial,$_.State)})
-    $State.RamFooter.Text="Total installed: $($p.Ram.Total) | Type: $(@($p.Ram.Modules|ForEach-Object Type|Sort-Object -Unique)-join '/') | Declared slots: $($p.Ram.DeclaredSlots) | Detected: $($p.Ram.ModuleCount) | State: $($p.Ram.State)`r`n$($p.Ram.Reasons -join '; ')"
+    $State.RamFooter.Text="Total installed: $($p.Ram.Total) | Type: $(@($p.Ram.Modules|ForEach-Object Type|Sort-Object -Unique)-join '/') | Declared slots: $($p.Ram.DeclaredSlots) | Detected: $($p.Ram.ModuleCount) | State: $($p.Ram.State)`r`n$((@($p.Ram.Reasons) + @($p.Ram.Context)) -join '; ')"
     Set-HardwareGridRows $State.StorageGrid @($p.Storage.Disks|ForEach-Object{,@($_.Model,$_.MediaType,$_.Capacity,$_.BusType,$_.Health,($_.OperationalStatus-join ', '),$_.Firmware,$_.Serial)})
     $State.StorageFooter.Text="Overall storage state: $($p.Storage.State). UNKNOWN means Windows did not expose trustworthy health data."
     Set-HardwareGridRows $State.GpuGrid @($p.Gpu.Controllers|ForEach-Object{,@($_.Name,$_.VRAM,$_.DriverVersion,$_.PnpId,$p.Gpu.State)})

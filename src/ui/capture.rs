@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 pub struct ReferenceMode {
     pub capture_path: Option<PathBuf>,
+    /// v1.0 QA scene (`--scene <name>`): diagnostics (default),
+    /// diagnostics-active, hardware, sensor-details, stage-details,
+    /// disk-details, bsod-running.
+    pub scene: String,
     frames: u32,
     stable_frames: u32,
     requested: bool,
@@ -28,8 +32,15 @@ impl ReferenceMode {
             .position(|a| a == "--capture")
             .and_then(|i| args.get(i + 1))
             .map(PathBuf::from);
+        let scene = args
+            .iter()
+            .position(|a| a == "--scene")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| "diagnostics".into());
         Some(Self {
             capture_path,
+            scene,
             frames: 0,
             stable_frames: 0,
             requested: false,

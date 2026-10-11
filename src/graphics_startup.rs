@@ -94,6 +94,30 @@ pub enum Role {
 
 /// Role of this process from its arguments (without the program name) and
 /// the handshake environment variable.
+/// v0.4.5 window / taskbar / Alt+Tab icon: the largest PNG frame of the
+/// approved `assets\icon.ico` (ruler/pencil, 256 px). eframe otherwise
+/// installs egui's default icon at runtime when no viewport icon is set,
+/// overriding the EXE resource icon on the titlebar. Pure byte parsing of
+/// the ICO directory; `None` when the file has no PNG frame.
+pub fn largest_png_icon_frame(ico: &[u8]) -> Option<&[u8]> {
+    if ico.len() < 6 || ico[0..4] != [0, 0, 1, 0] {
+        return None;
+    }
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    let mut best: Option<(u32, &[u8])> = None;
+    for i in 0..count {
+        let e = ico.get(6 + 16 * i..6 + 16 * (i + 1))?;
+        let w = if e[0] == 0 { 256 } else { e[0] as u32 };
+        let size = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
+        let off = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
+        let data = ico.get(off..off.checked_add(size)?)?;
+        if data.starts_with(b"\x89PNG") && best.is_none_or(|(bw, _)| w > bw) {
+            best = Some((w, data));
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
 pub fn parse_role(args: &[String], handshake_env: Option<&str>) -> Result<Role, String> {
     let modes: Vec<&str> = args
         .iter()
@@ -261,6 +285,25 @@ impl StartupLog {
         }
     }
 
+    /// v1.0 explicit session delimiter: the log keeps the history of
+    /// several WinStateDiag versions / launches, and each launch starts with
+    /// one block naming its time, producer version, computer and graphics
+    /// mode, so the current run is never confused with an older one.
+    pub fn session_start(&self, graphics_mode: &str) {
+        let now = crate::ui::sysinfo::local_time();
+        for text in session_start_lines(
+            &format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                now.year, now.month, now.day, now.hour, now.minute, now.second
+            ),
+            crate::APP_VERSION,
+            &crate::report_package::computer_name(),
+            graphics_mode,
+        ) {
+            self.line(&text);
+        }
+    }
+
     pub fn line(&self, text: &str) {
         let path = self.path();
         if let Some(dir) = path.parent() {
@@ -279,6 +322,22 @@ impl StartupLog {
             let _ = f.write_all(line.as_bytes());
         }
     }
+}
+
+/// The SESSION START block (pure, tested).
+pub fn session_start_lines(
+    timestamp: &str,
+    producer_version: &str,
+    computer: &str,
+    graphics_mode: &str,
+) -> Vec<String> {
+    vec![
+        "==================== SESSION START ====================".to_string(),
+        format!("timestamp: {timestamp}"),
+        format!("producer_version: {producer_version}"),
+        format!("computer: {computer}"),
+        format!("graphics_mode: {graphics_mode}"),
+    ]
 }
 
 /// Today's report folder of this PC under `root` (the one folder per PC and
@@ -308,7 +367,7 @@ pub fn environment_summary() -> String {
     let (edition, build) = crate::ui::sysinfo::windows_edition_and_build();
     format!(
         "WinStateDiag v{}; {} build {}; session: {}",
-        env!("CARGO_PKG_VERSION"),
+        crate::APP_VERSION,
         edition,
         if build.is_empty() { "?" } else { &build },
         session_kind()
@@ -495,6 +554,7 @@ where
 /// Bootstrap entry point. Returns the process exit code.
 pub fn run_bootstrap(user_args: &[String]) -> i32 {
     let log = StartupLog::open("bootstrap");
+    log.session_start("auto (normal first, safe fallback)");
     log.line(&format!("=== start; {}", environment_summary()));
     let (code, mode) = run_attempts(
         &log,
@@ -585,6 +645,29 @@ pub fn show_native_error(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_icon_is_the_approved_256_png_frame_of_icon_ico() {
+        let ico: &[u8] = include_bytes!("../assets/icon.ico");
+        let png = largest_png_icon_frame(ico).expect("icon.ico has a PNG frame");
+        assert!(png.starts_with(b"\x89PNG"));
+        // IHDR width/height = 256 (ruler/pencil application icon).
+        assert_eq!(
+            u32::from_be_bytes([png[16], png[17], png[18], png[19]]),
+            256
+        );
+        assert_eq!(
+            u32::from_be_bytes([png[20], png[21], png[22], png[23]]),
+            256
+        );
+        assert_eq!(largest_png_icon_frame(b"not an icon"), None);
+        let main = include_str!("lib.rs");
+        assert!(
+            main.contains(".with_icon("),
+            "eframe default icon overridden"
+        );
+        assert!(main.contains("include_bytes!(\"../assets/icon.ico\")"));
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -890,5 +973,38 @@ mod tests {
         assert!(fs::read_to_string(&path).unwrap().contains("hello"));
         assert!(!root.join(LOG_FILE_NAME).exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_log_sessions_are_delimited_with_version_computer_and_mode() {
+        let lines = session_start_lines(
+            "2026-10-06T11:00:00",
+            "1.0",
+            "MSI",
+            "auto (normal first, safe fallback)",
+        );
+        assert_eq!(
+            lines[0],
+            "==================== SESSION START ===================="
+        );
+        assert!(lines.contains(&"timestamp: 2026-10-06T11:00:00".to_string()));
+        assert!(lines.contains(&"producer_version: 1.0".to_string()));
+        assert!(lines.contains(&"computer: MSI".to_string()));
+        assert!(lines.iter().any(|l| l.starts_with("graphics_mode: auto")));
+        // History is kept: the marker is appended, nothing truncated.
+        let dir = std::env::temp_dir().join(format!("wsd_sess_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = StartupLog::at(&dir, "test");
+        log.line("older run");
+        log.session_start("normal");
+        let text = std::fs::read_to_string(dir.join(LOG_FILE_NAME)).unwrap();
+        assert!(text.contains("older run"));
+        let a = text.find("older run").unwrap();
+        let b = text.find("SESSION START").unwrap();
+        assert!(a < b);
+        assert!(text.contains(&format!("producer_version: {}", crate::APP_VERSION)));
+        let src = include_str!("graphics_startup.rs");
+        assert!(src.contains("log.session_start(\"auto (normal first, safe fallback)\");"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
