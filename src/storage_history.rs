@@ -82,6 +82,9 @@ pub enum ErrorLogDelta {
         current: u64,
     },
     Unknown,
+    /// The history file could not be read / parsed: no baseline is
+    /// claimed (never silently treated as a first session).
+    HistoryUnavailable,
 }
 
 impl ErrorLogDelta {
@@ -92,6 +95,7 @@ impl ErrorLogDelta {
             ErrorLogDelta::Delta { .. } => "DELTA",
             ErrorLogDelta::CounterReset { .. } => "COUNTER_RESET",
             ErrorLogDelta::Unknown => "UNKNOWN",
+            ErrorLogDelta::HistoryUnavailable => "HISTORY_UNAVAILABLE",
         }
     }
 
@@ -135,6 +139,12 @@ impl ErrorLogDelta {
             ),
             (ErrorLogDelta::Unknown, true) => "Журнал ошибок NVMe: сравнение невозможно (нет значения)".into(),
             (ErrorLogDelta::Unknown, false) => "NVMe error log: comparison not possible (value missing)".into(),
+            (ErrorLogDelta::HistoryUnavailable, true) => {
+                "Журнал ошибок NVMe: история сессий недоступна (файл не прочитан) — сравнение не выполнялось".into()
+            }
+            (ErrorLogDelta::HistoryUnavailable, false) => {
+                "NVMe error log: session history unavailable (file not readable) — no comparison made".into()
+            }
         }
     }
 }
@@ -236,6 +246,65 @@ pub fn parse(text: &str) -> Vec<SessionRecord> {
             })
         })
         .collect()
+}
+
+/// Strict parser for the whole file: a file that is not valid history JSON
+/// is an error (it must never be mistaken for an empty history and then
+/// overwritten). Individual damaged records are still skipped.
+pub fn parse_strict(text: &str) -> Result<Vec<SessionRecord>, String> {
+    let v = json::parse(text.trim_start_matches('\u{feff}'))
+        .ok_or_else(|| "history file is not valid JSON".to_string())?;
+    match v.get("sessions") {
+        Some(json::Value::Arr(_)) => Ok(parse(text)),
+        _ => Err("history file has no \"sessions\" array".into()),
+    }
+}
+
+/// Loads the history. A missing file is an empty history; an unreadable
+/// or corrupt file is an error and the file is left untouched.
+pub fn load(path: &std::path::Path) -> Result<Vec<SessionRecord>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let text =
+                String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", path.display()))?;
+            parse_strict(&text).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Atomic save: the history is written to a temporary file in the same
+/// directory, flushed, read back and verified, and only then renamed over
+/// the previous file (replace-existing). On any error the previous file is
+/// left as it was and the temporary file is removed.
+pub fn save_atomic(path: &std::path::Path, records: &[SessionRecord]) -> Result<(), String> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let text = to_json(records);
+    let result = (|| -> Result<(), String> {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        f.write_all(text.as_bytes())
+            .and_then(|_| f.sync_all())
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        drop(f);
+        let back = std::fs::read_to_string(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        if parse_strict(&back).map(|r| r.len()) != Ok(records.len()) {
+            return Err(format!(
+                "{}: verification after write failed",
+                tmp.display()
+            ));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Adds / replaces (same session + disk) a record and trims per disk.
@@ -378,5 +447,109 @@ mod tests {
         );
         assert_eq!(h.iter().filter(|r| r.session_id == "S10").count(), 1);
         assert!(parse("not json").is_empty());
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wsd_history_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn atomic_save_replaces_and_leaves_no_temp_file() {
+        let d = temp_dir("atomic");
+        let p = d.join(FILE_NAME);
+        assert_eq!(load(&p), Ok(Vec::new()), "missing file = empty history");
+        let h1 = vec![rec(
+            "S1",
+            "2026-10-01T10:00:00",
+            SessionStatus::Completed,
+            Some(1),
+        )];
+        save_atomic(&p, &h1).unwrap();
+        let mut h2 = h1.clone();
+        upsert(
+            &mut h2,
+            rec(
+                "S2",
+                "2026-10-02T10:00:00",
+                SessionStatus::Completed,
+                Some(2),
+            ),
+        );
+        save_atomic(&p, &h2).unwrap();
+        assert_eq!(load(&p).unwrap(), h2);
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != FILE_NAME)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn corrupt_or_partial_history_is_an_error_not_an_empty_history() {
+        let d = temp_dir("corrupt");
+        let p = d.join(FILE_NAME);
+        let good = to_json(&[rec(
+            "S1",
+            "2026-10-01T10:00:00",
+            SessionStatus::Completed,
+            Some(1),
+        )]);
+        // Partial write (truncated file).
+        std::fs::write(&p, &good[..good.len() / 2]).unwrap();
+        assert!(load(&p).is_err());
+        // Valid JSON, but not a history.
+        std::fs::write(&p, "{\"x\": 1}").unwrap();
+        assert!(load(&p).is_err());
+        std::fs::write(&p, [0xffu8, 0xfe, 0x00]).unwrap();
+        assert!(load(&p).is_err());
+        assert_eq!(delta(None, Some(1)).code(), "FIRST_COMPLETED");
+        assert_eq!(
+            ErrorLogDelta::HistoryUnavailable.code(),
+            "HISTORY_UNAVAILABLE"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_save_keeps_the_previous_history() {
+        let d = temp_dir("failsave");
+        let p = d.join(FILE_NAME);
+        let h1 = vec![rec(
+            "S1",
+            "2026-10-01T10:00:00",
+            SessionStatus::Completed,
+            Some(1),
+        )];
+        save_atomic(&p, &h1).unwrap();
+        // The temporary file cannot be created: a directory occupies its name.
+        let tmp = p.with_extension(format!("json.tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut h2 = h1.clone();
+        upsert(
+            &mut h2,
+            rec(
+                "S2",
+                "2026-10-02T10:00:00",
+                SessionStatus::Completed,
+                Some(2),
+            ),
+        );
+        assert!(save_atomic(&p, &h2).is_err());
+        assert_eq!(load(&p).unwrap(), h1, "previous history intact");
+        // The destination cannot be replaced (it is a directory): error too.
+        let _ = std::fs::remove_dir_all(&tmp);
+        let q = d.join("dir_target.json");
+        std::fs::create_dir_all(&q).unwrap();
+        assert!(save_atomic(&q, &h2).is_err());
+        assert!(
+            !q.with_extension(format!("json.tmp-{}", std::process::id()))
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

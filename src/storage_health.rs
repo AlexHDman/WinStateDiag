@@ -742,6 +742,9 @@ fn bench_json(b: Option<&BenchmarkFacts>) -> String {
 pub struct CorrelationExtras {
     pub session: Option<crate::storage_history::SessionRecord>,
     pub error_log_delta: Option<crate::storage_history::ErrorLogDelta>,
+    /// Session history could not be read or saved (shown to the engineer
+    /// and kept in the evidence; never silently ignored).
+    pub history_error: Option<String>,
 }
 
 /// Evidence JSON of one classification (English codes, both explanations).
@@ -891,12 +894,17 @@ pub fn to_json_with(
         })
         .unwrap_or_else(|| "null".into());
     let tail = format!(
-        ",\n  \"health_source\": {},\n  \"evidence_scope\": {},\n  \"temperature\": {},\n  \"session\": {},\n  \"error_log_delta\": {}\n}}\n",
+        ",\n  \"health_source\": {},\n  \"evidence_scope\": {},\n  \"temperature\": {},\n  \"session\": {},\n  \"error_log_delta\": {},\n  \"history_error\": {}\n}}\n",
         json::string(src),
         scope_json(inputs),
         temp,
         session,
-        delta
+        delta,
+        extras
+            .history_error
+            .as_deref()
+            .map(json::string)
+            .unwrap_or_else(|| "null".into())
     );
     let body = body.trim_end().trim_end_matches('}').trim_end().to_string();
     body + &tail
@@ -1589,6 +1597,7 @@ pub(crate) mod tests {
             &CorrelationExtras {
                 session: Some(rec),
                 error_log_delta: Some(crate::storage_history::ErrorLogDelta::Stable { value: 3 }),
+                history_error: Some("history.json: access denied".into()),
             },
         );
         let v = json::parse(&text).expect("valid JSON");
@@ -1618,6 +1627,10 @@ pub(crate) mod tests {
                 .and_then(|d| d.get("code"))
                 .and_then(|x| x.as_str()),
             Some("STABLE")
+        );
+        assert_eq!(
+            v.get("history_error").and_then(|x| x.as_str()),
+            Some("history.json: access denied")
         );
         // Plain to_json stays valid with null blocks.
         let plain = to_json(&i, &c, "m", None, &[]);

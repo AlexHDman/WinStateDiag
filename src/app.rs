@@ -2653,19 +2653,29 @@ impl WinStateDiagApp {
                 .map(|s| s.media_and_data_integrity_errors.min(u64::MAX as u128) as u64),
         };
         let history_path = self.reports_root.join(crate::storage_history::FILE_NAME);
-        let mut history = std::fs::read_to_string(&history_path)
-            .map(|t| crate::storage_history::parse(&t))
-            .unwrap_or_default();
-        let error_log_delta = smart_now.map(|_| {
-            crate::storage_history::delta(
+        // An unreadable / corrupt history is never treated as empty: no
+        // delta is claimed and the file is not overwritten.
+        let loaded = crate::storage_history::load(&history_path);
+        let error_log_delta = smart_now.map(|_| match &loaded {
+            Ok(history) => crate::storage_history::delta(
                 crate::storage_history::latest_completed(
-                    &history,
+                    history,
                     identity,
                     &self.storage_session_id,
                 ),
                 record.error_log_entries,
-            )
+            ),
+            Err(_) => crate::storage_history::ErrorLogDelta::HistoryUnavailable,
         });
+        let history_error = match loaded {
+            Ok(mut history) => {
+                crate::storage_history::upsert(&mut history, record.clone());
+                crate::storage_history::save_atomic(&history_path, &history)
+                    .err()
+                    .map(|e| format!("save failed: {e}"))
+            }
+            Err(e) => Some(format!("load failed (file kept unchanged): {e}")),
+        };
         let json = storage_health::to_json_with(
             &inputs,
             &c,
@@ -2673,13 +2683,20 @@ impl WinStateDiagApp {
             a.health_file.as_deref(),
             &a.benchmark_files,
             &storage_health::CorrelationExtras {
-                session: Some(record.clone()),
+                session: Some(record),
                 error_log_delta: error_log_delta.clone(),
+                history_error: history_error.clone(),
             },
         );
-        crate::storage_history::upsert(&mut history, record);
-        if std::fs::create_dir_all(&self.reports_root).is_ok() {
-            let _ = std::fs::write(&history_path, crate::storage_history::to_json(&history));
+        if let Some(e) = &history_error {
+            push_journal(
+                &mut self.journal,
+                if self.language == Language::Ru {
+                    format!("История сессий накопителя: ошибка — {e}")
+                } else {
+                    format!("Storage session history: error — {e}")
+                },
+            );
         }
         if let Some(dl) = error_log_delta.as_ref() {
             push_journal(&mut self.journal, dl.text(self.language == Language::Ru));
