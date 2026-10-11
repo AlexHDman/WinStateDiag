@@ -136,6 +136,43 @@ pub struct DeepCheckOutcome {
     pub source: ResultSource,
 }
 
+impl DeepCheckOutcome {
+    /// v1.0 additive finding class (manifest / UI). CHKDSK separates
+    /// "completed" from what it found: REPAIRED / PROBLEMS_FOUND / CLEAN /
+    /// FAILED. Other checks: none.
+    pub fn finding_class(&self) -> Option<ChkdskFinding> {
+        if self.check != DeepCheck::Chkdsk {
+            return None;
+        }
+        match self.result {
+            CheckResult::Ok => {
+                // An old engine may have said OK for an online repair: the
+                // evidence text decides.
+                match chkdsk_finding(&self.detail) {
+                    Some(ChkdskFinding::Repaired) => Some(ChkdskFinding::Repaired),
+                    _ => Some(ChkdskFinding::Clean),
+                }
+            }
+            CheckResult::Attention => Some(match chkdsk_finding(&self.detail) {
+                Some(ChkdskFinding::Repaired) => ChkdskFinding::Repaired,
+                _ => ChkdskFinding::ProblemsFound,
+            }),
+            CheckResult::Error => Some(ChkdskFinding::Failed),
+            _ => None,
+        }
+    }
+
+    /// v1.0: the result as shown — a CHKDSK online repair is ATTENTION even
+    /// if older evidence said OK.
+    pub fn effective_result(&self) -> CheckResult {
+        if self.finding_class() == Some(ChkdskFinding::Repaired) {
+            CheckResult::Attention
+        } else {
+            self.result
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Raw output classification (conservative)
 // ---------------------------------------------------------------------
@@ -143,6 +180,94 @@ pub struct DeepCheckOutcome {
 fn has(text: &str, needles: &[&str]) -> bool {
     let low = text.to_lowercase();
     needles.iter().any(|n| low.contains(&n.to_lowercase()))
+}
+
+/// v1.0 CHKDSK diagnostic finding, separate from "execution completed".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChkdskFinding {
+    /// "found no problems".
+    Clean,
+    /// Problems were found AND repaired online — never plain OK.
+    Repaired,
+    /// Problems found that still need an offline repair.
+    ProblemsFound,
+    /// CHKDSK could not check the volume.
+    Failed,
+}
+
+impl ChkdskFinding {
+    pub fn code(self) -> &'static str {
+        match self {
+            ChkdskFinding::Clean => "CLEAN",
+            ChkdskFinding::Repaired => "REPAIRED",
+            ChkdskFinding::ProblemsFound => "PROBLEMS_FOUND",
+            ChkdskFinding::Failed => "FAILED",
+        }
+    }
+}
+
+/// The CHKDSK finding of its console output (RU / EN). Order matters: a
+/// failed run first, then "repaired online", then unrepaired problems,
+/// then the clean sentence ("не обнаружила проблем" must never match the
+/// repaired "обнаружила проблемы, которые были исправлены").
+pub fn chkdsk_finding(text: &str) -> Option<ChkdskFinding> {
+    if has(
+        text,
+        &[
+            "cannot open volume",
+            "access denied",
+            "cannot lock",
+            "не удается открыть том",
+            "не удаётся открыть том",
+            "отказано в доступе",
+        ],
+    ) {
+        Some(ChkdskFinding::Failed)
+    } else if has(
+        text,
+        &[
+            "fixed online",
+            "found problems and fixed them",
+            "has made corrections",
+            "made corrections to the file system",
+            "исправлены в оперативном режиме",
+            "были исправлены",
+            "внесла исправления",
+            "исправила проблемы",
+            "исправлено:",
+            "repaired:",
+        ],
+    ) {
+        Some(ChkdskFinding::Repaired)
+    } else if has(
+        text,
+        &[
+            "must be fixed offline",
+            "will not fix",
+            "spotfix",
+            "found problems",
+            "found errors",
+            "обнаружила неполадки",
+            "обнаружены ошибки",
+            "найдены ошибки",
+            "в автономном режиме",
+            "не будут исправлены",
+            "обнаружила проблемы",
+        ],
+    ) {
+        Some(ChkdskFinding::ProblemsFound)
+    } else if has(
+        text,
+        &[
+            "windows has scanned the file system and found no problems",
+            "не обнаружила проблем",
+            "не обнаружено проблем",
+        ],
+    ) {
+        Some(ChkdskFinding::Clean)
+    } else {
+        None
+    }
 }
 
 /// Classifies the console output of a deep check. Only explicit, known
@@ -200,47 +325,17 @@ pub fn classify_output(check: DeepCheck, text: &str, exit_code: Option<i32>) -> 
                 CheckResult::Unknown
             }
         }
-        DeepCheck::Chkdsk => {
-            if has(
-                text,
-                &[
-                    "cannot open volume",
-                    "access denied",
-                    "cannot lock",
-                    "не удается открыть том",
-                    "не удаётся открыть том",
-                    "отказано в доступе",
-                ],
-            ) {
-                CheckResult::Error
-            } else if has(
-                text,
-                &[
-                    "found problems",
-                    "found errors",
-                    "windows has made corrections",
-                    "обнаружила неполадки",
-                    "обнаружены ошибки",
-                    "внесла исправления",
-                ],
-            ) {
-                CheckResult::Attention
-            } else if has(
-                text,
-                &[
-                    "windows has scanned the file system and found no problems",
-                    "не обнаружила проблем",
-                    "не обнаружено проблем",
-                ],
-            ) {
-                CheckResult::Ok
-            } else {
-                // chkdsk exit codes other than 0 are not failures by
-                // themselves (1 = errors fixed, 2 = cleanup, 3 = could not
-                // check); without the sentence the result stays UNKNOWN.
-                CheckResult::Unknown
-            }
-        }
+        DeepCheck::Chkdsk => match chkdsk_finding(text) {
+            Some(ChkdskFinding::Failed) => CheckResult::Error,
+            // v1.0: found-and-repaired is ATTENTION (finding REPAIRED),
+            // never plain OK.
+            Some(ChkdskFinding::Repaired | ChkdskFinding::ProblemsFound) => CheckResult::Attention,
+            Some(ChkdskFinding::Clean) => CheckResult::Ok,
+            // chkdsk exit codes other than 0 are not failures by themselves
+            // (1 = errors fixed, 2 = cleanup, 3 = could not check); without
+            // the sentence the result stays UNKNOWN.
+            None => CheckResult::Unknown,
+        },
     }
 }
 
@@ -1092,5 +1187,83 @@ mod tests {
                 .unwrap()
                 .starts_with("2026-09-28T10:00:00")
         );
+    }
+
+    // ---- v1.0 CHKDSK: execution completed != diagnostic finding ----
+
+    const CHKDSK_REPAIRED_RU: &str = "Этап 1. Проверка базовой структуры файловой системы...\r\nWindows обнаружила проблемы, которые были исправлены в оперативном режиме.\r\nДальнейшие действия не требуются.\r\n";
+    const CHKDSK_REPAIRED_EN: &str = "Stage 1: Examining basic file system structure ...\r\nWindows found problems with the file system that were fixed online.\r\nNo further action is required.\r\n";
+
+    #[test]
+    fn chkdsk_found_and_repaired_is_attention_never_plain_ok_ru_en() {
+        for text in [CHKDSK_REPAIRED_RU, CHKDSK_REPAIRED_EN] {
+            assert_eq!(
+                chkdsk_finding(text),
+                Some(ChkdskFinding::Repaired),
+                "{text}"
+            );
+            assert_eq!(
+                classify_output(DeepCheck::Chkdsk, text, Some(0)),
+                CheckResult::Attention,
+                "exit code 0 must not turn a repair into OK"
+            );
+        }
+        // An older engine that reported OK for the online repair: the
+        // evidence text decides — effective result ATTENTION / REPAIRED.
+        let legacy = DeepCheckOutcome {
+            check: DeepCheck::Chkdsk,
+            result: CheckResult::Ok,
+            detail: "Windows обнаружила проблемы, которые были исправлены в оперативном режиме"
+                .into(),
+            source: ResultSource::ExpcJson,
+        };
+        assert_eq!(legacy.finding_class(), Some(ChkdskFinding::Repaired));
+        assert_eq!(legacy.effective_result(), CheckResult::Attention);
+        // The v1.0 engine's own detail line.
+        let v10 = DeepCheckOutcome {
+            check: DeepCheck::Chkdsk,
+            result: CheckResult::Attention,
+            detail: "ИСПРАВЛЕНО: CHKDSK обнаружил проблемы файловой системы и исправил их в оперативном режиме (FindingClass=REPAIRED).".into(),
+            source: ResultSource::ExpcJson,
+        };
+        assert_eq!(v10.finding_class(), Some(ChkdskFinding::Repaired));
+    }
+
+    #[test]
+    fn chkdsk_clean_problems_and_failure_keep_their_classes_ru_en() {
+        assert_eq!(chkdsk_finding(CHKDSK_OK_EN), Some(ChkdskFinding::Clean));
+        assert_eq!(chkdsk_finding(CHKDSK_OK_RU), Some(ChkdskFinding::Clean));
+        assert_eq!(
+            chkdsk_finding(CHKDSK_BAD_EN),
+            Some(ChkdskFinding::ProblemsFound)
+        );
+        assert_eq!(
+            chkdsk_finding(CHKDSK_BAD_RU),
+            Some(ChkdskFinding::ProblemsFound)
+        );
+        assert_eq!(chkdsk_finding(CHKDSK_FAIL_EN), Some(ChkdskFinding::Failed));
+        assert_eq!(
+            classify_output(DeepCheck::Chkdsk, CHKDSK_OK_RU, Some(0)),
+            CheckResult::Ok
+        );
+        assert_eq!(
+            classify_output(DeepCheck::Chkdsk, CHKDSK_FAIL_EN, Some(3)),
+            CheckResult::Error
+        );
+        let ok = DeepCheckOutcome {
+            check: DeepCheck::Chkdsk,
+            result: CheckResult::Ok,
+            detail: "Windows проверила файловую систему и не обнаружила проблем.".into(),
+            source: ResultSource::ExpcJson,
+        };
+        assert_eq!(ok.finding_class(), Some(ChkdskFinding::Clean));
+        assert_eq!(ok.effective_result(), CheckResult::Ok);
+        // The PowerShell engine checks REPAIRED before generic problems.
+        let ps = include_str!("../embedded/EXPC-Diagnostic/EXPC-Diagnostic.ps1");
+        let a = ps.find("$repaired = (").expect("repaired detection");
+        let b = ps.find("if ($repaired) {").expect("repaired branch");
+        let c = ps.find("} elseif ($problem) {").expect("problem branch");
+        assert!(a < b && b < c);
+        assert!(ps.contains("FindingClass=REPAIRED"));
     }
 }

@@ -16,7 +16,9 @@
 //!   "windows": { "product": "...", "build": "..." },
 //!   "modules": [
 //!     { "name": "expc_diagnostic" | "hardware_report" | "driver_audit"
-//!               | "ssd_benchmark" | "nvme_health" | "storage_correlation",
+//!               | "ssd_benchmark" | "nvme_health" | "storage_correlation"
+//!               | "crash_dump_analysis" | "group_policy_admx_health"
+//!               | "hardware_sensors" | "freeze_hang_incidents",
 //!       "status": "completed" | "cancelled",
 //!       "evidence": ["<file name in this ZIP>", ...],
 //!       "latest_evidence": ["<files of the newest completed run>", ...],
@@ -31,6 +33,11 @@
 //!           "source_file": "<EXPC evidence file name>",
 //!           "source": "expc_json.checks" | "expc_txt.result_line" | "expc_txt.key_output",
 //!           "timestamp": "<EXPC GeneratedAt>" | null } ],
+//!       "dump_count", "analyzed_count", "analysis_status", "confidence"
+//!                                         (crash_dump_analysis, additive)
+//!       "result_status"   (group_policy_admx_health, hardware_sensors, additive)
+//!       "provider", "sensor_count"           (hardware_sensors, v0.4.5 additive)
+//!       "result_status", "incident_count"    (freeze_hang_incidents, v0.4.5 additive)
 //!       "disks": [   (ssd_benchmark, nvme_health, storage_correlation; additive)
 //!         { "disk_key": "<FNV-1a of the physical identity>",
 //!           "physical_disk_index": n | null, "model": "...",
@@ -52,8 +59,9 @@ use crate::ui::sysinfo::LocalTime;
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SCHEMA_VERSION: &str = "1.0";
 pub const PRODUCER: &str = "WinStateDiag";
-/// The canonical application version (Cargo.toml `[package] version`).
-pub const PRODUCER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The canonical application version (Cargo.toml `[package] version`,
+/// release form "1.0" — see build.rs `display_version`).
+pub const PRODUCER_VERSION: &str = env!("WSD_DISPLAY_VERSION");
 
 #[derive(Clone, Debug)]
 pub struct ManifestContext {
@@ -63,6 +71,9 @@ pub struct ManifestContext {
     pub created_at: LocalTime,
     pub windows_product: String,
     pub windows_build: String,
+    /// v1.0 (additive): separate system / hardware state codes.
+    pub system_state: Option<String>,
+    pub hardware_state: Option<String>,
 }
 
 fn module_name(m: EvidenceModule) -> &'static str {
@@ -73,6 +84,11 @@ fn module_name(m: EvidenceModule) -> &'static str {
         EvidenceModule::SsdBenchmark => "ssd_benchmark",
         EvidenceModule::NvmeHealth => "nvme_health",
         EvidenceModule::StorageCorrelation => "storage_correlation",
+        EvidenceModule::CrashDump => "crash_dump_analysis",
+        EvidenceModule::GroupPolicyAdmx => "group_policy_admx_health",
+        EvidenceModule::HardwareSensors => "hardware_sensors",
+        EvidenceModule::FreezeIncidents => "freeze_hang_incidents",
+        EvidenceModule::EventEvidence => "event_evidence",
     }
 }
 
@@ -172,6 +188,15 @@ fn json_field(bytes: &[u8], keys: &[&str]) -> Option<String> {
         .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(str::to_string))
 }
 
+/// Integer field of a JSON evidence file.
+fn json_number(bytes: &[u8], key: &str) -> Option<u64> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    match json::parse(text.trim_start_matches('\u{feff}'))?.get(key)? {
+        json::Value::Num(n) if *n >= 0.0 => Some(*n as u64),
+        _ => None,
+    }
+}
+
 /// (identity, index, model) of one benchmark / health / correlation JSON.
 fn disk_of(bytes: &[u8]) -> Option<(String, Option<u64>, String)> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -206,6 +231,114 @@ fn disk_of(bytes: &[u8]) -> Option<(String, Option<u64>, String)> {
         .filter(|m| !m.is_empty())
         .unwrap_or(id_model);
     Some((identity, index, model))
+}
+
+/// v1.0 the evidence set of the newest analyzed crash. Crash files are
+/// `CrashDump_{Analysis|Summary|Dump}_<stamp>_<NN>[_<original>]`; one
+/// analysis run numbers its dumps newest first, so the set is the newest
+/// `<stamp>` with the smallest `<NN>`.
+fn crash_evidence_set<'a>(files: &[&'a str]) -> Vec<&'a str> {
+    let set_key = |name: &str| -> Option<(Vec<u32>, u32, String)> {
+        let rest = ["Analysis_", "Summary_", "Dump_"]
+            .iter()
+            .find_map(|p| name.strip_prefix(&format!("CrashDump_{p}")))?;
+        let parts: Vec<&str> = rest.splitn(4, '_').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let nn_str = parts[2].split('.').next().unwrap_or("");
+        let nn: u32 = nn_str.parse().ok()?;
+        let stamp = format!("{}_{}", parts[0], parts[1]);
+        Some((
+            // `run_key` strips an extension itself (never the date dots).
+            run_key(&format!("{stamp}.json")).unwrap_or_default(),
+            nn,
+            format!("{stamp}_{nn_str}"),
+        ))
+    };
+    let newest = files
+        .iter()
+        .filter(|n| !n.contains(USER_CANCELLED))
+        .filter_map(|n| set_key(n))
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let Some((_, _, key)) = newest else {
+        return Vec::new();
+    };
+    files
+        .iter()
+        .copied()
+        .filter(|n| set_key(n).is_some_and(|(_, _, k)| k == key))
+        .collect()
+}
+
+/// v1.0 chronological key of one per-disk JSON: its own timestamp
+/// (`captured_at` / `assessed_at` / `generated_at`, seconds) when present,
+/// else the file-name key (legacy evidence). A legacy `<stem>_retest`
+/// sorts directly AFTER its base run, never before a later run.
+fn evidence_order_key(name: &str, bytes: &[u8]) -> Vec<u32> {
+    if let Some(ts) = json_field(bytes, &["captured_at", "assessed_at", "generated_at"]) {
+        let nums: Vec<u32> = ts
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|g| !g.is_empty())
+            .filter_map(|g| g.parse().ok())
+            .take(6)
+            .collect();
+        if nums.len() >= 5 {
+            return nums;
+        }
+    }
+    let base = stem(name).trim_end_matches("_retest");
+    // `run_key` strips an extension itself: the date dots of a bare stem
+    // ("…_05.10.26_10-58") must never be taken for one.
+    let mut key = run_key(&format!("{base}.json")).unwrap_or_default();
+    if let Some(y) = key.first_mut()
+        && *y < 100
+    {
+        *y += 2000;
+    }
+    if stem(name).ends_with("_retest") {
+        key.push(u32::MAX);
+    }
+    key
+}
+
+/// v1.0 the CURRENT run of one disk: the newest JSON by its own timestamp
+/// (an automatic retest is newer than the run it confirms, so a confirmed
+/// sequence ends on its retest). Returns (final JSON name, sequence files:
+/// the initial run + its retest, all extensions).
+fn current_run<'a>(files: &[&'a str], entries: &[EvidenceFile]) -> Option<(&'a str, Vec<&'a str>)> {
+    let jsons: Vec<(&'a str, Vec<u32>)> = files
+        .iter()
+        .copied()
+        .filter(|n| n.ends_with(".json") && !n.contains(USER_CANCELLED))
+        .filter_map(|n| {
+            let e = entries.iter().find(|e| e.name == n)?;
+            Some((n, evidence_order_key(n, &e.bytes)))
+        })
+        .collect();
+    let (last, _) = jsons
+        .iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(b.0)))?;
+    let last = *last;
+    let last_stem = stem(last);
+    // The initial run of a retest: explicit `retest_of`, else the legacy
+    // `<initial>_retest` naming.
+    let initial_stem: Option<String> = entries
+        .iter()
+        .find(|e| e.name == last)
+        .and_then(|e| json_field(&e.bytes, &["retest_of"]))
+        .map(|r| stem(&r).to_string())
+        .or_else(|| last_stem.strip_suffix("_retest").map(str::to_string));
+    let mut seq: Vec<&'a str> = files
+        .iter()
+        .copied()
+        .filter(|n| {
+            let s = stem(n);
+            s == last_stem || initial_stem.as_deref() == Some(s)
+        })
+        .collect();
+    seq.sort_unstable();
+    Some((last, seq))
 }
 
 /// Groups a per-disk module's files by physical disk: each JSON names its
@@ -266,6 +399,11 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
         EvidenceModule::SsdBenchmark,
         EvidenceModule::NvmeHealth,
         EvidenceModule::StorageCorrelation,
+        EvidenceModule::CrashDump,
+        EvidenceModule::GroupPolicyAdmx,
+        EvidenceModule::HardwareSensors,
+        EvidenceModule::FreezeIncidents,
+        EvidenceModule::EventEvidence,
     ];
     let mut modules: Vec<String> = Vec::new();
     for m in order {
@@ -298,9 +436,17 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             .as_ref()
             .and_then(|r| r.as_ref())
             .map(|r| stem(&r.source_file).to_string());
+        // v1.0: for crash analysis the latest evidence is the complete
+        // logical set of the newest analyzed crash (original .dmp copy +
+        // CrashDump_Analysis .txt + CrashDump_Summary .json).
+        let latest = if m == EvidenceModule::CrashDump {
+            crash_evidence_set(&files)
+        } else {
+            latest_run(&files, preferred.as_deref())
+        };
         fields.push(format!(
             "      \"latest_evidence\": {}",
-            str_list(&latest_run(&files, preferred.as_deref()), "      ")
+            str_list(&latest, "      ")
         ));
         if m == EvidenceModule::Expc {
             let run = deep_checks::from_evidence_files(
@@ -323,10 +469,13 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
                         .map(json::string)
                         .unwrap_or_else(|| "null".into());
                     checks.push(format!(
-                        "        {{\n          \"check\": {},\n          \"execution_status\": {},\n          \"result_status\": {},\n          \"finding\": {},\n          \"source_file\": {},\n          \"source\": {},\n          \"timestamp\": {}\n        }}",
+                        "        {{\n          \"check\": {},\n          \"execution_status\": {},\n          \"result_status\": {},\n          \"finding_class\": {},\n          \"finding\": {},\n          \"source_file\": {},\n          \"source\": {},\n          \"timestamp\": {}\n        }}",
                         json::string(o.check.key()),
                         json::string(exec),
-                        json::string(o.result.as_str()),
+                        json::string(o.effective_result().as_str()),
+                        o.finding_class()
+                            .map(|f| json::string(f.code()))
+                            .unwrap_or_else(|| "null".into()),
                         json::string(&o.detail),
                         json::string(&run.source_file),
                         json::string(o.source.as_str()),
@@ -355,14 +504,72 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             let disks: Vec<String> = groups
                 .iter()
                 .map(|g| {
-                    let latest = latest_run(&g.files, None);
-                    let status = latest
+                    // v1.0: the CURRENT (final) run of this disk by its own
+                    // timestamp — after UNSTABLE → retest → STABLE the
+                    // retest is current; earlier runs stay in `evidence`.
+                    let (latest, sequence) = match current_run(&g.files, entries) {
+                        Some((last, seq)) => (
+                            g.files
+                                .iter()
+                                .copied()
+                                .filter(|n| stem(n) == stem(last))
+                                .collect::<Vec<_>>(),
+                            seq,
+                        ),
+                        None => (latest_run(&g.files, None), Vec::new()),
+                    };
+                    let current_json = latest
                         .iter()
                         .filter(|n| n.ends_with(".json"))
-                        .find_map(|n| entries.iter().find(|e| e.name == *n))
-                        .and_then(|e| json_field(&e.bytes, &["status", "state", "stability"]));
+                        .find_map(|n| entries.iter().find(|e| e.name == *n));
+                    // v1.0 item 13: NVMe_Health status = the normalized
+                    // health record (`health_status`, e.g. ATA SMART OK),
+                    // never the NVMe-log probe status alone; correlation =
+                    // its storage state.
+                    let keys: &[&str] = match m {
+                        EvidenceModule::StorageCorrelation => &["state", "status"],
+                        _ => &["health_status", "status", "state", "stability"],
+                    };
+                    let status = current_json.and_then(|e| json_field(&e.bytes, keys));
+                    // Correlation: the exact benchmark / health evidence the
+                    // current assessment was made from.
+                    let refs = if m == EvidenceModule::StorageCorrelation {
+                        let text = current_json
+                            .and_then(|e| std::str::from_utf8(&e.bytes).ok())
+                            .and_then(|t| json::parse(t.trim_start_matches('\u{feff}')));
+                        let bench: Vec<String> = text
+                            .as_ref()
+                            .and_then(|v| match v.get("benchmark_evidence") {
+                                Some(json::Value::Arr(a)) => Some(
+                                    a.iter()
+                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                        .collect(),
+                                ),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let health = text
+                            .as_ref()
+                            .and_then(|v| v.get("health_evidence").and_then(|x| x.as_str()).map(str::to_string));
+                        let bench_refs: Vec<&str> = bench.iter().map(String::as_str).collect();
+                        format!(
+                            ",\n          \"current_benchmark_evidence\": {},\n          \"current_health_evidence\": {}",
+                            str_list(&bench_refs, "          "),
+                            health.map(|h| json::string(&h)).unwrap_or_else(|| "null".into())
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let seq_field = if m == EvidenceModule::SsdBenchmark {
+                        format!(
+                            ",\n          \"current_sequence\": {}",
+                            str_list(&sequence, "          ")
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "        {{\n          \"disk_key\": {},\n          \"physical_disk_index\": {},\n          \"model\": {},\n          \"status\": {},\n          \"evidence\": {},\n          \"latest_evidence\": {}\n        }}",
+                        "        {{\n          \"disk_key\": {},\n          \"physical_disk_index\": {},\n          \"model\": {},\n          \"status\": {},\n          \"evidence\": {},\n          \"latest_evidence\": {}{}{}\n        }}",
                         json::string(&g.key),
                         g.index
                             .map(|i| i.to_string())
@@ -372,7 +579,9 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
                             .map(|s| json::string(&s))
                             .unwrap_or_else(|| "null".into()),
                         str_list(&g.files, "          "),
-                        str_list(&latest, "          ")
+                        str_list(&latest, "          "),
+                        seq_field,
+                        refs
                     )
                 })
                 .collect();
@@ -381,6 +590,86 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             } else {
                 format!("      \"disks\": [\n{}\n      ]", disks.join(",\n"))
             });
+        }
+        if m == EvidenceModule::CrashDump {
+            // v0.4.4 (additive): dump / analysis counts and the result of
+            // the newest analysis, read from the summaries themselves.
+            let summaries: Vec<&EvidenceFile> = entries
+                .iter()
+                .filter(|e| files.contains(&e.name.as_str()) && e.name.contains("_Summary_"))
+                .collect();
+            let dumps = files
+                .iter()
+                .filter(|n| n.to_ascii_lowercase().ends_with(".dmp"))
+                .count();
+            let analyzed = summaries
+                .iter()
+                .filter(|e| {
+                    json_field(&e.bytes, &["analysis_status"]).as_deref() == Some("COMPLETED")
+                })
+                .count();
+            let newest = summaries.iter().max_by(|a, b| {
+                run_key(&a.name)
+                    .cmp(&run_key(&b.name))
+                    .then(a.name.cmp(&b.name))
+            });
+            let field = |k: &str| {
+                newest
+                    .and_then(|e| json_field(&e.bytes, &[k]))
+                    .map(|v| json::string(&v))
+                    .unwrap_or_else(|| "null".into())
+            };
+            fields.push(format!("      \"dump_count\": {dumps}"));
+            fields.push(format!("      \"analyzed_count\": {analyzed}"));
+            fields.push(format!(
+                "      \"analysis_status\": {}",
+                field("analysis_status")
+            ));
+            fields.push(format!("      \"confidence\": {}", field("confidence")));
+        }
+        if matches!(
+            m,
+            EvidenceModule::GroupPolicyAdmx
+                | EvidenceModule::HardwareSensors
+                | EvidenceModule::FreezeIncidents
+                | EvidenceModule::EventEvidence
+        ) {
+            let latest = latest_run(&files, None);
+            let newest = latest
+                .iter()
+                .filter(|n| n.ends_with(".json"))
+                .find_map(|n| entries.iter().find(|e| e.name == *n));
+            let status = newest
+                .and_then(|e| json_field(&e.bytes, &["status"]))
+                .map(|v| json::string(&v))
+                .unwrap_or_else(|| "null".into());
+            fields.push(format!("      \"result_status\": {status}"));
+            if m == EvidenceModule::HardwareSensors {
+                let provider = newest
+                    .and_then(|e| json_field(&e.bytes, &["provider"]))
+                    .map(|v| json::string(&v))
+                    .unwrap_or_else(|| "null".into());
+                let count = newest
+                    .and_then(|e| json_number(&e.bytes, "sensor_count"))
+                    .map(|n| format!("{n}"))
+                    .unwrap_or_else(|| "null".into());
+                fields.push(format!("      \"provider\": {provider}"));
+                fields.push(format!("      \"sensor_count\": {count}"));
+            }
+            if m == EvidenceModule::EventEvidence {
+                let count = newest
+                    .and_then(|e| json_number(&e.bytes, "aggregate_count"))
+                    .map(|n| format!("{n}"))
+                    .unwrap_or_else(|| "null".into());
+                fields.push(format!("      \"aggregate_count\": {count}"));
+            }
+            if m == EvidenceModule::FreezeIncidents {
+                let count = newest
+                    .and_then(|e| json_number(&e.bytes, "incident_count"))
+                    .map(|n| format!("{n}"))
+                    .unwrap_or_else(|| "null".into());
+                fields.push(format!("      \"incident_count\": {count}"));
+            }
         }
         modules.push(format!("    {{\n{}\n    }}", fields.join(",\n")));
     }
@@ -415,6 +704,13 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
         json::string(&ctx.windows_product),
         json::string(&ctx.windows_build)
     ));
+    if let (Some(sys), Some(hw)) = (&ctx.system_state, &ctx.hardware_state) {
+        out.push_str(&format!(
+            "  \"state\": {{\n    \"system\": {},\n    \"hardware\": {},\n    \"note\": \"Two separate concepts: hardware state OK does not mean the computer is healthy.\"\n  }},\n",
+            json::string(sys),
+            json::string(hw)
+        ));
+    }
     if modules.is_empty() {
         out.push_str("  \"modules\": [],\n");
     } else {
@@ -451,6 +747,8 @@ mod tests {
             },
             windows_product: "Windows 11 Pro".into(),
             windows_build: "26200.7462".into(),
+            system_state: None,
+            hardware_state: None,
         }
     }
 
@@ -492,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn version_source_contract_0_4_3() {
+    fn version_source_contract_1_0() {
         // One canonical version: Cargo.toml → Cargo.lock → EXE metadata
         // (winresource, build.rs) → title (env!) → manifest → release
         // script/folder (read from Cargo.toml).
@@ -500,12 +798,27 @@ mod tests {
         let lock = include_str!("../Cargo.lock").replace("\r\n", "\n");
         let package = toml.split("[dependencies]").next().unwrap();
         assert!(package.contains("name = \"win_state_diag\""));
-        assert!(package.contains("\nversion = \"0.4.3\"\n"), "{package}");
-        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"0.4.3\"\n"));
-        assert_eq!(PRODUCER_VERSION, "0.4.3");
-        let main = include_str!("main.rs").replace("\r\n", "\n");
-        assert!(main.contains("pub const APP_VERSION: &str = env!(\"CARGO_PKG_VERSION\");"));
+        assert!(package.contains("\nversion = \"1.0.0\"\n"), "{package}");
+        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"1.0.0\"\n"));
+        // v1.0 policy: displayed / manifest / folder version is "1.0".
+        assert_eq!(PRODUCER_VERSION, "1.0");
+        assert_eq!(crate::APP_VERSION, "1.0");
+        let main = include_str!("lib.rs").replace("\r\n", "\n");
+        assert!(main.contains("pub const APP_VERSION: &str = env!(\"WSD_DISPLAY_VERSION\");"));
         assert!(main.contains("format!(\"WinStateDiag — v{APP_VERSION}\")"));
+        let build = include_str!("../build.rs");
+        assert!(build.contains("res.set(\"FileVersion\", &display);"));
+        assert!(build.contains("res.set(\"ProductVersion\", &display);"));
+        // The admin manifest is linked into the shipped bin only; the bin
+        // has no test harness, so `cargo test` never needs elevation.
+        assert!(build.contains("cargo:rustc-link-arg-bin=win_state_diag={arg}"));
+        assert!(build.contains("requireAdministrator"));
+        let toml_bin = toml.split("[[bin]]").nth(1).unwrap_or("");
+        assert!(toml_bin.contains("test = false"), "{toml_bin}");
+        assert!(
+            !build.contains("cargo:rustc-link-arg={"),
+            "no package-wide link args"
+        );
         let release = include_str!("../scripts/make_release.ps1");
         assert!(release.contains("Join-Path $root 'Cargo.toml'"));
         assert!(release.contains("\"WinStateDiag-v$version\""));
@@ -867,5 +1180,349 @@ mod tests {
         let m = &v.get("modules").unwrap().as_arr().unwrap()[0];
         assert_eq!(m.get("disks").unwrap().as_arr().unwrap().len(), 0);
         assert_eq!(names(m, "evidence").len(), 1, "evidence still listed");
+    }
+
+    /// v0.4.4: crash dump, Group Policy and power evidence are their own
+    /// additive modules (schema 1.0 unchanged); original dumps are listed.
+    #[test]
+    fn v044_modules_are_referenced_with_counts() {
+        let f = |n: &str, b: &str| EvidenceFile::new(n, b.as_bytes().to_vec());
+        let files = vec![
+            f(
+                "CrashDump_Dump_04.10.26_10-00_01_100326-10421-01.dmp",
+                "MDMP",
+            ),
+            f("CrashDump_Analysis_04.10.26_10-00_01.txt", "raw"),
+            f(
+                "CrashDump_Summary_04.10.26_10-00_01.json",
+                "{\"analysis_status\": \"COMPLETED\", \"confidence\": \"HIGH\"}",
+            ),
+            f(
+                "CrashDump_Summary_04.10.26_10-00_02.json",
+                "{\"analysis_status\": \"TIMED_OUT\", \"confidence\": \"CAUSE NOT DETERMINED\"}",
+            ),
+            f(
+                "GroupPolicy_ADMX_Health_04.10.26_10-01.json",
+                "{\"status\": \"NOT APPLICABLE\"}",
+            ),
+            f("GroupPolicy_ADMX_Health_04.10.26_10-01.txt", "x"),
+            f(
+                "Hardware_Sensors_04.10.26_10-02.json",
+                "{\"status\": \"PARTIAL\", \"provider\": \"nvidia-smi\", \"sensor_count\": 7}",
+            ),
+        ];
+        let v = parsed(&build(&ctx(), &files));
+        assert_eq!(s(&v, "schema_version"), "1.0");
+        let modules = v.get("modules").unwrap().as_arr().unwrap();
+        let m = |n: &str| {
+            modules
+                .iter()
+                .find(|x| s(x, "name") == n)
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        let crash = m("crash_dump_analysis");
+        assert_eq!(crash.get("dump_count"), Some(&Value::Num(1.0)));
+        assert_eq!(crash.get("analyzed_count"), Some(&Value::Num(1.0)));
+        assert_eq!(s(crash, "analysis_status"), "TIMED_OUT", "newest summary");
+        assert_eq!(crash.get("evidence").unwrap().as_arr().unwrap().len(), 4);
+        assert_eq!(
+            s(m("group_policy_admx_health"), "result_status"),
+            "NOT APPLICABLE"
+        );
+        let names = |x: &Value, k: &str| -> Vec<String> {
+            x.get(k)
+                .and_then(|a| a.as_arr())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let hs = m("hardware_sensors");
+        assert_eq!(s(hs, "result_status"), "PARTIAL");
+        assert_eq!(s(hs, "provider"), "nvidia-smi");
+        assert_eq!(hs.get("sensor_count"), Some(&Value::Num(7.0)));
+        assert_eq!(names(hs, "latest_evidence").len(), 1);
+        // Hardware_Sensors_* is not mistaken for the Hardware Report.
+        assert!(names(hs, "evidence")[0].starts_with("Hardware_Sensors_"));
+    }
+
+    // ---- v1.0 final-state / per-run references ----
+
+    fn bench(role: &str, at: &str, stability: &str, retest_of: Option<&str>) -> Vec<u8> {
+        format!(
+            "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"run_role\":\"{role}\",\"captured_at\":\"{at}\",\"retest_of\":{},\"physical_disk_index\":3,\"model\":\"Samsung SSD 9100 PRO 1TB\",\"disk\":\"PHYS#Samsung SSD 9100 PRO 1TB#S1\",\"stability\":\"{stability}\"}}",
+            retest_of.map(|r| format!("\"{r}\"")).unwrap_or_else(|| "null".into())
+        )
+        .into_bytes()
+    }
+
+    fn corr(at: &str, state: &str, bench: &[&str], health: &str) -> Vec<u8> {
+        format!(
+            "{{\"format\":\"winstatediag.storage_correlation/1\",\"physical_identity\":\"PHYS#Samsung SSD 9100 PRO 1TB#S1\",\"physical_disk_index\":3,\"model\":\"Samsung SSD 9100 PRO 1TB\",\"assessed_at\":\"{at}\",\"state\":\"{state}\",\"health_evidence\":\"{health}\",\"benchmark_evidence\":[{}]}}",
+            bench.iter().map(|b| format!("\"{b}\"")).collect::<Vec<_>>().join(",")
+        )
+        .into_bytes()
+    }
+
+    fn disk_entry<'a>(v: &'a Value, module: &str) -> &'a Value {
+        let modules = v.get("modules").unwrap().as_arr().unwrap();
+        let m = modules
+            .iter()
+            .find(|m| m.get("name").and_then(Value::as_str) == Some(module))
+            .unwrap();
+        &m.get("disks").unwrap().as_arr().unwrap()[0]
+    }
+
+    fn strs(v: &Value, k: &str) -> Vec<String> {
+        v.get(k)
+            .unwrap()
+            .as_arr()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The real MSI case: ACCEPT run, then an UNSTABLE run that collided
+    /// on the same minute (`_02`), then its automatic retest ACCEPT. The
+    /// current state is the retest — never the stale UNSTABLE `_02`.
+    #[test]
+    fn unstable_then_retest_stable_is_the_current_state_per_disk() {
+        let entries = vec![
+            EvidenceFile::new(
+                "SSD_Benchmark_05.10.26_10-57.json",
+                bench("initial", "2026-10-05T10:57:30", "ACCEPT", None),
+            ),
+            EvidenceFile::new(
+                "SSD_Benchmark_05.10.26_10-57_02.json",
+                bench("initial", "2026-10-05T10:57:36", "UNSTABLE", None),
+            ),
+            EvidenceFile::new(
+                "SSD_Benchmark_05.10.26_10-57_02_retest.json",
+                bench(
+                    "automatic_retest",
+                    "2026-10-05T10:57:47",
+                    "ACCEPT",
+                    Some("SSD_Benchmark_05.10.26_10-57_02.json"),
+                ),
+            ),
+            EvidenceFile::new("SSD_Benchmark_05.10.26_10-57_02_retest.txt", b"t".to_vec()),
+            EvidenceFile::new("SSD_Benchmark_05.10.26_10-57_02.txt", b"t".to_vec()),
+            EvidenceFile::new(
+                "Storage_Correlation_05.10.26_10-57_PD3.json",
+                corr(
+                    "2026-10-05T10:57:37",
+                    "OK",
+                    &["SSD_Benchmark_05.10.26_10-57.json"],
+                    "NVMe_Health_05.10.26_10-57_PD3.json",
+                ),
+            ),
+            EvidenceFile::new(
+                "Storage_Correlation_05.10.26_10-57_PD3_02.json",
+                corr(
+                    "2026-10-05T10:57:48",
+                    "BENCHMARK_ANOMALY_NOT_CONFIRMED",
+                    &[
+                        "SSD_Benchmark_05.10.26_10-57_02.json",
+                        "SSD_Benchmark_05.10.26_10-57_02_retest.json",
+                    ],
+                    "NVMe_Health_05.10.26_10-57_PD3_02.json",
+                ),
+            ),
+        ];
+        let v = parsed(&build(&ctx(), &entries));
+        let b = disk_entry(&v, "ssd_benchmark");
+        assert_eq!(s(b, "status"), "ACCEPT", "final confirmed state");
+        assert_eq!(
+            strs(b, "latest_evidence"),
+            vec![
+                "SSD_Benchmark_05.10.26_10-57_02_retest.json".to_string(),
+                "SSD_Benchmark_05.10.26_10-57_02_retest.txt".to_string()
+            ]
+        );
+        let seq = strs(b, "current_sequence");
+        assert!(seq.contains(&"SSD_Benchmark_05.10.26_10-57_02.json".to_string()));
+        assert!(seq.contains(&"SSD_Benchmark_05.10.26_10-57_02_retest.json".to_string()));
+        assert!(!seq.contains(&"SSD_Benchmark_05.10.26_10-57.json".to_string()));
+        // History is preserved, not presented as current.
+        assert_eq!(strs(b, "evidence").len(), 5);
+        // Correlation: newest assessment + the exact runs it was made from.
+        let c = disk_entry(&v, "storage_correlation");
+        assert_eq!(s(c, "status"), "BENCHMARK_ANOMALY_NOT_CONFIRMED");
+        assert_eq!(
+            strs(c, "latest_evidence"),
+            vec!["Storage_Correlation_05.10.26_10-57_PD3_02.json".to_string()]
+        );
+        assert_eq!(
+            strs(c, "current_benchmark_evidence"),
+            vec![
+                "SSD_Benchmark_05.10.26_10-57_02.json".to_string(),
+                "SSD_Benchmark_05.10.26_10-57_02_retest.json".to_string()
+            ]
+        );
+        assert_eq!(
+            s(c, "current_health_evidence"),
+            "NVMe_Health_05.10.26_10-57_PD3_02.json"
+        );
+    }
+
+    /// Legacy evidence (no timestamps, retest named after the first run):
+    /// the retest still sorts directly after its base, so the confirmed
+    /// sequence wins over the colliding `_02`.
+    #[test]
+    fn legacy_retest_without_timestamps_still_ends_the_sequence() {
+        let legacy = |stab: &str, role: &str| {
+            format!(
+                "{{\"run_role\":\"{role}\",\"physical_disk_index\":3,\"model\":\"M\",\"disk\":\"PHYS#M#S\",\"stability\":\"{stab}\"}}"
+            )
+            .into_bytes()
+        };
+        let entries = vec![
+            EvidenceFile::new(
+                "SSD_Benchmark_05.10.26_10-57.json",
+                legacy("ACCEPT", "initial"),
+            ),
+            EvidenceFile::new(
+                "SSD_Benchmark_05.10.26_10-57_02.json",
+                legacy("UNSTABLE", "initial"),
+            ),
+            EvidenceFile::new(
+                "SSD_Benchmark_05.10.26_10-57_retest.json",
+                legacy("ACCEPT", "automatic_retest"),
+            ),
+            EvidenceFile::new(
+                "SSD_Benchmark_05.10.26_10-58.json",
+                legacy("STABLE", "initial"),
+            ),
+        ];
+        let v = parsed(&build(&ctx(), &entries));
+        // A later initial run (10-58) is newer than everything at 10-57.
+        assert_eq!(s(disk_entry(&v, "ssd_benchmark"), "status"), "STABLE");
+        let v = parsed(&build(&ctx(), &entries[..3]));
+        assert_eq!(s(disk_entry(&v, "ssd_benchmark"), "status"), "ACCEPT");
+    }
+
+    #[test]
+    fn crash_latest_evidence_is_the_complete_set_of_the_newest_crash() {
+        let summary = |status: &str| {
+            format!("{{\"analysis_status\":\"{status}\",\"confidence\":\"MEDIUM\"}}").into_bytes()
+        };
+        let entries = vec![
+            EvidenceFile::new("CrashDump_Analysis_06.10.26_11-00_01.txt", b"a".to_vec()),
+            EvidenceFile::new(
+                "CrashDump_Summary_06.10.26_11-00_01.json",
+                summary("COMPLETED"),
+            ),
+            EvidenceFile::new(
+                "CrashDump_Dump_06.10.26_11-00_01_100326-9500-01.dmp",
+                b"d".to_vec(),
+            ),
+            EvidenceFile::new("CrashDump_Analysis_06.10.26_11-00_02.txt", b"a".to_vec()),
+            EvidenceFile::new(
+                "CrashDump_Summary_06.10.26_11-00_02.json",
+                summary("COMPLETED"),
+            ),
+            EvidenceFile::new(
+                "CrashDump_Dump_06.10.26_11-00_02_092926-1234-01.dmp",
+                b"d".to_vec(),
+            ),
+            EvidenceFile::new("CrashDump_Analysis_05.10.26_09-00_01.txt", b"a".to_vec()),
+        ];
+        let v = parsed(&build(&ctx(), &entries));
+        let modules = v.get("modules").unwrap().as_arr().unwrap();
+        let m = modules
+            .iter()
+            .find(|m| m.get("name").and_then(Value::as_str) == Some("crash_dump_analysis"))
+            .unwrap();
+        let latest = strs(m, "latest_evidence");
+        assert_eq!(latest.len(), 3, "{latest:?}");
+        assert!(latest.iter().any(|n| n.ends_with("100326-9500-01.dmp")));
+        assert!(
+            latest
+                .iter()
+                .any(|n| n == "CrashDump_Analysis_06.10.26_11-00_01.txt")
+        );
+        assert!(
+            latest
+                .iter()
+                .any(|n| n == "CrashDump_Summary_06.10.26_11-00_01.json")
+        );
+    }
+
+    #[test]
+    fn hardware_and_system_states_are_separate_in_the_manifest() {
+        let mut c = ctx();
+        c.system_state = Some("ATTENTION_BSOD".into());
+        c.hardware_state = Some("OK".into());
+        let v = parsed(&build(&c, &entries()));
+        let st = v.get("state").unwrap();
+        assert_eq!(s(st, "system"), "ATTENTION_BSOD");
+        assert_eq!(s(st, "hardware"), "OK");
+        assert!(s(st, "note").contains("does not mean the computer is healthy"));
+        // Without states the field is simply absent (backward compatible).
+        assert!(parsed(&build(&ctx(), &entries())).get("state").is_none());
+    }
+
+    #[test]
+    fn event_evidence_is_a_manifest_module_with_its_count() {
+        let mut e = entries();
+        e.push(EvidenceFile::new(
+            "Event_Evidence_06.10.26_11-00.json",
+            b"{\"status\":\"COLLECTED\",\"aggregate_count\":12}".to_vec(),
+        ));
+        let v = parsed(&build(&ctx(), &e));
+        let modules = v.get("modules").unwrap().as_arr().unwrap();
+        let m = modules
+            .iter()
+            .find(|m| m.get("name").and_then(Value::as_str) == Some("event_evidence"))
+            .expect("event_evidence module");
+        assert_eq!(s(m, "result_status"), "COLLECTED");
+        assert!(matches!(m.get("aggregate_count"), Some(Value::Num(n)) if *n == 12.0));
+    }
+
+    /// v1.0 item 13 / 49: ATA SMART collected → the manifest NEVER says
+    /// UNSUPPORTED for that disk; the correlation keeps its storage state.
+    #[test]
+    fn ata_smart_present_is_never_manifest_unsupported() {
+        use crate::storage_health::tests::{ata, sata_health};
+        let h = sata_health(ata(&[(5, 100, 10, 0), (194, 70, 0, 33)]));
+        assert_eq!(h.status.as_str(), "UNSUPPORTED", "NVMe log status alone");
+        let inputs = crate::storage_health::StorageHealthInputs {
+            physical_identity: h.physical_identity.clone(),
+            disk_index: Some(1),
+            benchmark: None,
+            retest: crate::storage_health::RetestOutcome::NotNeeded,
+            nvme: Some(h.clone()),
+            events: crate::storage_health::EventsInput::Collected(Vec::new()),
+            assessed_at: "2026-10-09T10:00:00".into(),
+        };
+        let c = crate::storage_health::classify(&inputs);
+        let files = vec![
+            EvidenceFile::new(
+                "NVMe_Health_09.10.26_10-00_PD1.json",
+                crate::nvme_health::to_json(&h).into_bytes(),
+            ),
+            EvidenceFile::new(
+                "Storage_Correlation_09.10.26_10-00_PD1.json",
+                crate::storage_health::to_json(
+                    &inputs,
+                    &c,
+                    "Patriot P210 512GB",
+                    Some("NVMe_Health_09.10.26_10-00_PD1.json"),
+                    &[],
+                )
+                .into_bytes(),
+            ),
+        ];
+        let v = parsed(&build(&ctx(), &files));
+        let modules = v.get("modules").unwrap().as_arr().unwrap();
+        let disk_status = |name: &str| {
+            let m = modules.iter().find(|m| s(m, "name") == name).unwrap();
+            s(&m.get("disks").unwrap().as_arr().unwrap()[0], "status").to_string()
+        };
+        assert_eq!(disk_status("nvme_health"), "OK");
+        assert_eq!(disk_status("storage_correlation"), "OK");
     }
 }

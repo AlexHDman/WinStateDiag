@@ -897,11 +897,19 @@ function Test-ServiceSignificantSystemEvent {
         return $false
     }
 
-    if ($provider -match 'WHEA|Disk|Ntfs|storahci|stornvme|storsvc|volmgr|volsnap|partmgr|spaceport|Kernel-Power|BugCheck') {
+    # v1.0 event identity: an Event ID alone never identifies an event.
+    # Hyper-V-Hypervisor 41 (hypervisor launch failed) is NOT Kernel-Power 41.
+    if (Test-HypervisorLaunchEvent -Event $Event) { return $false }
+
+    if ($provider -match 'WHEA|Disk|Ntfs|storahci|stornvme|storsvc|volmgr|volsnap|partmgr|spaceport|BugCheck') {
         return $true
     }
+    if ($provider -eq 'Microsoft-Windows-Kernel-Power' -and $id -eq 41) { return $true }
+    if ($provider -eq 'EventLog' -and $id -eq 6008) { return $true }
 
-    if ($id -in @(7,11,15,41,51,55,57,98,129,140,153,154,157,161,6008)) {
+    # Classic storage Event IDs count only from storage-family providers.
+    if ($id -in @(7,11,15,51,55,57,98,129,140,153,154,157,161) -and
+        $provider -match '(?i)^(disk|ntfs|atapi|iaStor\w*|stor\w*|nvme\w*|volmgr|partmgr|spaceport|cdrom|sbp2port|amdsata|amdxata|mpio|msdsm)$') {
         return $true
     }
 
@@ -910,6 +918,154 @@ function Test-ServiceSignificantSystemEvent {
     }
 
     return $false
+}
+
+# v1.0: Microsoft-Windows-Hyper-V-Hypervisor Event 41 = hypervisor launch
+# failed (VMX / virtualization unavailable or disabled). Never Kernel-Power.
+function Get-DismRepairIntelligence {
+    # v1.0 items 36/37: DISM Repair Intelligence. Separates the CURRENT
+    # ScanHealth verdict from HISTORICAL dism.log / CBS.log evidence
+    # (lines written before this run). Read-only: nothing is repaired.
+    #   CLEAN                - current OK, no historical corruption;
+    #   HISTORICAL_REPAIRED  - current OK, corruption was found and repaired
+    #                          earlier (context, INFO);
+    #   HISTORICAL_ONLY      - current OK, old corruption lines without a
+    #                          recorded repair (context, INFO);
+    #   CURRENT_CORRUPTION   - current run reports corruption (ATTENTION /
+    #                          ERROR when not repairable);
+    #   RECURRENT_CORRUPTION - current corruption AFTER an earlier
+    #                          successful repair (ATTENTION, check storage /
+    #                          RAM before repeating repairs);
+    #   UNKNOWN              - current result not recognised.
+    param([string]$CurrentText = '', [string[]]$HistoryLines = @())
+    $corruptRx = '(?i)component store is repairable|component store cannot be repaired|corruption detected|CSI Corrupt|STATUS_SXS_COMPONENT_STORE_CORRUPT|0x80073712'
+    $repairRx = '(?i)restore operation completed successfully|Repair complete|corruption repaired|repaired successfully'
+    $dateOf = { param($l) if ([string]$l -match '^(\d{4}-\d{2}-\d{2})') { $Matches[1] } else { $null } }
+    $histCorrupt = @($HistoryLines | Where-Object { $_ -match $corruptRx -and $_ -notmatch '(?i)No component store corruption' })
+    $histRepair = @($HistoryLines | Where-Object { $_ -match $repairRx })
+    $current = if ($CurrentText -match 'component store cannot be repaired') { 'NOT_REPAIRABLE' }
+        elseif ($CurrentText -match 'component store is repairable') { 'REPAIRABLE' }
+        elseif ($CurrentText -match 'No component store corruption detected') { 'CLEAN' }
+        else { 'UNKNOWN' }
+    $lastCorrupt = if ($histCorrupt.Count) { & $dateOf $histCorrupt[-1] } else { $null }
+    $lastRepair = if ($histRepair.Count) { & $dateOf $histRepair[-1] } else { $null }
+    $evidence = @(@($histCorrupt | Select-Object -Last 3) + @($histRepair | Select-Object -Last 3))
+    $when = { param($d) if ($d) { $d } else { 'дата не указана' } }
+    switch ($current) {
+        'CLEAN' {
+            if ($histRepair.Count -and $histCorrupt.Count) {
+                $verdict = 'HISTORICAL_REPAIRED'; $status = 'INFO'
+                $detail = 'Сейчас повреждений хранилища компонентов нет. В журналах есть прошлое повреждение ({0}), восстановленное {1} — историческая запись, не текущая проблема.' -f (& $when $lastCorrupt), (& $when $lastRepair)
+            } elseif ($histCorrupt.Count) {
+                $verdict = 'HISTORICAL_ONLY'; $status = 'INFO'
+                $detail = 'Сейчас повреждений хранилища компонентов нет. В старых строках журналов есть записи о повреждении ({0}) — исторический контекст.' -f (& $when $lastCorrupt)
+            } else {
+                $verdict = 'CLEAN'; $status = 'OK'
+                $detail = 'Повреждение хранилища компонентов не обнаружено.'
+            }
+        }
+        { $_ -in 'REPAIRABLE','NOT_REPAIRABLE' } {
+            $status = if ($current -eq 'NOT_REPAIRABLE') { 'ERROR' } else { 'ATTENTION' }
+            $what = if ($current -eq 'NOT_REPAIRABLE') { 'повреждено и не может быть восстановлено обычным способом' } else { 'повреждено, но подлежит восстановлению' }
+            if ($histRepair.Count) {
+                $verdict = 'RECURRENT_CORRUPTION'
+                $detail = 'ПОВТОРНОЕ ПОВРЕЖДЕНИЕ: хранилище компонентов {0}, хотя ранее уже восстанавливалось ({1}). Перед повторным восстановлением проверьте накопитель и память. Автоматическое восстановление не выполнялось.' -f $what, (& $when $lastRepair)
+            } else {
+                $verdict = 'CURRENT_CORRUPTION'
+                $detail = 'DISM сообщает: хранилище компонентов {0}. Восстановление выполняется только вручную (DISM /RestoreHealth); автоматически ничего не менялось.' -f $what
+            }
+        }
+        default {
+            $verdict = 'UNKNOWN'; $status = 'UNKNOWN'
+            $detail = 'Итоговая строка DISM не распознана; требуется инженерная проверка вывода.'
+        }
+    }
+    [PSCustomObject]@{ Verdict = $verdict; Status = $status; Current = $current; Detail = $detail; LastCorruption = $lastCorrupt; LastRepair = $lastRepair; Evidence = $evidence }
+}
+
+function Get-BuildUpdateConsistency {
+    param([object[]]$Hotfixes = @(), [string]$Build = '', [int]$Ubr = -1)
+    if (-not $Build) {
+        try {
+            $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+            $Build = [string]$cv.CurrentBuild
+            $Ubr = [int]$cv.UBR
+        } catch { }
+    }
+    $full = if ($Build -and $Ubr -ge 0) { '{0}.{1}' -f $Build, $Ubr } elseif ($Build) { $Build } else { 'неизвестна' }
+    $latest = @($Hotfixes | Where-Object { $_.HotFixID } | Select-Object -First 1)
+    if ($latest.Count -eq 0) {
+        $detail = 'Сборка {0}; список Get-HotFix пуст или недоступен — номер сборки является источником истины.' -f $full
+        return [PSCustomObject]@{ Build = $full; LatestKb = $null; LatestDate = $null; Detail = $detail }
+    }
+    $kb = [string]$latest[0].HotFixID
+    $date = $null
+    if ($latest[0].InstalledOn -is [datetime]) { $date = $latest[0].InstalledOn }
+    else { $tmp = [datetime]::MinValue; if ([datetime]::TryParse([string]$latest[0].InstalledOn, [ref]$tmp)) { $date = $tmp } }
+    $dateText = if ($date) { $date.ToString('yyyy-MM-dd') } else { 'дата не указана' }
+    $detail = 'Сборка {0}; последнее обновление в списке Get-HotFix: {1} ({2}). Get-HotFix показывает не все накопительные обновления — расхождение списка и номера сборки не является ошибкой.' -f $full, $kb, $dateText
+    return [PSCustomObject]@{ Build = $full; LatestKb = $kb; LatestDate = $dateText; Detail = $detail }
+}
+
+function Test-HypervisorLaunchEvent {
+    param($Event)
+    if ($null -eq $Event) { return $false }
+    return ([string]$Event.ProviderName -match '(?i)^Microsoft-Windows-Hyper-V-Hypervisor$')
+}
+
+# v1.0 SCM service identity: 7009 / 7011 carry the timeout in param1 and the
+# service in param2; the other SCM failure events name the service in param1.
+function Get-ScmServiceName {
+    param($Event)
+    $data = @()
+    try { $data = @(([xml]$Event.ToXml()).Event.EventData.Data) } catch {}
+    $values = @(foreach ($d in $data) { if ($d -is [string]) { $d } else { [string]$d.'#text' } })
+    $id = [int]$Event.Id
+    $name = ''
+    if ($id -in @(7009,7011)) { if ($values.Count -ge 2) { $name = $values[1] } }
+    elseif ($values.Count -ge 1) { $name = $values[0] }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $m = [regex]::Match([string]$Event.Message, '(?i)(?:service|службы|служба)\s+"?([^".]+?)"?\s+(?:service|failed|terminated|не|завершилась)')
+        if ($m.Success) { $name = $m.Groups[1].Value.Trim() }
+    }
+    return $name
+}
+
+# v1.0 actionable software / service groups of the System log: Level 1/2
+# events that are not hardware-critical, grouped by identity (SCM service,
+# otherwise Provider + Event ID). A group is actionable when it recurs.
+function Get-SoftwareServiceGroups {
+    param($Events)
+    $rows = @(
+        foreach ($e in @($Events)) {
+            $provider = [string]$e.ProviderName
+            $identity = if ($provider -eq 'Service Control Manager') { Get-ScmServiceName -Event $e } else { '' }
+            [PSCustomObject]@{
+                Key = ('{0}|{1}|{2}' -f $provider, [int]$e.Id, $identity)
+                Provider = $provider; Id = [int]$e.Id; Identity = $identity; Time = $e.TimeCreated
+                Message = $e.Message
+            }
+        }
+    )
+    @(
+        foreach ($g in @($rows | Group-Object Key | Sort-Object Count -Descending)) {
+            $sorted = @($g.Group | Sort-Object Time)
+            [PSCustomObject]@{
+                Count = $g.Count; Provider = $sorted[0].Provider; EventID = $sorted[0].Id
+                Identity = $sorted[0].Identity
+                First = $sorted[0].Time; Last = $sorted[-1].Time
+                Example = Short-Message $sorted[-1].Message 600
+            }
+        }
+    )
+}
+
+function Format-SoftwareGroupLabel {
+    param($Group)
+    if (-not [string]::IsNullOrWhiteSpace([string]$Group.Identity)) {
+        return ('{0} ({1} {2}) ×{3}' -f $Group.Identity, $Group.Provider, $Group.EventID, $Group.Count)
+    }
+    return ('{0} {1} ×{2}' -f $Group.Provider, $Group.EventID, $Group.Count)
 }
 
 function Get-ApplicationEventCategory {
@@ -1255,6 +1411,18 @@ function Get-VssVolumeText {
         return $VolumeMap[$key]
     }
     return $raw
+}
+
+# v0.4.4: VSS classification. High Shadow Storage utilization alone is
+# INFO; ATTENTION needs a real operational failure (Volsnap 25/33/35/36,
+# VSS 8193/12289) — recent failures on their own, or any failure together
+# with a near-limit storage area.
+function Get-VssClassification {
+    param([int]$NearLimitCount, [int]$RecentFailureCount, [int]$OlderFailureCount)
+    if ($RecentFailureCount -gt 0) { return 'ATTENTION' }
+    if ($NearLimitCount -gt 0 -and $OlderFailureCount -gt 0) { return 'ATTENTION' }
+    if ($NearLimitCount -gt 0 -or $OlderFailureCount -gt 0) { return 'INFO' }
+    return 'OK'
 }
 
 function Get-VssShadowStorageInfo {
@@ -1665,18 +1833,26 @@ $continue = Invoke-Step -Number 1 -Title 'Сведения о системе, ж
     if ($pending.OnlyPrintRdpContext) {
         $detail = "PFRO относится к Print Spooler/V4Dirs при активной RDP-печати; обычная системная перезагрузка не подтверждена как необходимая."
         Set-CheckStatus -Key 'System / Pending reboot' -Status 'INFO' -Detail $detail
-    } elseif ($pending.Pending) {
+    } elseif ($pending.CBSRebootPending -or $pending.WindowsUpdateRebootRequired) {
         Write-Log ("Reasons: {0}" -f $pending.Reasons)
-        Add-Attention ("Есть признаки ожидающей перезагрузки: {0}" -f $pending.Reasons)
+        Add-Attention ("Есть признаки ожидающей перезагрузки обслуживания Windows: {0}" -f $pending.Reasons)
         Set-CheckStatus -Key 'System / Pending reboot' -Status 'ATTENTION' -Detail $pending.Reasons
+    } elseif ($pending.PendingFileRenameCount -gt 0) {
+        # v1.0: PendingFileRenameOperations alone (CBS = False, WU = False) is
+        # software-update cleanup, not a servicing reboot.
+        $names = @($pending.PendingFileRenamePairs | Select-Object -First 3 | ForEach-Object { ([string]$_.Source).Split('\')[-1] })
+        $detail = "Ожидается очистка/переименование файлов после обновления ПО ({0}: {1}); CBS и Windows Update перезагрузку не требуют. Перезагрузка рекомендуется." -f $pending.PendingFileRenameCount, ($names -join ', ')
+        Write-Log ("Reasons: {0}" -f $pending.Reasons)
+        Set-CheckStatus -Key 'System / Pending reboot' -Status 'INFO' -Detail $detail
     } else {
         Set-CheckStatus -Key 'System / Pending reboot' -Status 'OK' -Detail 'Ожидающая перезагрузка не обнаружена.'
     }
 
     Write-Log ''
     Write-Log 'Последние установленные обновления:'
+    $hotfixes = @()
     try {
-        Write-ObjectLog (
+        $hotfixes = @(
             Get-HotFix |
             ForEach-Object {
                 # Get-HotFix may expose InstalledOn as a throwing script property.
@@ -1699,10 +1875,17 @@ $continue = Invoke-Step -Number 1 -Title 'Сведения о системе, ж
                 }
             } -Descending |
             Select-Object -First 12 HotFixID, Description, InstalledOn
-        ) -Format Table
+        )
+        Write-ObjectLog $hotfixes -Format Table
     } catch {
         Write-Log ("Get-HotFix недоступен: {0}" -f $_.Exception.Message)
     }
+    # v1.0 item 35: build vs KB list consistency is CONTEXT (INFO). Get-HotFix
+    # (Win32_QuickFixEngineering) does not list every cumulative / servicing
+    # stack update, so a list that looks older than the build is not an error.
+    $buildInfo = Get-BuildUpdateConsistency -Hotfixes $hotfixes
+    Write-Log ("Сборка/обновления: {0}" -f $buildInfo.Detail)
+    Set-CheckStatus -Key 'System / Build and updates' -Status 'INFO' -Detail $buildInfo.Detail
 }
 if (-not $continue) { break Diagnostics }
 
@@ -1857,6 +2040,10 @@ $continue = Invoke-Step -Number 4 -Title 'Критические и ошибоч
     $events = @(Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2; StartTime=$start } -ErrorAction SilentlyContinue)
     $smartCard = @($events | Where-Object { Test-SmartCardPeripheralEvent $_ })
     $significant = @($events | Where-Object { (Test-ServiceSignificantSystemEvent $_) -and -not (Test-SmartCardPeripheralEvent $_) })
+    $hypervisor = @($events | Where-Object { Test-HypervisorLaunchEvent $_ })
+    $software = @($events | Where-Object { -not (Test-ServiceSignificantSystemEvent $_) -and -not (Test-SmartCardPeripheralEvent $_) -and -not (Test-HypervisorLaunchEvent $_) })
+    $softwareGroups = @(Get-SoftwareServiceGroups -Events $software)
+    $recurring = @($softwareGroups | Where-Object { $_.Count -ge 3 })
 
     Write-Log ("Всего Critical/Error: {0}" -f $events.Count)
     Write-Log ("Сервисно-значимых системных по фильтру EXPC: {0}" -f $significant.Count)
@@ -1910,9 +2097,25 @@ $continue = Invoke-Step -Number 4 -Title 'Критические и ошибоч
         $msg = "Сервисно-значимые System-события за 14 дней: {0}" -f $significant.Count
         Add-Attention $msg
         Set-CheckStatus -Key 'System event log' -Status 'ATTENTION' -Detail $msg
+    } elseif ($recurring.Count -gt 0) {
+        Write-Log 'Аппаратно-критических System-событий по фильтру не обнаружено.'
+        $top = (@($recurring | Select-Object -First 3) | ForEach-Object { Format-SoftwareGroupLabel $_ }) -join '; '
+        $detail = "Повторяющиеся ошибки ПО/служб: {0} групп ({1}); аппаратно-критических событий не обнаружено." -f $recurring.Count, $top
+        Set-CheckStatus -Key 'System event log' -Status 'INFO' -Detail $detail
     } else {
         Write-Log 'Сервисно-значимых аппаратных/дисковых/аварийных System-событий по фильтру не обнаружено.'
         Set-CheckStatus -Key 'System event log' -Status 'OK' -Detail 'Значимых аппаратных/дисковых/аварийных событий по фильтру не обнаружено.'
+    }
+
+    if ($softwareGroups.Count -gt 0) {
+        Write-Log ''
+        Write-Log ('Ошибки ПО/служб (сгруппировано по службе / Provider + Event ID): групп {0}, повторяющихся (>=3): {1}' -f $softwareGroups.Count, $recurring.Count)
+        Write-ObjectLog ($softwareGroups | Select-Object -First 15 Count, Provider, EventID, Identity, First, Last, Example) -Format Table
+    }
+    if ($hypervisor.Count -gt 0) {
+        Write-Log ''
+        Write-Log ('Microsoft-Windows-Hyper-V-Hypervisor Event 41 (запуск гипервизора не выполнен; виртуализация недоступна или отключена) — НЕ Kernel-Power: {0}' -f $hypervisor.Count)
+        Set-CheckStatus -Key 'Hypervisor' -Status 'INFO' -Detail ('Hyper-V-Hypervisor 41: запуск гипервизора не выполнен ({0}×); это не неожиданное выключение.' -f $hypervisor.Count)
     }
 }
 if (-not $continue) { break Diagnostics }
@@ -1930,12 +2133,45 @@ $continue = Invoke-Step -Number 5 -Title 'VSS Shadow Storage и события V
         Write-Log 'Текущее состояние Shadow Storage:'
         Write-ObjectLog $vss.Rows -Format Table
 
-        if ($vss.NearLimitCount -gt 0) {
-            $msg = "VSS Shadow Storage близко к установленному максимуму: областей с использованием >= 85% — {0}." -f $vss.NearLimitCount
-            Add-Attention $msg
-            Set-CheckStatus -Key 'VSS Shadow Storage' -Status 'ATTENTION' -Detail $msg
-        } else {
-            Set-CheckStatus -Key 'VSS Shadow Storage' -Status 'OK' -Detail 'Областей Shadow Storage с использованием >= 85% лимита не обнаружено.'
+    }
+
+    # Real VSS operational failures (30 days): Volsnap 25/33/35/36 in System,
+    # VSS 8193/12289 in Application. Recent = last 7 days.
+    # v1.0: Volsnap 33 (oldest shadow copy removed by quota) and VSS 8224
+    # (idle shutdown) are normal activity, never failures.
+    $vssFailures = @()
+    try {
+        $vssFailures += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='volsnap'; Id=25,35,36; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)
+    } catch {}
+    $vssQuota = @()
+    try {
+        $vssQuota = @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='volsnap'; Id=33; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)
+    } catch {}
+    if ($vssQuota.Count -gt 0) {
+        Write-Log ('Volsnap 33 (удаление старой теневой копии по квоте — штатная активность, не сбой): {0}' -f $vssQuota.Count)
+    }
+    try {
+        $vssFailures += @(Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='VSS'; Id=8193,12289; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)
+    } catch {}
+    $recentCut = (Get-Date).AddDays(-7)
+    $recentFailures = @($vssFailures | Where-Object { $_.TimeCreated -ge $recentCut }).Count
+    $olderFailures = @($vssFailures).Count - $recentFailures
+    if ($vss.Success -and @($vss.Rows).Count -gt 0) {
+        $near = [int]$vss.NearLimitCount
+        $vssStatus = Get-VssClassification -NearLimitCount $near -RecentFailureCount $recentFailures -OlderFailureCount $olderFailures
+        $detail = "Областей Shadow Storage >= 85% лимита: {0}; сбоев VSS/Volsnap за 7 дней: {1}, за 8-30 дней: {2}." -f $near, $recentFailures, $olderFailures
+        switch ($vssStatus) {
+            'ATTENTION' {
+                $msg = "VSS: подтверждённые сбои теневого копирования. $detail"
+                Add-Attention $msg
+                Set-CheckStatus -Key 'VSS Shadow Storage' -Status 'ATTENTION' -Detail $msg
+            }
+            'INFO' {
+                Set-CheckStatus -Key 'VSS Shadow Storage' -Status 'INFO' -Detail ("Высокое заполнение или давние события без текущих сбоев — информация. $detail")
+            }
+            default {
+                Set-CheckStatus -Key 'VSS Shadow Storage' -Status 'OK' -Detail $detail
+            }
         }
     }
 
@@ -2151,8 +2387,14 @@ $continue = Invoke-Step -Number 7 -Title 'Неожиданные выключе�
         } -ErrorAction SilentlyContinue
     )
 
-    $kp41 = @($ev | Where-Object { $_.Id -eq 41 })
-    $ev6008 = @($ev | Where-Object { $_.Id -eq 6008 })
+    # v1.0 event identity: Kernel-Power 41 = provider AND id. Hyper-V-
+    # Hypervisor 41 (launch failed) is a separate, non-crash event.
+    $kp41 = @($ev | Where-Object { $_.Id -eq 41 -and [string]$_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' })
+    $hv41 = @($ev | Where-Object { $_.Id -eq 41 -and (Test-HypervisorLaunchEvent $_) })
+    $ev6008 = @($ev | Where-Object { $_.Id -eq 6008 -and [string]$_.ProviderName -eq 'EventLog' })
+    if ($hv41.Count -gt 0) {
+        Write-Log ('Hyper-V-Hypervisor Event 41 (не Kernel-Power, не выключение): {0}' -f $hv41.Count)
+    }
     $bugchecks = @(
         $ev | Where-Object {
             $_.Id -eq 1001 -and
@@ -2331,7 +2573,18 @@ $continue = Invoke-Step -Number 8 -Title 'Ошибки приложений за
     }
 
     if ($crashEvents.Count -gt 0) {
-        $msg = "Crash/Hang/.NET/WER за 14 дней: {0}; уникальных групп: {1}." -f $crashEvents.Count, $crashGroups.Count
+        # v1.0: name the process, exception and count instead of a bare total.
+        $named = @(
+            foreach ($g in @($crashGroups | Select-Object -First 3)) {
+                $parts = ([string]$g.Name).Split('|')
+                $appName = if ($parts.Count -ge 4) { $parts[3] } else { '-' }
+                $exc = if ($parts.Count -ge 6) { $parts[5] } else { '-' }
+                $label = '{0} — {1}×' -f $appName, $g.Count
+                if ($exc -and $exc -ne '-') { $label += (' · Exception {0}' -f $exc) }
+                $label
+            }
+        )
+        $msg = "Crash/Hang/.NET/WER за 14 дней: {0}; уникальных групп: {1}: {2}." -f $crashEvents.Count, $crashGroups.Count, ($named -join '; ')
         Add-Attention $msg
         Set-CheckStatus -Key 'Applications' -Status 'ATTENTION' -Detail $msg
     } elseif ($componentEvents.Count -gt 0) {
@@ -2573,6 +2826,15 @@ $continue = Invoke-Step `
 
     $dismLog = Join-Path $env:windir 'Logs\DISM\dism.log'
     $dismOffset = Get-FileLengthSafe -Path $dismLog
+    # v1.0: historical evidence = the last 8 MB of dism.log / CBS.log written
+    # BEFORE this run (read-only; the current run is scoped separately).
+    $historyLines = @()
+    foreach ($hl in @($dismLog, (Join-Path $env:windir 'Logs\CBS\CBS.log'))) {
+        if (Test-Path -LiteralPath $hl) {
+            $len = Get-FileLengthSafe -Path $hl
+            $historyLines += @((Read-TextFileAuto -Path $hl -Offset ([math]::Max(0, $len - 8MB))) -split '\r?\n')
+        }
+    }
 
     Write-Log 'Команда: DISM.exe /Online /Cleanup-Image /ScanHealth /NoRestart /English'
     Write-Log 'Прогресс показывался оператору и намеренно не записан в TXT.'
@@ -2606,36 +2868,21 @@ $continue = Invoke-Step `
         Write-Log ($meaningful -join [Environment]::NewLine)
     }
 
-    if ($text -match 'component store cannot be repaired') {
-        $detail = 'DISM сообщает: хранилище компонентов не может быть восстановлено обычным способом.'
-        Write-Log ("Result: ERROR — {0}" -f $detail)
-        Add-Attention $detail
-        Set-CheckStatus -Key 'DISM' -Status 'ERROR' -Detail $detail
-        Write-DiagResult -Status 'ERROR' -Message $detail
-    } elseif ($text -match 'component store is repairable') {
-        $detail = 'DISM сообщает: хранилище компонентов повреждено, но подлежит восстановлению.'
-        Write-Log ("Result: ATTENTION — {0}" -f $detail)
-        Add-Attention $detail
-        Set-CheckStatus -Key 'DISM' -Status 'ATTENTION' -Detail $detail
-        Write-DiagResult -Status 'ATTENTION' -Message $detail
-    } elseif ($text -match 'No component store corruption detected') {
-        $detail = 'Повреждение хранилища компонентов не обнаружено.'
-        Write-Log ("Result: OK — {0}" -f $detail)
-        Set-CheckStatus -Key 'DISM' -Status 'OK' -Detail $detail
-        Write-DiagResult -Status 'OK' -Message $detail
-    } elseif ($r.ExitCodeKnown -and $r.ExitCode -ne 0) {
-        $detail = "DISM /ScanHealth завершился с ExitCode {0}; итоговая строка не распознана." -f $r.ExitCode
-        Write-Log ("Result: ERROR — {0}" -f $detail)
-        Add-Attention $detail
-        Set-CheckStatus -Key 'DISM' -Status 'ERROR' -Detail $detail
-        Write-DiagResult -Status 'ERROR' -Message $detail
-    } else {
-        $detail = 'Итоговая строка DISM не распознана; требуется инженерная проверка вывода.'
-        Write-Log ("Result: UNKNOWN — {0}" -f $detail)
-        Add-Attention $detail
-        Set-CheckStatus -Key 'DISM' -Status 'UNKNOWN' -Detail $detail
-        Write-DiagResult -Status 'ATTENTION' -Message $detail
+    $intel = Get-DismRepairIntelligence -CurrentText $text -HistoryLines $historyLines
+    if ($intel.Verdict -eq 'UNKNOWN' -and $r.ExitCodeKnown -and $r.ExitCode -ne 0) {
+        $intel.Status = 'ERROR'
+        $intel.Detail = "DISM /ScanHealth завершился с ExitCode {0}; итоговая строка не распознана." -f $r.ExitCode
     }
+    Write-Log ("DISM Repair Intelligence: {0} (current: {1}; last historical corruption: {2}; last repair: {3})" -f $intel.Verdict, $intel.Current, $intel.LastCorruption, $intel.LastRepair)
+    if (@($intel.Evidence).Count -gt 0) {
+        Write-Log 'Исторические строки CBS/DISM (до текущего запуска):'
+        Write-Log (@($intel.Evidence) -join [Environment]::NewLine)
+    }
+    Write-Log ("Result: {0} — {1}" -f $intel.Status, $intel.Detail)
+    if ($intel.Status -in 'ATTENTION','ERROR','UNKNOWN') { Add-Attention $intel.Detail }
+    Set-CheckStatus -Key 'DISM' -Status $intel.Status -Detail $intel.Detail
+    $diagStatus = switch ($intel.Status) { 'OK' { 'OK' } 'INFO' { 'INFO' } 'ERROR' { 'ERROR' } default { 'ATTENTION' } }
+    Write-DiagResult -Status $diagStatus -Message $intel.Detail
 
     if (Test-Path -LiteralPath $dismLog) {
         $newDismLog = Read-TextFileAuto -Path $dismLog -Offset $dismOffset
@@ -2700,11 +2947,24 @@ $continue = Invoke-Step `
         $text -match 'Windows has scanned the file system and found no problems|не обнаружила проблем|не обнаружено проблем'
     )
 
-    $problem = (
-        $text -match 'found problems|found errors|Windows has made corrections|обнаружила неполадки|обнаружены ошибки|внесла исправления'
+    # v1.0: problems found AND repaired online are never plain OK
+    # (execution completed != diagnostic finding). Checked before the
+    # generic problem markers; "не обнаружила проблем" never matches here.
+    $repaired = (
+        $text -match 'fixed online|found problems and fixed them|has made corrections|made corrections to the file system|исправлены в оперативном режиме|были исправлены|внесла исправления|исправила проблемы'
     )
 
-    if ($problem) {
+    $problem = (
+        $text -match 'must be fixed offline|will not fix|spotfix|found problems|found errors|обнаружила неполадки|обнаружены ошибки|найдены ошибки|в автономном режиме|не будут исправлены|обнаружила проблемы'
+    )
+
+    if ($repaired) {
+        $detail = 'ИСПРАВЛЕНО: CHKDSK обнаружил проблемы файловой системы и исправил их в оперативном режиме (FindingClass=REPAIRED).'
+        Write-Log ("Result: ATTENTION — {0}" -f $detail)
+        Add-Attention $detail
+        Set-CheckStatus -Key 'CHKDSK' -Status 'ATTENTION' -Detail $detail
+        Write-DiagResult -Status 'ATTENTION' -Message $detail
+    } elseif ($problem) {
         $detail = 'CHKDSK сообщил о проблемах/исправлениях файловой системы.'
         Write-Log ("Result: ATTENTION — {0}" -f $detail)
         Add-Attention $detail
@@ -2755,6 +3015,8 @@ $continue = Invoke-Step -Number 14 -Title 'BIOS, основные драйвер
         try {
             $d = [datetime]$DateValue
             if ($d.Year -lt 2009) { return $null }
+            # May be negative for a future (anomalous) date; callers never
+            # display a negative age (DATE ANOMALY instead).
             return [int][math]::Floor(($now - $d).TotalDays / 30.4375)
         } catch {
             return $null
@@ -2777,12 +3039,14 @@ $continue = Invoke-Step -Number 14 -Title 'BIOS, основные драйвер
             return 'CHECK'
         }
 
-        if ($age -ge 36) {
-            return 'REVIEW OLD'
+        # v0.4.4: a future date is a metadata anomaly (INFO), and age alone is
+        # informational evidence only — never REVIEW/WARNING.
+        if ($age -lt 0) {
+            return 'DATE ANOMALY'
         }
 
         if ($age -ge 24) {
-            return 'CHECK'
+            return 'AGE INFO'
         }
 
         return 'NO AGE FLAG'
@@ -2822,7 +3086,7 @@ $continue = Invoke-Step -Number 14 -Title 'BIOS, основные драйвер
                 Version   = [string]$d.DriverVersion
                 Date_FW   = $dateText
                 Provider  = [string]$d.DriverProviderName
-                AgeMonths = $(if ($null -eq $age) { '' } else { $age })
+                AgeMonths = $(if ($null -eq $age -or $age -lt 0) { '' } else { $age })
                 Update    = $review
             })
         }
@@ -2865,7 +3129,10 @@ $continue = Invoke-Step -Number 14 -Title 'BIOS, основные драйвер
 
         $biosAge = Get-AgeMonthsLocal $bios.ReleaseDate
         $biosUpdate = 'OEM CHECK'
-        if ($null -ne $biosAge -and $biosAge -ge 36) {
+        if ($null -ne $biosAge -and $biosAge -lt 0) {
+            $biosUpdate = 'DATE ANOMALY'
+            $biosAge = $null
+        } elseif ($null -ne $biosAge -and $biosAge -ge 36) {
             $biosUpdate = 'REVIEW OEM'
         }
 
@@ -2994,7 +3261,8 @@ $continue = Invoke-Step -Number 14 -Title 'BIOS, основные драйвер
     Write-Log 'Легенда Update:'
     Write-Log '  NO AGE FLAG = по возрасту драйвера нет автоматического повода для проверки; это НЕ подтверждение latest.'
     Write-Log '  CHECK       = версию разумно сверить с Windows Update / OEM.'
-    Write-Log '  REVIEW OLD  = драйвер старше ~36 месяцев; приоритетная ручная сверка.'
+    Write-Log '  AGE INFO    = дата INF старше ~24 месяцев; только информация, возраст сам по себе не находка.'
+    Write-Log '  DATE ANOMALY= дата драйвера в будущем (ошибка метаданных); только информация, возраст не показывается.'
     Write-Log '  WINDOWS/WU  = системный Microsoft-драйвер; обновляется вместе с Windows / Windows Update.'
     Write-Log '  OEM/WU      = служебная/синтетическая дата INF; проверять через OEM / Windows Update, возраст не оценивается.'
     Write-Log '  OEM CHECK   = сверить BIOS/firmware с официальным источником производителя.'
@@ -3003,7 +3271,7 @@ $continue = Invoke-Step -Number 14 -Title 'BIOS, основные драйвер
 
     $reviewRows = @(
         $inventory | Where-Object {
-            $_.Update -in @('REVIEW OLD','REVIEW OEM')
+            $_.Update -in @('REVIEW OEM')
         }
     )
 

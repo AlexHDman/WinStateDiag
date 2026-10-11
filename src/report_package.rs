@@ -84,6 +84,20 @@ pub enum EvidenceModule {
     NvmeHealth,
     /// Storage correlation (benchmark + health + events) per disk.
     StorageCorrelation,
+    /// v0.4.4: Crash Dump / BSOD analysis (original dumps, raw debugger
+    /// output, structured summaries).
+    CrashDump,
+    /// v0.4.4: Group Policy / ADMX health.
+    GroupPolicyAdmx,
+    /// v0.4.5: hardware sensors (temperatures, rails, power, fans; replaces
+    /// the v0.4.4 power-only module).
+    HardwareSensors,
+    /// v0.4.5: freeze / hang incident intelligence (Kernel-Power 41 /
+    /// EventLog 6008 timelines, LiveKernelReports listing).
+    FreezeIncidents,
+    /// v1.0: aggregated event evidence (Schannel, Windows Update, TPM, SCM,
+    /// SideBySide, Code Integrity, VSS / Volsnap, application errors).
+    EventEvidence,
 }
 
 impl EvidenceModule {
@@ -93,6 +107,10 @@ impl EvidenceModule {
         if name.contains(USER_CANCELLED) {
             return None;
         }
+        // Before "Hardware_": the sensor evidence shares that prefix.
+        if name.starts_with(crate::sensors::EVIDENCE_PREFIX) {
+            return Some(Self::HardwareSensors);
+        }
         if name.starts_with("EXPC_") {
             Some(Self::Expc)
         } else if name.starts_with("Hardware_") {
@@ -101,10 +119,20 @@ impl EvidenceModule {
             Some(Self::DriverAudit)
         } else if name.starts_with("SSD_Benchmark_") {
             Some(Self::SsdBenchmark)
-        } else if name.starts_with(crate::nvme_health::EVIDENCE_PREFIX) {
+        } else if name.starts_with(crate::nvme_health::EVIDENCE_PREFIX)
+            || name.starts_with("Ata_Smart_")
+        {
             Some(Self::NvmeHealth)
         } else if name.starts_with(crate::storage_health::EVIDENCE_PREFIX) {
             Some(Self::StorageCorrelation)
+        } else if name.starts_with(crate::crash_dump::EVIDENCE_PREFIX) {
+            Some(Self::CrashDump)
+        } else if name.starts_with(crate::gpo_admx::EVIDENCE_PREFIX) {
+            Some(Self::GroupPolicyAdmx)
+        } else if name.starts_with(crate::incidents::EVIDENCE_PREFIX) {
+            Some(Self::FreezeIncidents)
+        } else if name.starts_with(crate::events::EVIDENCE_PREFIX) {
+            Some(Self::EventEvidence)
         } else {
             None
         }
@@ -227,6 +255,8 @@ pub struct SessionPackage {
     pending: Vec<EvidenceFile>,
     zip_ready: bool,
     template: Option<Vec<u8>>,
+    /// v1.0 (system, hardware) state codes for the manifest.
+    states: Option<(String, String)>,
     #[cfg(test)]
     pub fail_next_replace: bool,
 }
@@ -242,9 +272,16 @@ impl SessionPackage {
             pending: Vec::new(),
             zip_ready: false,
             template,
+            states: None,
             #[cfg(test)]
             fail_next_replace: false,
         }
+    }
+
+    /// v1.0: the current (system, hardware) state codes written into the
+    /// manifest at the next rebuild.
+    pub fn set_states(&mut self, system: &str, hardware: &str) {
+        self.states = Some((system.to_string(), hardware.to_string()));
     }
 
     /// Package for the portable EXE folder (`<exe_dir>\Reports`) with the
@@ -303,6 +340,22 @@ impl SessionPackage {
         date: &str,
         files: Vec<EvidenceFile>,
     ) -> Result<PathBuf, String> {
+        self.contribute_named(client, computer, date, files)
+            .map(|(zip, _)| zip)
+    }
+
+    /// v1.0: [`contribute`] that also returns the names the files were
+    /// STORED under (input order). A same-day collision stores a file as
+    /// `<stem>_NN`; evidence that references other evidence (storage
+    /// correlation → benchmark / health) must use these exact names.
+    pub fn contribute_named(
+        &mut self,
+        client: &str,
+        computer: &str,
+        date: &str,
+        files: Vec<EvidenceFile>,
+    ) -> Result<(PathBuf, Vec<String>), String> {
+        let wanted: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
         let id = self.resolve(client, computer, date);
         let evidence_dir = id.evidence_dir();
         fs::create_dir_all(&evidence_dir).map_err(|e| {
@@ -325,13 +378,22 @@ impl SessionPackage {
                 return Err(err);
             }
         };
-        for name in &stored {
+        for (_, name) in &stored {
             if let Some(m) = EvidenceModule::of_file_name(name) {
                 self.completed.insert(m);
             }
         }
+        // Names of THIS call's files (pending files from before come first).
+        let mut names = Vec::with_capacity(wanted.len());
+        let mut pool = stored.clone();
+        for w in &wanted {
+            match pool.iter().rposition(|(o, _)| o == w) {
+                Some(i) => names.push(pool.remove(i).1),
+                None => names.push(w.clone()),
+            }
+        }
         restored?;
-        self.rebuild()
+        self.rebuild().map(|zip| (zip, names))
     }
 
     /// The report folder for an update outside `contribute` (SSD history
@@ -477,6 +539,8 @@ impl SessionPackage {
         let (windows_product, windows_build) = crate::ui::sysinfo::windows_edition_and_full_build();
         let ctx = crate::manifest::ManifestContext {
             producer_version: crate::manifest::PRODUCER_VERSION.to_string(),
+            system_state: self.states.as_ref().map(|s| s.0.clone()),
+            hardware_state: self.states.as_ref().map(|s| s.1.clone()),
             package: id
                 .zip_path
                 .file_name()
@@ -510,7 +574,9 @@ impl SessionPackage {
 /// Writes each file into `dir` (flat). An identical existing file is kept
 /// as is; a different file with the same name never overwrites it: the
 /// whole group sharing that stem gets the first free `_NN` suffix.
-fn store_evidence(dir: &Path, files: &[EvidenceFile]) -> Result<Vec<String>, String> {
+/// Returns `(original name, stored name)` for every file, in input order
+/// (a collision gives the stored file its first free `_NN` name).
+fn store_evidence(dir: &Path, files: &[EvidenceFile]) -> Result<Vec<(String, String)>, String> {
     let mut stems: Vec<String> = Vec::new();
     for f in files {
         let stem = split_name(&f.name).0.to_string();
@@ -550,10 +616,18 @@ fn store_evidence(dir: &Path, files: &[EvidenceFile]) -> Result<Vec<String>, Str
             if !path.is_file() {
                 write_new_file(&path, &f.bytes)?;
             }
-            stored.push(name);
+            stored.push((f.name.clone(), name));
         }
     }
-    Ok(stored)
+    // Input order (the grouping above is per stem).
+    let mut ordered = Vec::with_capacity(stored.len());
+    for f in files {
+        if let Some(i) = stored.iter().position(|(o, _)| *o == f.name) {
+            ordered.push(stored.remove(i));
+        }
+    }
+    ordered.extend(stored);
+    Ok(ordered)
 }
 
 /// Append-only logs: written meanwhile by other code (start-up log, SSD

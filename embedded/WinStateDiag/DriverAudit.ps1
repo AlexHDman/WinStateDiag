@@ -16,6 +16,13 @@
 #   DRVFILE <service name> <resolved image path> <exists True/False>
 #        <Authenticode status> <signer subject> <company> <file version>
 #        (only for drivers named in SCM 7026 events)
+#   SIGCHK <pnp device id> <image path> <image Authenticode status>
+#        <image signer> <inf Authenticode status> <inf signer>
+#        (v1.0: second, independent verification for every device whose
+#        Win32_PnPSignedDriver.IsSigned is False — WMI alone is not proof)
+#   PKG  <published name> <original name> <provider> <class> <version>
+#        <date yyyy-MM-dd>  (v1.0: authoritative driver-package identity,
+#        read-only package inventory Get-WindowsDriver -Online)
 #   ERR  <source> <message>
 
 param([int]$Days = 30)
@@ -49,6 +56,7 @@ try {
 } catch { Emit @('ERR', 'Win32_PnPEntity', $_.Exception.Message) }
 
 $seen = @{}
+$unsignedDev = @()
 try {
     foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop)) {
         if (-not $d.DeviceID) { continue }
@@ -63,6 +71,7 @@ try {
         Emit @('DEV', $cls, $d.DeviceName, $d.Manufacturer, $d.DriverProviderName, $d.DriverVersion,
                $date, $d.InfName, $code, $d.IsSigned, $id, $svc)
         $seen[$id] = $true
+        if ($d.IsSigned -eq $false) { $unsignedDev += [PSCustomObject]@{ Id = $id; Svc = [string]$svc; Inf = [string]$d.InfName } }
     }
 } catch { Emit @('ERR', 'Win32_PnPSignedDriver', $_.Exception.Message) }
 
@@ -84,6 +93,43 @@ try {
         $sysDrivers[[string]$s.Name] = $s
     }
 } catch { Emit @('ERR', 'Win32_SystemDriver', $_.Exception.Message) }
+
+# ------------------------------------- v1.0 independent signature check
+function Get-SigFacts([string]$path) {
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return @('NotFound', '') }
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop
+        $signer = ''
+        if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.Subject }
+        return @([string]$sig.Status, $signer)
+    } catch { return @('Error', '') }
+}
+function Resolve-ImagePath([string]$raw) {
+    if (-not $raw) { return '' }
+    $p = $raw.Trim().Trim('"')
+    if ($p.StartsWith('\??\')) { $p = $p.Substring(4) }
+    if ($p -match '^\\SystemRoot\\(.*)$') { $p = Join-Path $env:SystemRoot $Matches[1] }
+    elseif ($p -match '^(?i)system32\\') { $p = Join-Path $env:SystemRoot $p }
+    return $p
+}
+foreach ($u in $unsignedDev) {
+    $img = ''
+    if ($u.Svc -and $sysDrivers[$u.Svc]) { $img = Resolve-ImagePath ([string]$sysDrivers[$u.Svc].PathName) }
+    $is = Get-SigFacts $img
+    $infPath = ''
+    if ($u.Inf) { $infPath = Join-Path (Join-Path $env:SystemRoot 'INF') $u.Inf }
+    $fs = Get-SigFacts $infPath
+    Emit @('SIGCHK', $u.Id, $img, $is[0], $is[1], $fs[0], $fs[1])
+}
+
+# ------------------------------------------- v1.0 driver package identity
+try {
+    foreach ($p in @(Get-WindowsDriver -Online -ErrorAction Stop)) {
+        $pd = ''
+        if ($p.Date) { try { $pd = ([datetime]$p.Date).ToString('yyyy-MM-dd') } catch {} }
+        Emit @('PKG', $p.Driver, (Split-Path -Leaf ([string]$p.OriginalFileName)), $p.ProviderName, $p.ClassName, $p.Version, $pd)
+    }
+} catch { Emit @('ERR', 'Get-WindowsDriver', $_.Exception.Message) }
 
 # ------------------------------------------------------------------ events
 function Emit-Events([hashtable]$filter, [string]$tag) {

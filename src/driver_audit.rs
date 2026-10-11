@@ -147,6 +147,33 @@ pub struct RawAudit {
     pub driver_files: Vec<RawDriverFile>,
     pub events: Vec<RawEvent>,
     pub errors: Vec<String>,
+    /// v1.0 independent signature verification (`SIGCHK`).
+    pub sig_checks: Vec<RawSigCheck>,
+    /// v1.0 authoritative driver-package identity (`PKG`).
+    pub packages: Vec<DriverPackage>,
+}
+
+/// v1.0 `SIGCHK`: Authenticode facts of the image and the INF of a device
+/// whose `Win32_PnPSignedDriver.IsSigned` is False.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RawSigCheck {
+    pub pnp_id: String,
+    pub image: String,
+    pub image_status: String,
+    pub image_signer: String,
+    pub inf_status: String,
+    pub inf_signer: String,
+}
+
+/// v1.0 `PKG`: one driver package (one PublishedName = one identity).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DriverPackage {
+    pub published: String,
+    pub original: String,
+    pub provider: String,
+    pub class: String,
+    pub version: String,
+    pub date: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -158,9 +185,14 @@ pub enum EvidenceKind {
     DeviceLoadFailure,
     DisplayTimeout,
     Unsigned,
+    /// v1.0: driver-package identity conflict (never a removal advice).
+    PackageMapping,
     BasicDriver,
     Disabled,
     ExpectedInactive,
+    /// v1.0: a crash dump names this kernel module (dump-driven Driver
+    /// Audit extension; kernel-driver failure evidence, priority 2).
+    BugcheckDump,
 }
 
 impl EvidenceKind {
@@ -173,9 +205,11 @@ impl EvidenceKind {
             EvidenceKind::DeviceLoadFailure => "device_driver_load_failure",
             EvidenceKind::DisplayTimeout => "display_timeout_recovered",
             EvidenceKind::Unsigned => "unsigned_driver",
+            EvidenceKind::PackageMapping => "package_mapping",
             EvidenceKind::BasicDriver => "basic_microsoft_driver",
             EvidenceKind::Disabled => "device_disabled",
             EvidenceKind::ExpectedInactive => "expected_inactive_driver",
+            EvidenceKind::BugcheckDump => "bugcheck_dump_module",
         }
     }
 }
@@ -289,7 +323,7 @@ impl AuditItem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AuditReport {
     pub generated: String,
     pub window_days: u32,
@@ -301,6 +335,11 @@ pub struct AuditReport {
     /// Evidence that could not be attributed to a present device/driver.
     /// Reported for context only; it never changes a status.
     pub unattributed: Vec<Evidence>,
+    /// v1.0: Code Integrity findings that are not tied to a present device
+    /// (user-mode blocked DLL / process image, unmapped kernel image). Kept
+    /// as independent SOFTWARE / SECURITY findings: "no device mapping"
+    /// means "not a device-driver finding", never "problem absent".
+    pub software_findings: Vec<Evidence>,
     /// Drivers that are inactive by design (only an informational SCM 7026,
     /// intact Microsoft-signed image, valid configuration, no failures).
     /// Internal INFO: not an item, not counted, not in the text report.
@@ -380,6 +419,22 @@ pub fn parse_collector_output(text: &str) -> RawAudit {
                 props: get(5).split(" | ").map(|s| s.trim().to_string()).collect(),
                 message: get(6),
                 level: get(7).parse().ok(),
+            }),
+            Some("SIGCHK") => raw.sig_checks.push(RawSigCheck {
+                pnp_id: get(1),
+                image: get(2),
+                image_status: get(3),
+                image_signer: get(4),
+                inf_status: get(5),
+                inf_signer: get(6),
+            }),
+            Some("PKG") => raw.packages.push(DriverPackage {
+                published: get(1),
+                original: get(2),
+                provider: get(3),
+                class: get(4),
+                version: get(5),
+                date: get(6),
             }),
             Some("ERR") => raw.errors.push(format!("{}: {}", get(1), get(2))),
             _ => {}
@@ -679,6 +734,112 @@ fn item_from_device(cat: Category, dev: &RawDevice) -> AuditItem {
     }
 }
 
+/// v1.0 signature semantics. `Win32_PnPSignedDriver.IsSigned = False` alone
+/// is not proof (real cases: Aladdin, PowerShell 7 hosts returning empty
+/// data). WARNING only when Authenticode confirms a missing / invalid
+/// signature for an identified device; otherwise "not confirmed by the
+/// current method" (information). A record without identity (no name, no
+/// INF, no instance id) is INSUFFICIENT DATA, never "unsigned driver".
+fn signature_evidence(dev: &RawDevice, checks: &[RawSigCheck]) -> Option<Evidence> {
+    if dev.signed != Some(false) {
+        return None;
+    }
+    let identified =
+        !dev.name.trim().is_empty() || !dev.inf.trim().is_empty() || !dev.pnp_id.trim().is_empty();
+    if !identified {
+        return Some(Evidence::fact(
+            EvidenceKind::Unsigned,
+            Severity::Ok,
+            "Win32_PnPSignedDriver",
+            "НЕДОСТАТОЧНО ДАННЫХ: запись IsSigned=False без имени устройства, INF и InstanceId — подпись не оценивается".into(),
+        ));
+    }
+    let valid = |s: &str| s.eq_ignore_ascii_case("Valid");
+    let bad = |s: &str| {
+        ["NotSigned", "HashMismatch", "NotTrusted", "Incompatible"]
+            .iter()
+            .any(|b| s.eq_ignore_ascii_case(b))
+    };
+    let chk = checks
+        .iter()
+        .find(|c| !c.pnp_id.is_empty() && c.pnp_id.eq_ignore_ascii_case(&dev.pnp_id));
+    Some(match chk {
+        Some(c) if valid(&c.image_status) || valid(&c.inf_status) => Evidence::fact(
+            EvidenceKind::Unsigned,
+            Severity::Ok,
+            "Authenticode / каталог",
+            format!(
+                "IsSigned=False в Win32_PnPSignedDriver, но подпись подтверждена ({}: {}) — информация",
+                if valid(&c.image_status) { "образ драйвера" } else { "каталог INF" },
+                if valid(&c.image_status) { &c.image_signer } else { &c.inf_signer }
+            ),
+        ),
+        Some(c) if bad(&c.image_status) && !valid(&c.inf_status) => Evidence::fact(
+            EvidenceKind::Unsigned,
+            Severity::Warning,
+            "Authenticode",
+            format!(
+                "подпись драйвера не подтверждена Authenticode ({}; {}){}",
+                c.image_status,
+                if c.image.is_empty() { "образ н/д" } else { &c.image },
+                if dev.inf.is_empty() { String::new() } else { format!("; INF {}", dev.inf) }
+            ),
+        ),
+        _ => Evidence::fact(
+            EvidenceKind::Unsigned,
+            Severity::Ok,
+            "Win32_PnPSignedDriver",
+            "подпись не подтверждена текущим методом проверки (IsSigned=False; независимая проверка недоступна) — информация".into(),
+        ),
+    })
+}
+
+/// v1.0 package identity: one PublishedName (oemNN.inf) = one package. When
+/// devices reference the same PublishedName with different providers, the
+/// mapping is flagged (information) — no removal advice is ever derived.
+fn package_conflicts(items: &mut [AuditItem], packages: &[DriverPackage]) {
+    use std::collections::BTreeMap;
+    let mut by_inf: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, it) in items.iter().enumerate() {
+        let inf = it.inf.trim().to_ascii_lowercase();
+        // Audited categories only (unrelated clean devices are not listed).
+        if it.category != Category::Other && inf.starts_with("oem") && inf.ends_with(".inf") {
+            by_inf.entry(inf).or_default().push(i);
+        }
+    }
+    for (inf, idx) in by_inf {
+        let mut providers: Vec<String> = idx
+            .iter()
+            .map(|&i| items[i].provider.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        providers.sort_by_key(|p| p.to_lowercase());
+        providers.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        if providers.len() < 2 {
+            continue;
+        }
+        let pkg = packages
+            .iter()
+            .find(|p| p.published.eq_ignore_ascii_case(&inf));
+        let reason = format!(
+            "КОНФЛИКТ СОПОСТАВЛЕНИЯ ПАКЕТА: {inf} указан для разных поставщиков ({}); пакет по данным Get-WindowsDriver: {} — сопоставление не подтверждено, рекомендаций по удалению нет",
+            providers.join(", "),
+            match pkg {
+                Some(p) => format!("{} / {} / {}", p.original, p.provider, p.class),
+                None => "н/д".into(),
+            }
+        );
+        for &i in &idx {
+            items[i].add_evidence(Evidence::fact(
+                EvidenceKind::PackageMapping,
+                Severity::Ok,
+                "PKG",
+                reason.clone(),
+            ));
+        }
+    }
+}
+
 fn device_facts(item: &mut AuditItem, dev: &RawDevice) {
     match dev.error_code {
         None | Some(0) => {}
@@ -701,14 +862,6 @@ fn device_facts(item: &mut AuditItem, dev: &RawDevice) {
             ev.detail_code(code);
             item.add_evidence(ev);
         }
-    }
-    if dev.signed == Some(false) {
-        item.add_evidence(Evidence::fact(
-            EvidenceKind::Unsigned,
-            Severity::Warning,
-            "Win32_PnPSignedDriver",
-            "драйвер не имеет действительной цифровой подписи".into(),
-        ));
     }
     if item.category == Category::Display
         && (contains_any(&dev.name, &["basic display", "basic render"])
@@ -805,6 +958,7 @@ struct Ctx<'a> {
     files: &'a [RawDriverFile],
     events: &'a [RawEvent],
     unattributed: Vec<Evidence>,
+    software_findings: Vec<Evidence>,
     expected_inactive: Vec<Evidence>,
 }
 
@@ -934,6 +1088,27 @@ impl Ctx<'_> {
             }
         } else {
             self.expected_inactive.push(ev);
+        }
+    }
+
+    /// v1.0 independent software / security finding (Code Integrity not
+    /// mapped to a device), aggregated by process + module + event.
+    fn software_finding(&mut self, ev: Evidence) {
+        let key = ev.dedup_key();
+        if let Some(e) = self
+            .software_findings
+            .iter_mut()
+            .find(|e| e.dedup_key() == key)
+        {
+            e.count += 1;
+            if ev.first_seen < e.first_seen {
+                e.first_seen = ev.first_seen;
+            }
+            if ev.last_seen > e.last_seen {
+                e.last_seen = ev.last_seen;
+            }
+        } else {
+            self.software_findings.push(ev);
         }
     }
 
@@ -1268,14 +1443,20 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
             }
         }
         "CI" => {
-            let file = ev
-                .props
-                .iter()
-                .find(|p| {
-                    let l = p.to_lowercase();
-                    l.ends_with(".sys") || l.ends_with(".dll")
-                })
-                .cloned()
+            // v1.0: the blocked image can be a .sys, a .dll or a process
+            // image (.exe, e.g. CI 3004 DefenderSessionHelper.exe); a record
+            // with an image is never dropped.
+            let image = |exts: &[&str]| {
+                ev.props
+                    .iter()
+                    .find(|p| {
+                        let l = p.to_lowercase();
+                        exts.iter().any(|x| l.ends_with(x))
+                    })
+                    .cloned()
+            };
+            let file = image(&[".sys", ".dll"])
+                .or_else(|| image(&[".exe"]))
                 .unwrap_or_default();
             if file.is_empty() {
                 return;
@@ -1283,8 +1464,14 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
             let process = ev
                 .props
                 .iter()
-                .find(|p| p.to_lowercase().ends_with(".exe"))
+                .filter(|p| p.to_lowercase().ends_with(".exe"))
                 .map(|p| file_name(p))
+                .find(|p| !p.eq_ignore_ascii_case(&file_name(&file)))
+                .or_else(|| {
+                    file.to_lowercase()
+                        .ends_with(".exe")
+                        .then(|| file_name(&file))
+                })
                 .unwrap_or_default();
             let fname = file_name(&file);
             let is_kernel = fname.to_lowercase().ends_with(".sys");
@@ -1320,7 +1507,17 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
                 targets = vec![ctx.kernel_item(&fname)];
             }
             if targets.is_empty() {
-                ctx.unattributed(e);
+                // Not a device-driver finding — but still a finding.
+                e.reason = format!(
+                    "{}: {}",
+                    if is_kernel {
+                        "KERNEL CI (без привязки к устройству)"
+                    } else {
+                        "SOFTWARE / SECURITY"
+                    },
+                    e.reason
+                );
+                ctx.software_finding(e);
             } else {
                 ctx.attach(&targets, &e);
             }
@@ -1337,6 +1534,7 @@ pub fn classify(raw: &RawAudit) -> AuditReport {
         files: &raw.driver_files,
         events: &raw.events,
         unattributed: Vec::new(),
+        software_findings: Vec::new(),
         expected_inactive: Vec::new(),
     };
     let mut scanned = 0usize;
@@ -1349,6 +1547,9 @@ pub fn classify(raw: &RawAudit) -> AuditReport {
         let cat = categorize(dev);
         let mut item = item_from_device(cat, dev);
         device_facts(&mut item, dev);
+        if let Some(e) = signature_evidence(dev, &raw.sig_checks) {
+            item.add_evidence(e);
+        }
         // Every device is kept for event correlation (service / instance id
         // match); clean devices outside the relevant categories are dropped
         // after the events are applied.
@@ -1359,6 +1560,7 @@ pub fn classify(raw: &RawAudit) -> AuditReport {
     for ev in events {
         apply_event(&mut ctx, ev);
     }
+    package_conflicts(&mut ctx.items, &raw.packages);
     let mut items: Vec<AuditItem> = ctx
         .items
         .into_iter()
@@ -1384,6 +1586,7 @@ pub fn classify(raw: &RawAudit) -> AuditReport {
         overall,
         items,
         unattributed: ctx.unattributed,
+        software_findings: ctx.software_findings,
         expected_inactive: ctx.expected_inactive,
         errors: raw.errors.clone(),
     }
@@ -1640,6 +1843,16 @@ pub fn to_json(r: &AuditReport) -> String {
     } else {
         "\n  ],\n"
     });
+    o.push_str("  \"software_security_findings\": [");
+    for (k, e) in r.software_findings.iter().enumerate() {
+        o.push_str(if k == 0 { "\n" } else { ",\n" });
+        o.push_str(&evidence_json(e, "    "));
+    }
+    o.push_str(if r.software_findings.is_empty() {
+        "],\n"
+    } else {
+        "\n  ],\n"
+    });
     o.push_str("  \"unattributed_evidence\": [");
     for (k, e) in r.unattributed.iter().enumerate() {
         o.push_str(if k == 0 { "\n" } else { ",\n" });
@@ -1707,6 +1920,26 @@ pub fn to_text(r: &AuditReport) -> String {
                 } else {
                     format!(" {} … {}", e.first_seen, e.last_seen)
                 }
+            );
+        }
+    }
+    if !r.software_findings.is_empty() {
+        let _ = writeln!(
+            o,
+            "\nCode Integrity — программные / защитные находки (не драйверы устройств):"
+        );
+        for e in &r.software_findings {
+            let _ = writeln!(
+                o,
+                "    • {} [{}{}] ×{} {} … {}",
+                e.reason,
+                e.source,
+                e.event_id
+                    .map(|i| format!(", событие {i}"))
+                    .unwrap_or_default(),
+                e.count,
+                e.first_seen,
+                e.last_seen
             );
         }
     }
@@ -1922,6 +2155,8 @@ mod tests {
             driver_files: vec![],
             events,
             errors: vec![],
+            sig_checks: Vec::new(),
+            packages: Vec::new(),
         })
     }
 
@@ -2193,6 +2428,62 @@ mod tests {
         assert_eq!(it.evidence[0].process, "svc.exe");
     }
 
+    /// v1.0 real case: CI 3004 for DefenderSessionHelper.exe (process image,
+    /// no device mapping) was dropped. It is now an independent
+    /// SOFTWARE / SECURITY finding; device statuses are unaffected.
+    #[test]
+    fn ci_3004_process_image_without_device_is_a_software_finding() {
+        let e = |t: &str| {
+            evt(
+                "CI",
+                3004,
+                t,
+                &[
+                    "\\Device\\HarddiskVolume3\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18\\DefenderSessionHelper.exe",
+                    "0x1",
+                ],
+            )
+        };
+        let r = report(
+            vec![intel_gpu()],
+            vec![e("2026-10-08T08:00:00"), e("2026-10-09T09:00:00")],
+        );
+        assert_eq!(item(&r, "UHD").status, Severity::Ok, "no device blamed");
+        assert_eq!(r.software_findings.len(), 1, "{:?}", r.software_findings);
+        let f = &r.software_findings[0];
+        assert_eq!(f.module, "DefenderSessionHelper.exe");
+        assert_eq!(f.count, 2);
+        assert_eq!(f.event_id, Some(3004));
+        assert!(f.reason.starts_with("SOFTWARE / SECURITY"), "{}", f.reason);
+        assert_eq!(f.first_seen, "2026-10-08T08:00:00");
+        assert!(to_json(&r).contains("\"software_security_findings\": [\n"));
+        assert!(to_text(&r).contains("Code Integrity — программные / защитные находки"));
+    }
+
+    /// A repeated blocked DLL in a process with no PnP mapping stays a
+    /// finding (never "problem absent").
+    #[test]
+    fn ci_user_mode_dll_without_device_is_kept_with_process_and_module() {
+        let r = report(
+            vec![intel_gpu()],
+            vec![evt(
+                "CI",
+                3033,
+                "2026-10-01T10:00:00",
+                &[
+                    "0x10",
+                    "C:\\Program Files\\Vendor\\hook64.dll",
+                    "0x1",
+                    "C:\\Program Files\\App\\app.exe",
+                ],
+            )],
+        );
+        assert_eq!(r.software_findings.len(), 1);
+        assert_eq!(r.software_findings[0].process, "app.exe");
+        assert_eq!(r.software_findings[0].module, "hook64.dll");
+        assert!(r.unattributed.is_empty(), "not silently context-only");
+    }
+
     #[test]
     fn display_timeout_is_warning() {
         let r = report(
@@ -2383,9 +2674,132 @@ mod tests {
         basic.inf = "display.inf".into();
         let mut unsigned = dev("MEDIA", "Some Audio", "Acme", "1.0", 0);
         unsigned.signed = Some(false);
-        let r = report(vec![basic, unsigned], vec![]);
+        let mut raw = RawAudit {
+            devices: vec![basic, unsigned.clone()],
+            ..Default::default()
+        };
+        // v1.0: WARNING only when Authenticode confirms the missing signature.
+        raw.sig_checks.push(RawSigCheck {
+            pnp_id: unsigned.pnp_id.clone(),
+            image: "C:\\Windows\\System32\\drivers\\acme.sys".into(),
+            image_status: "NotSigned".into(),
+            inf_status: "NotSigned".into(),
+            ..Default::default()
+        });
+        let r = classify(&raw);
         assert_eq!(item(&r, "Basic Display").status, Severity::Warning);
         assert_eq!(item(&r, "Some Audio").status, Severity::Warning);
+    }
+
+    /// v1.0 real case: an "unsigned driver" WARNING without device name,
+    /// INF or InstanceId is not evidence — INSUFFICIENT DATA, no warning.
+    #[test]
+    fn unsigned_record_without_identity_is_insufficient_data() {
+        let mut empty = dev("", "", "", "", 0);
+        empty.inf.clear();
+        empty.pnp_id.clear();
+        empty.signed = Some(false);
+        let r = report(vec![empty], vec![]);
+        assert!(
+            r.items.iter().all(|i| i.status == Severity::Ok),
+            "{:?}",
+            r.items
+        );
+        assert!(
+            r.items
+                .iter()
+                .flat_map(|i| i.evidence.iter())
+                .any(|e| e.reason.starts_with("НЕДОСТАТОЧНО ДАННЫХ"))
+        );
+        assert_eq!(r.count(Severity::Warning), 0);
+    }
+
+    /// v1.0 real case (Aladdin): IsSigned=False but no independent
+    /// confirmation → "not confirmed by the current method", not a fault;
+    /// a catalog-valid INF clears it.
+    #[test]
+    fn aladdin_is_signed_false_is_not_a_categorical_fault() {
+        let mut d = dev(
+            "SmartCardReader",
+            "Aladdin Token JC",
+            "Aladdin R.D.",
+            "1.0",
+            0,
+        );
+        d.signed = Some(false);
+        let r = report(vec![d.clone()], vec![]);
+        let it = item(&r, "Aladdin");
+        assert_eq!(it.status, Severity::Ok);
+        assert!(it.evidence.iter().any(|e| {
+            e.reason
+                .starts_with("подпись не подтверждена текущим методом проверки")
+        }));
+        let r = classify(&RawAudit {
+            devices: vec![d.clone()],
+            sig_checks: vec![RawSigCheck {
+                pnp_id: d.pnp_id.clone(),
+                image_status: "NotFound".into(),
+                inf_status: "Valid".into(),
+                inf_signer: "CN=Microsoft Windows Hardware Compatibility Publisher".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(
+            item(&r, "Aladdin")
+                .evidence
+                .iter()
+                .any(|e| e.reason.contains("подпись подтверждена (каталог INF"))
+        );
+    }
+
+    /// v1.0 real case: oem16.inf linked to both Kaspersky and Intel Graphics.
+    /// The conflict is flagged; nothing recommends removing a package.
+    #[test]
+    fn conflicting_package_mapping_is_flagged_without_removal_advice() {
+        let mut gpu = dev(
+            "Display",
+            "Intel(R) UHD Graphics",
+            "Intel Corporation",
+            "31.0",
+            0,
+        );
+        gpu.inf = "oem16.inf".into();
+        let mut kav = dev(
+            "Net",
+            "Kaspersky Lab NDIS 6 Filter",
+            "AO Kaspersky Lab",
+            "30.0",
+            0,
+        );
+        kav.inf = "oem16.inf".into();
+        let r = classify(&RawAudit {
+            devices: vec![gpu, kav],
+            packages: vec![DriverPackage {
+                published: "oem16.inf".into(),
+                original: "iigd_dch.inf".into(),
+                provider: "Intel Corporation".into(),
+                class: "Display".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let all: Vec<&Evidence> = r.items.iter().flat_map(|i| i.evidence.iter()).collect();
+        let c: Vec<&&Evidence> = all
+            .iter()
+            .filter(|e| e.kind == EvidenceKind::PackageMapping)
+            .collect();
+        assert!(!c.is_empty());
+        assert!(
+            c[0].reason
+                .contains("iigd_dch.inf / Intel Corporation / Display")
+        );
+        assert!(c.iter().all(|e| e.severity == Severity::Ok));
+        let text = to_text(&r).to_lowercase();
+        assert!(
+            !text.contains("удалить") && !text.contains("pnputil /delete"),
+            "no removal advice"
+        );
     }
 
     #[test]
@@ -2595,6 +3009,8 @@ mod tests {
             driver_files: vec![file],
             events,
             errors: vec![],
+            sig_checks: Vec::new(),
+            packages: Vec::new(),
         })
     }
 

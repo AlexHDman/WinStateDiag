@@ -160,6 +160,13 @@ pub fn driver_issues_text(r: &AuditReport, d: &Dict, label: &dyn Fn(&str) -> Str
             }
         }
     }
+    if !r.software_findings.is_empty() {
+        push_line(&mut o, "");
+        push_line(&mut o, &format!("{}:", d.driver_software_findings_title));
+        for e in &r.software_findings {
+            push_line(&mut o, &format!("      • {}", evidence_line(e, d)));
+        }
+    }
     if !r.unattributed.is_empty() {
         push_line(&mut o, "");
         push_line(&mut o, &format!("{}:", d.driver_export_unattributed));
@@ -345,7 +352,7 @@ pub fn build_stage_details(
             StepProgress::Done => {
                 let deep_check = DeepCheck::of_step_index(i);
                 if let Some(o) = deep_check.and_then(|k| deep.iter().find(|o| o.check == k)) {
-                    d.state = state_of_result(o.result);
+                    d.state = state_of_result(o.effective_result());
                     if !o.detail.is_empty() {
                         d.findings.push(o.detail.clone());
                     }
@@ -690,6 +697,7 @@ pub(crate) mod tests {
                 ),
             ],
             unattributed: vec![ev("Old WUDFRd event", Severity::Warning, Some(219), 3, "")],
+            software_findings: Vec::new(),
             expected_inactive: vec![],
             errors: vec![],
         }

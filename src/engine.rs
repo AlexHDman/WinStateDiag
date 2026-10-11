@@ -3728,11 +3728,10 @@ mod icon_isolation_tests {
         let build = include_str!("../build.rs");
         assert!(build.contains("res.set_icon(\"assets/icon.ico\")"));
         assert!(!build.contains("tray-icon"));
-        let main = include_str!("main.rs");
-        assert!(
-            !main.contains("with_icon"),
-            "window icon still from the EXE resource"
-        );
+        let main = include_str!("lib.rs");
+        // v0.4.5: the window icon is set explicitly from the same icon.ico
+        // (eframe would otherwise show egui's default icon).
+        assert!(main.contains(".with_icon(window_icon())"));
         assert!(!main.contains("tray"));
         let app_icon: &[u8] = include_bytes!("../assets/icon.ico");
         let tray_icon: &[u8] = include_bytes!("../assets/tray-icon.ico");
@@ -3749,9 +3748,329 @@ mod icon_isolation_tests {
         for src in [
             include_str!("app.rs"),
             include_str!("main.rs"),
+            include_str!("lib.rs"),
             include_str!("../build.rs"),
         ] {
             assert!(!src.contains(&["tray-icon", ".ico"].concat()));
         }
+    }
+}
+
+/// v0.4.4 EXPC classification fixes: VSS utilization alone is INFO; driver
+/// age is informational only and a future date is a DATE ANOMALY.
+#[cfg(test)]
+mod expc_v044_tests {
+    use super::EXPC_DIAGNOSTIC_PS1;
+
+    fn script() -> String {
+        String::from_utf8_lossy(EXPC_DIAGNOSTIC_PS1).replace("\r\n", "\n")
+    }
+
+    fn between(s: &str, from: &str, to: &str) -> String {
+        let a = s.find(from).unwrap_or_else(|| panic!("{from}"));
+        let b = a + s[a..].find(to).unwrap_or_else(|| panic!("{to}"));
+        s[a..b].to_string()
+    }
+
+    fn run(tag: &str, ps: &str) -> Option<String> {
+        let host = crate::ps_exec::test_host()?;
+        let dir = std::env::temp_dir().join(format!("wsd-expc044-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.ps1");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(ps.as_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        let out = std::process::Command::new(host)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&file)
+            .output()
+            .expect("PowerShell runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    #[test]
+    fn vss_utilization_alone_is_info_and_failures_make_attention() {
+        let s = script();
+        assert!(!s.contains("Add-Attention $msg\n            Set-CheckStatus -Key 'VSS Shadow Storage' -Status 'ATTENTION' -Detail $msg\n        } else {"));
+        let f = between(
+            &s,
+            "function Get-VssClassification {",
+            "function Get-VssShadowStorageInfo {",
+        );
+        let ps = format!(
+            "{f}\nWrite-Output (Get-VssClassification -NearLimitCount 2 -RecentFailureCount 0 -OlderFailureCount 0)\n\
+             Write-Output (Get-VssClassification -NearLimitCount 1 -RecentFailureCount 1 -OlderFailureCount 0)\n\
+             Write-Output (Get-VssClassification -NearLimitCount 1 -RecentFailureCount 0 -OlderFailureCount 3)\n\
+             Write-Output (Get-VssClassification -NearLimitCount 0 -RecentFailureCount 0 -OlderFailureCount 2)\n\
+             Write-Output (Get-VssClassification -NearLimitCount 0 -RecentFailureCount 0 -OlderFailureCount 0)\n"
+        );
+        let Some(out) = run("vss", &ps) else { return };
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines, ["INFO", "ATTENTION", "ATTENTION", "INFO", "OK"]);
+    }
+
+    #[test]
+    fn driver_age_is_informational_and_future_dates_are_anomalies() {
+        let s = script();
+        assert!(
+            !s.contains("return 'REVIEW OLD'"),
+            "age alone never REVIEW OLD"
+        );
+        let f = between(
+            &s,
+            "    function Get-AgeMonthsLocal {",
+            "    function Add-DriverRowsLocal {",
+        );
+        let ps = format!(
+            "$now = Get-Date '2026-10-04'\n{f}\n\
+             Write-Output (Get-DriverReviewLocal -Provider 'Realtek' -DriverDate (Get-Date '2027-03-01'))\n\
+             Write-Output (Get-DriverReviewLocal -Provider 'Realtek' -DriverDate (Get-Date '2019-01-01'))\n\
+             Write-Output (Get-DriverReviewLocal -Provider 'Realtek' -DriverDate (Get-Date '2026-06-01'))\n\
+             Write-Output (Get-DriverReviewLocal -Provider 'Microsoft' -DriverDate (Get-Date '2010-06-01'))\n\
+             Write-Output ([string](Get-AgeMonthsLocal (Get-Date '2027-03-01')))\n"
+        );
+        let Some(out) = run("age", &ps) else { return };
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines[..4],
+            ["DATE ANOMALY", "AGE INFO", "NO AGE FLAG", "WINDOWS/WU"]
+        );
+        assert!(
+            lines[4].starts_with('-'),
+            "raw age is negative; rows never display it"
+        );
+        assert!(
+            s.contains("AgeMonths = $(if ($null -eq $age -or $age -lt 0) { '' } else { $age })")
+        );
+    }
+
+    /// v1.0 real-case fixtures (event identity, SCM grouping, VSS,
+    /// pending reboot, application summary).
+    fn identity_functions() -> String {
+        let s = script();
+        between(
+            &s,
+            "function Test-SmartCardPeripheralEvent {",
+            "function Get-ApplicationEventCategory {",
+        )
+    }
+
+    const FAKE_EVENT: &str = "function Ev([string]$p, [int]$id, [string]$msg, [string[]]$data) {\n\
+        $o = [PSCustomObject]@{ ProviderName = $p; Id = $id; Message = $msg; TimeCreated = (Get-Date '2026-10-09 10:00'); Data = $data }\n\
+        $o | Add-Member -MemberType ScriptMethod -Name ToXml -Value { $x = '<Event><EventData>'; foreach ($d in $this.Data) { $x += '<Data>' + $d + '</Data>' }; $x + '</EventData></Event>' }\n\
+        $o }\n\
+        function Short-Message([string]$m, [int]$n = 400) { $m }\n";
+
+    #[test]
+    fn hyper_v_hypervisor_41_is_never_kernel_power() {
+        let s = script();
+        assert!(s.contains(
+            "$kp41 = @($ev | Where-Object { $_.Id -eq 41 -and [string]$_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' })"
+        ));
+        let ps = format!(
+            "{FAKE_EVENT}{}\n\
+             $hv = Ev 'Microsoft-Windows-Hyper-V-Hypervisor' 41 'Hypervisor launch failed; Either VMX/SVM or virtualization is not present or not enabled.' @()\n\
+             $kp = Ev 'Microsoft-Windows-Kernel-Power' 41 'The system has rebooted without cleanly shutting down first.' @('0','0')\n\
+             $other = Ev 'SomeVendorDriver' 41 'vendor event' @()\n\
+             $disk = Ev 'disk' 7 'bad block' @()\n\
+             $fake = Ev 'Foo' 7 'not storage' @()\n\
+             Write-Output (Test-ServiceSignificantSystemEvent $hv)\n\
+             Write-Output (Test-HypervisorLaunchEvent $hv)\n\
+             Write-Output (Test-ServiceSignificantSystemEvent $kp)\n\
+             Write-Output (Test-ServiceSignificantSystemEvent $other)\n\
+             Write-Output (Test-ServiceSignificantSystemEvent $disk)\n\
+             Write-Output (Test-ServiceSignificantSystemEvent $fake)\n",
+            identity_functions()
+        );
+        let Some(out) = run("hv41", &ps) else { return };
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines, ["False", "True", "True", "False", "True", "False"]);
+    }
+
+    #[test]
+    fn dism_repair_intelligence_separates_current_historical_and_recurrent() {
+        let s = script();
+        assert!(
+            s.contains("Set-CheckStatus -Key 'DISM' -Status $intel.Status -Detail $intel.Detail")
+        );
+        assert!(
+            !s.contains("/RestoreHealth /NoRestart"),
+            "never runs a repair"
+        );
+        let ps = format!(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n{}\n\
+             $old = @('2026-05-02 10:00:01, Info CBS Checking System Update Readiness. Corruption detected', '2026-05-02 10:40:00, Info DISM The restore operation completed successfully.')\n\
+             $oldOnly = @('2026-05-02 10:00:01, Info CBS STATUS_SXS_COMPONENT_STORE_CORRUPT')\n\
+             $clean = 'No component store corruption detected.'\n\
+             $bad = 'The component store is repairable.'\n\
+             $r = @(\n\
+               (Get-DismRepairIntelligence -CurrentText $clean -HistoryLines @()),\n\
+               (Get-DismRepairIntelligence -CurrentText $clean -HistoryLines $old),\n\
+               (Get-DismRepairIntelligence -CurrentText $clean -HistoryLines $oldOnly),\n\
+               (Get-DismRepairIntelligence -CurrentText $bad -HistoryLines @()),\n\
+               (Get-DismRepairIntelligence -CurrentText $bad -HistoryLines $old),\n\
+               (Get-DismRepairIntelligence -CurrentText 'The component store cannot be repaired.' -HistoryLines @()),\n\
+               (Get-DismRepairIntelligence -CurrentText 'garbage' -HistoryLines $old)\n\
+             )\n\
+             $r | ForEach-Object {{ '{{0}}|{{1}}|{{2}}' -f $_.Verdict, $_.Status, $_.Detail }}\n",
+            identity_functions()
+        );
+        let Some(out) = run("dismintel", &ps) else {
+            return;
+        };
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let head: Vec<String> = lines
+            .iter()
+            .map(|l| l.split('|').take(2).collect::<Vec<_>>().join("|"))
+            .collect();
+        assert_eq!(
+            head,
+            [
+                "CLEAN|OK",
+                "HISTORICAL_REPAIRED|INFO",
+                "HISTORICAL_ONLY|INFO",
+                "CURRENT_CORRUPTION|ATTENTION",
+                "RECURRENT_CORRUPTION|ATTENTION",
+                "CURRENT_CORRUPTION|ERROR",
+                "UNKNOWN|UNKNOWN"
+            ],
+            "{out}"
+        );
+        assert!(
+            lines[1].contains("2026-05-02") && lines[1].contains("не текущая проблема"),
+            "{out}"
+        );
+        assert!(lines[4].contains("ПОВТОРНОЕ ПОВРЕЖДЕНИЕ"), "{out}");
+        assert!(
+            lines[3].contains("автоматически ничего не менялось"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn build_and_kb_list_consistency_is_info_context() {
+        let s = script();
+        assert!(s.contains(
+            "Set-CheckStatus -Key 'System / Build and updates' -Status 'INFO' -Detail $buildInfo.Detail"
+        ));
+        let ps = format!(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n{}\n\
+             $h = @([PSCustomObject]@{{ HotFixID = 'KB5063878'; Description = 'Update'; InstalledOn = (Get-Date '2025-08-12') }})\n\
+             (Get-BuildUpdateConsistency -Hotfixes $h -Build '26100' -Ubr 6584).Detail\n\
+             (Get-BuildUpdateConsistency -Hotfixes @() -Build '26100' -Ubr 6584).Detail\n",
+            identity_functions()
+        );
+        let Some(out) = run("buildkb", &ps) else {
+            return;
+        };
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(
+            lines[0].contains("26100.6584") && lines[0].contains("KB5063878 (2025-08-12)"),
+            "{out}"
+        );
+        assert!(lines[0].contains("не является ошибкой"), "{out}");
+        assert!(lines[1].contains("источником истины"), "{out}");
+    }
+
+    #[test]
+    fn scm_7009_groups_by_service_not_timeout_and_cdpsvc_recurs() {
+        let ps = format!(
+            "{FAKE_EVENT}{}\n\
+             $e = @(\n\
+               (Ev 'Service Control Manager' 7009 'A timeout was reached (30000 milliseconds) while waiting for the Rutoken Connect service to connect.' @('30000','Rutoken Connect')),\n\
+               (Ev 'Service Control Manager' 7009 'A timeout was reached (45000 milliseconds) while waiting for the Rutoken Connect service to connect.' @('45000','Rutoken Connect')),\n\
+               (Ev 'Service Control Manager' 7009 'A timeout was reached (30000 milliseconds) while waiting for the ScDeviceEnum service to connect.' @('30000','ScDeviceEnum'))\n\
+             )\n\
+             1..6 | ForEach-Object {{ $e += (Ev 'Service Control Manager' 7031 'The Connected Devices Platform Service service terminated unexpectedly.' @('Connected Devices Platform Service','1')) }}\n\
+             $g = @(Get-SoftwareServiceGroups -Events $e)\n\
+             foreach ($x in $g) {{ Write-Output ('{{0}}|{{1}}|{{2}}' -f $x.Identity, $x.EventID, $x.Count) }}\n",
+            identity_functions()
+        );
+        let Some(out) = run("scm7009", &ps) else {
+            return;
+        };
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(
+            lines.contains(&"Connected Devices Platform Service|7031|6"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"Rutoken Connect|7009|2"),
+            "timeouts are attributes: {lines:?}"
+        );
+        assert!(lines.contains(&"ScDeviceEnum|7009|1"), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("30000") || l.starts_with("45000"))
+        );
+        let s = script();
+        assert!(s.contains("Повторяющиеся ошибки ПО/служб: {0} групп ({1}); аппаратно-критических событий не обнаружено."));
+    }
+
+    #[test]
+    fn volsnap_33_quota_and_vss_8224_are_not_failures() {
+        let s = script();
+        assert!(
+            s.contains("ProviderName='volsnap'; Id=25,35,36;"),
+            "33 removed from failures"
+        );
+        assert!(!s.contains("Id=25,33,35,36"));
+        assert!(!s.contains("Id=8193,12289,8224"));
+    }
+
+    #[test]
+    fn pending_file_rename_alone_is_info_cleanup_not_servicing_reboot() {
+        let s = script();
+        assert!(s.contains(
+            "} elseif ($pending.CBSRebootPending -or $pending.WindowsUpdateRebootRequired) {"
+        ));
+        assert!(s.contains("Ожидается очистка/переименование файлов после обновления ПО"));
+        assert!(s.contains(
+            "Set-CheckStatus -Key 'System / Pending reboot' -Status 'INFO' -Detail $detail"
+        ));
+    }
+
+    #[test]
+    fn application_summary_names_process_exception_and_count() {
+        let s = script();
+        assert!(s.contains("$label = '{0} — {1}×' -f $appName, $g.Count"));
+        assert!(s.contains("$label += (' · Exception {0}' -f $exc)"));
     }
 }
