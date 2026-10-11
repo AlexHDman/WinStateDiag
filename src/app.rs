@@ -1194,7 +1194,7 @@ fn pass_grid(ui: &mut egui::Ui, id: &str, result: &StorageDiagnosticSummary) {
 
 /// `YYYY-MM-DDTHH:MM:SS` local time (NVMe Health `captured_at`).
 #[cfg_attr(not(windows), allow(dead_code))]
-fn local_iso(t: sysinfo::LocalTime) -> String {
+pub(crate) fn local_iso(t: sysinfo::LocalTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         t.year, t.month, t.day, t.hour, t.minute, t.second
@@ -2982,9 +2982,9 @@ impl WinStateDiagApp {
     ) {
         match res {
             Ok((raw, services)) => {
-                let aggs = events::aggregate(&raw, &services);
-                let wu = events::wu_failure_is_historical(&raw);
                 let now = sysinfo::local_time();
+                let aggs = events::aggregate(&raw, &services, &local_iso(now));
+                let wu = events::wu_failure_is_historical(&raw);
                 let json = events::to_json(&aggs, wu, &local_iso(now));
                 let name = format!("{}{}.json", events::EVIDENCE_PREFIX, evidence_stamp(now));
                 self.event_evidence = Some(Ok((aggs, wu)));
@@ -3005,7 +3005,7 @@ impl WinStateDiagApp {
         };
         // v1.0: unique actionable groups first (primary metric), then the
         // raw aggregates (secondary evidence, scope in Event_Evidence JSON).
-        let mut out: Vec<String> = events::actionable(aggs, *wu)
+        let mut out: Vec<String> = events::actionable(aggs)
             .iter()
             .filter(|g| g.stage == i)
             .map(|g| {

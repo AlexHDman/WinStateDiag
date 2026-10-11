@@ -139,11 +139,12 @@ fn evidence_probe(dir: Option<PathBuf>, module: Option<String>) -> i32 {
     let mut summary = String::new();
     match events::collect("powershell.exe") {
         Ok((raw, services)) => {
-            let aggs = events::aggregate(&raw, &services);
+            let collected_at = app::local_iso(ui::sysinfo::local_time());
+            let aggs = events::aggregate(&raw, &services, &collected_at);
             let wu = events::wu_failure_is_historical(&raw);
             let _ = std::fs::write(
                 dir.join("Event_Evidence_probe.json"),
-                events::to_json(&aggs, wu, "probe"),
+                events::to_json(&aggs, wu, &collected_at),
             );
             summary.push_str(&format!(
                 "EVENTS raw={} services={} aggregates={} seconds={}\r\n",

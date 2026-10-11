@@ -326,6 +326,7 @@ fn row_details_show_only_that_stages_evidence() {
             ev("Service Control Manager", 7031, "terminated"),
         ],
         &[],
+        "2026-10-02T00:00:00",
     );
     app.event_evidence = Some(Ok((aggs, None)));
     let vss = app.stage_evidence_lines(4).join("\n");

@@ -596,7 +596,7 @@ fn qa_vss_aggregates() -> Vec<events::Aggregate> {
             "The oldest shadow copy of volume C: was deleted to keep disk space usage for shadow copies of volume C: below the user defined limit.",
         ));
     }
-    events::aggregate(&evs, &[])
+    events::aggregate(&evs, &[], "2026-10-06T10:00:00")
 }
 
 #[cfg(test)]

@@ -100,8 +100,9 @@ pub struct Aggregate {
     /// Key fields that define this aggregate (service, KB, process …).
     pub key: Vec<(String, String)>,
     pub count: u32,
-    /// Events of the last 7 days (relative to the newest event collected),
-    /// so "N in 7 days / M in 8–30 days" summaries are verifiable.
+    /// Events of the last 7 days relative to the collection time
+    /// (`collected_at`), so "N in 7 days / M in 8–30 days" summaries are
+    /// verifiable and old events are never shown as fresh.
     pub count_last_7_days: u32,
     pub first_seen: String,
     pub last_seen: String,
@@ -110,6 +111,11 @@ pub struct Aggregate {
     /// Interpretation category (e.g. VSS "quota_eviction").
     pub category: String,
     pub service: Option<ServiceInfo>,
+    /// Windows Update 20 only: `Some(true)` = a LATER successful install
+    /// (Event 19) of the SAME update (GUID / KB / title) exists;
+    /// `Some(false)` = none; `None` = the failure has no identity, so no
+    /// claim is made that it was fixed.
+    pub wu_resolved: Option<bool>,
 }
 
 fn group_of(e: &RawEvent) -> Group {
@@ -404,9 +410,86 @@ fn day_number(iso: &str) -> Option<i64> {
     Some(era * 146_097 + doe)
 }
 
+fn is_wu(e: &RawEvent, id: u32) -> bool {
+    e.id == id
+        && e.provider
+            .to_ascii_lowercase()
+            .contains("windowsupdateclient")
+}
+
+/// Confirmed identity of one Windows Update event: update GUID, KB and
+/// title (each normalised; empty when absent).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WuIdentity {
+    pub guid: String,
+    pub kb: String,
+    pub title: String,
+}
+
+pub fn wu_identity(e: &RawEvent) -> WuIdentity {
+    let guid = e
+        .field(&["updateGuid", "UpdateGuid"])
+        .map(|g| g.trim().trim_matches(['{', '}']).to_ascii_lowercase())
+        .unwrap_or_default();
+    let title = e
+        .field(&["updateTitle", "UpdateTitle"])
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let kb = kb_of(&title)
+        .or_else(|| kb_of(&e.message))
+        .unwrap_or_default();
+    WuIdentity {
+        guid,
+        kb,
+        title: title.to_lowercase(),
+    }
+}
+
+impl WuIdentity {
+    pub fn is_known(&self) -> bool {
+        !(self.guid.is_empty() && self.kb.is_empty() && self.title.is_empty())
+    }
+
+    /// Same update? Decided by the strongest identity BOTH sides carry
+    /// (GUID, then KB, then exact title); otherwise not the same.
+    pub fn same_update(&self, other: &WuIdentity) -> bool {
+        if !self.guid.is_empty() && !other.guid.is_empty() {
+            self.guid == other.guid
+        } else if !self.kb.is_empty() && !other.kb.is_empty() {
+            self.kb == other.kb
+        } else if !self.title.is_empty() && !other.title.is_empty() {
+            self.title == other.title
+        } else {
+            false
+        }
+    }
+}
+
+/// Is the Windows Update failure `fail` (Event 20) resolved by a LATER
+/// successful install (Event 19) of the same update? `None` when the
+/// failure carries no identity (nothing can be claimed).
+pub fn wu_failure_resolved(fail: &RawEvent, events: &[RawEvent]) -> Option<bool> {
+    let id = wu_identity(fail);
+    if !id.is_known() {
+        return None;
+    }
+    Some(
+        events
+            .iter()
+            .filter(|e| is_wu(e, 19) && e.time > fail.time)
+            .any(|ok| id.same_update(&wu_identity(ok))),
+    )
+}
+
 /// Aggregates raw events (any order) by group + provider + id + key.
-pub fn aggregate(events: &[RawEvent], services: &[ServiceInfo]) -> Vec<Aggregate> {
-    let newest_day = events.iter().filter_map(|e| day_number(&e.time)).max();
+/// `collected_at` (ISO local time of the collection) is the reference of
+/// the 7-day counters; when it cannot be parsed no event counts as recent.
+pub fn aggregate(
+    events: &[RawEvent],
+    services: &[ServiceInfo],
+    collected_at: &str,
+) -> Vec<Aggregate> {
+    let reference_day = day_number(collected_at);
     let mut out: Vec<Aggregate> = Vec::new();
     let mut sorted: Vec<&RawEvent> = events.iter().collect();
     // Newest first, so "latest" messages and last_seen come first.
@@ -415,11 +498,7 @@ pub fn aggregate(events: &[RawEvent], services: &[ServiceInfo]) -> Vec<Aggregate
         // Successful Windows Update installs (19) are not evidence of a
         // problem: they only decide whether a failure (20) is historical
         // (`wu_failure_is_historical`), never an aggregate of their own.
-        if e.id == 19
-            && e.provider
-                .to_ascii_lowercase()
-                .contains("windowsupdateclient")
-        {
+        if is_wu(e, 19) {
             continue;
         }
         let group = group_of(e);
@@ -464,6 +543,13 @@ pub fn aggregate(events: &[RawEvent], services: &[ServiceInfo]) -> Vec<Aggregate
                     latest: Vec::new(),
                     category,
                     service,
+                    // Newest-first: the first event is the newest failure
+                    // of this aggregate (same KB / title by key).
+                    wu_resolved: if is_wu(e, 20) {
+                        wu_failure_resolved(e, events)
+                    } else {
+                        None
+                    },
                 });
                 out.last_mut().unwrap()
             }
@@ -487,8 +573,8 @@ pub fn aggregate(events: &[RawEvent], services: &[ServiceInfo]) -> Vec<Aggregate
             }
         }
         a.count += 1;
-        if let (Some(day), Some(newest)) = (day_number(&e.time), newest_day)
-            && newest - day < 7
+        if let (Some(day), Some(reference)) = (day_number(&e.time), reference_day)
+            && reference - day < 7
         {
             a.count_last_7_days += 1;
         }
@@ -517,6 +603,10 @@ pub enum FindingClass {
     SoftwareRecurring,
     /// Code Integrity / security-relevant software findings.
     Security,
+    /// A single (below the recurrence threshold) application crash / hang /
+    /// .NET exception: a finding of its own, neither recurring nor
+    /// historical.
+    SoftwareSingle,
     /// Old or self-resolved activity (historical WU failure, VSS quota,
     /// idle shutdowns, single service hiccups).
     Historical,
@@ -527,6 +617,7 @@ impl FindingClass {
         match self {
             FindingClass::SoftwareRecurring => "SOFTWARE_RECURRING",
             FindingClass::Security => "SECURITY",
+            FindingClass::SoftwareSingle => "SOFTWARE_SINGLE",
             FindingClass::Historical => "HISTORICAL",
         }
     }
@@ -558,7 +649,7 @@ fn key_val<'a>(a: &'a Aggregate, k: &str) -> &'a str {
 pub const RECURRENCE_MIN: u32 = 3;
 
 /// v1.0 unique actionable groups (primary metric — not raw counts).
-pub fn actionable(aggs: &[Aggregate], wu_historical: Option<bool>) -> Vec<Actionable> {
+pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
     let mut out = Vec::new();
     for a in aggs {
         let Some(group) = a.group else { continue };
@@ -613,7 +704,12 @@ pub fn actionable(aggs: &[Aggregate], wu_historical: Option<bool>) -> Vec<Action
                 if !module.is_empty() {
                     title.push_str(&format!(" · модуль {module}"));
                 }
-                out.push(base(FindingClass::SoftwareRecurring, title));
+                let class = if a.count >= RECURRENCE_MIN {
+                    FindingClass::SoftwareRecurring
+                } else {
+                    FindingClass::SoftwareSingle
+                };
+                out.push(base(class, title));
             }
             Group::CodeIntegrityUser | Group::CodeIntegrityKernel => {
                 let title = format!(
@@ -632,7 +728,9 @@ pub fn actionable(aggs: &[Aggregate], wu_historical: Option<bool>) -> Vec<Action
                 ));
             }
             Group::WindowsUpdate => {
-                let class = if wu_historical == Some(true) {
+                // Historical ONLY when a later install of the same update
+                // is confirmed; another KB's success proves nothing.
+                let class = if a.wu_resolved == Some(true) {
                     FindingClass::Historical
                 } else {
                     FindingClass::SoftwareRecurring
@@ -673,24 +771,14 @@ pub fn actionable(aggs: &[Aggregate], wu_historical: Option<bool>) -> Vec<Action
     out
 }
 
-/// Windows Update Event 20: a historical failure is not a currently broken
-/// Windows Update. Current = no successful install (Event 19) after the
-/// newest failure.
+/// Windows Update Event 20 summary: `Some(true)` only when EVERY failure
+/// is followed by a successful install (Event 19) of the same update
+/// (`wu_failure_resolved`); a failure without identity, or one resolved
+/// only by another update, keeps it `Some(false)`. `None` = no failures.
 pub fn wu_failure_is_historical(events: &[RawEvent]) -> Option<bool> {
-    let wu = |id: u32| {
-        events
-            .iter()
-            .filter(move |e| {
-                e.provider
-                    .to_ascii_lowercase()
-                    .contains("windowsupdateclient")
-                    && e.id == id
-            })
-            .map(|e| e.time.as_str())
-            .max()
-    };
-    let last_fail = wu(20)?;
-    Some(wu(19).is_some_and(|ok| ok > last_fail))
+    let mut fails = events.iter().filter(|e| is_wu(e, 20)).peekable();
+    fails.peek()?;
+    Some(fails.all(|f| wu_failure_resolved(f, events) == Some(true)))
 }
 
 /// One-line summary of an aggregate for Details (stage-local evidence).
@@ -757,7 +845,7 @@ pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &s
                 None => "null".into(),
             };
             format!(
-                "    {{\"group\": {}, \"provider\": {}, \"event_id\": {}, \"category\": {}, \"key\": {{{}}}, \"count\": {}, \"count_last_7_days\": {}, \"first_seen\": {}, \"last_seen\": {}, \"latest_messages\": [{}], \"service\": {}}}",
+                "    {{\"group\": {}, \"provider\": {}, \"event_id\": {}, \"category\": {}, \"key\": {{{}}}, \"count\": {}, \"count_last_7_days\": {}, \"first_seen\": {}, \"last_seen\": {}, \"latest_messages\": [{}], \"service\": {}, \"wu_resolved_by_later_install\": {}}}",
                 json::string(a.group.map(Group::code).unwrap_or("other")),
                 json::string(&a.provider),
                 a.id,
@@ -768,11 +856,15 @@ pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &s
                 json::string(&a.first_seen),
                 json::string(&a.last_seen),
                 latest.join(", "),
-                svc
+                svc,
+                match a.wu_resolved {
+                    Some(b) => b.to_string(),
+                    None => "null".into(),
+                }
             )
         })
         .collect();
-    let groups: Vec<String> = actionable(aggs, wu_historical)
+    let groups: Vec<String> = actionable(aggs)
         .iter()
         .map(|g| {
             format!(
@@ -921,6 +1013,9 @@ pub fn collect(host: &str) -> Result<(Vec<RawEvent>, Vec<ServiceInfo>), String> 
 mod tests {
     use super::*;
 
+    /// Collection time of the test fixtures.
+    const NOW: &str = "2026-10-06T10:00:00";
+
     fn ev(provider: &str, id: u32, time: &str, message: &str, data: &[(&str, &str)]) -> RawEvent {
         RawEvent {
             log: "System".into(),
@@ -967,7 +1062,7 @@ mod tests {
             start_mode: "Auto".into(),
             path: "C:\\Foo\\foo.exe".into(),
         }];
-        let aggs = aggregate(&events, &services);
+        let aggs = aggregate(&events, &services, NOW);
         let foo = aggs.iter().find(|a| a.id == 7000).unwrap();
         assert_eq!(foo.count, 2);
         assert_eq!(foo.first_seen, "2026-10-01T10:00:00");
@@ -1001,7 +1096,7 @@ mod tests {
                 ("errorCode", "0x80070643"),
             ],
         );
-        let aggs = aggregate(std::slice::from_ref(&fail), &[]);
+        let aggs = aggregate(std::slice::from_ref(&fail), &[], NOW);
         let a = &aggs[0];
         assert_eq!(a.group, Some(Group::WindowsUpdate));
         assert!(a.key.contains(&("KB".into(), "KB5034441".into())));
@@ -1015,12 +1110,181 @@ mod tests {
             "Installation Successful",
             &[],
         );
-        assert_eq!(wu_failure_is_historical(&[fail.clone(), ok]), Some(true));
+        // A success WITHOUT identity proves nothing about this failure.
+        assert_eq!(wu_failure_is_historical(&[fail.clone(), ok]), Some(false));
         assert_eq!(
             wu_failure_is_historical(std::slice::from_ref(&fail)),
             Some(false)
         );
         assert_eq!(wu_failure_is_historical(&[]), None);
+    }
+
+    fn wu(id: u32, time: &str, kb: &str) -> RawEvent {
+        let title = format!("2026-09 Cumulative Update ({kb})");
+        ev(
+            "Microsoft-Windows-WindowsUpdateClient",
+            id,
+            time,
+            &format!("Installation: {title}"),
+            &[("updateTitle", title.as_str()), ("errorCode", "0x80070643")],
+        )
+    }
+
+    fn wu_class(events: &[RawEvent]) -> Vec<FindingClass> {
+        actionable(&aggregate(events, &[], NOW))
+            .iter()
+            .map(|a| a.class)
+            .collect()
+    }
+
+    #[test]
+    fn wu_20_for_kb_a_stays_actual_after_later_19_for_kb_b() {
+        let events = [
+            wu(20, "2026-09-20T03:00:00", "KB5000001"),
+            wu(19, "2026-10-01T03:00:00", "KB5000002"),
+        ];
+        let aggs = aggregate(&events, &[], NOW);
+        assert_eq!(aggs.len(), 1);
+        assert_eq!(aggs[0].wu_resolved, Some(false));
+        assert_eq!(wu_class(&events), vec![FindingClass::SoftwareRecurring]);
+        assert_eq!(wu_failure_is_historical(&events), Some(false));
+        assert!(
+            to_json(&aggs, Some(false), NOW).contains("\"wu_resolved_by_later_install\": false")
+        );
+    }
+
+    #[test]
+    fn wu_20_for_kb_a_is_historical_after_confirmed_later_19_for_kb_a() {
+        let events = [
+            wu(20, "2026-09-20T03:00:00", "KB5000001"),
+            wu(19, "2026-10-01T03:00:00", "KB5000001"),
+        ];
+        assert_eq!(aggregate(&events, &[], NOW)[0].wu_resolved, Some(true));
+        assert_eq!(wu_class(&events), vec![FindingClass::Historical]);
+        assert_eq!(wu_failure_is_historical(&events), Some(true));
+        // An EARLIER success of the same KB does not resolve a later failure.
+        let earlier = [
+            wu(19, "2026-09-01T03:00:00", "KB5000001"),
+            wu(20, "2026-09-20T03:00:00", "KB5000001"),
+        ];
+        assert_eq!(wu_class(&earlier), vec![FindingClass::SoftwareRecurring]);
+        // Mixed: A resolved, B not -> the summary is not "historical".
+        let mixed = [
+            wu(20, "2026-09-20T03:00:00", "KB5000001"),
+            wu(20, "2026-09-21T03:00:00", "KB5000003"),
+            wu(19, "2026-10-01T03:00:00", "KB5000001"),
+        ];
+        let mut classes = wu_class(&mixed);
+        classes.sort();
+        assert_eq!(
+            classes,
+            vec![FindingClass::SoftwareRecurring, FindingClass::Historical]
+        );
+        assert_eq!(wu_failure_is_historical(&mixed), Some(false));
+    }
+
+    #[test]
+    fn wu_19_without_identity_does_not_close_any_20() {
+        let ok = ev(
+            "Microsoft-Windows-WindowsUpdateClient",
+            19,
+            "2026-10-01T03:00:00",
+            "Installation Successful",
+            &[],
+        );
+        // Identified failure + anonymous success: stays actual.
+        let a = [wu(20, "2026-09-20T03:00:00", "KB5000001"), ok.clone()];
+        assert_eq!(wu_class(&a), vec![FindingClass::SoftwareRecurring]);
+        // Anonymous failure + anonymous success: no identity, no claim.
+        let anon = ev(
+            "Microsoft-Windows-WindowsUpdateClient",
+            20,
+            "2026-09-20T03:00:00",
+            "Installation Failure",
+            &[],
+        );
+        let b = [anon, ok];
+        assert_eq!(aggregate(&b, &[], NOW)[0].wu_resolved, None);
+        assert_eq!(wu_class(&b), vec![FindingClass::SoftwareRecurring]);
+        assert_eq!(wu_failure_is_historical(&b), Some(false));
+        // GUID decides when both carry it, even with an equal KB.
+        let g = |id, t: &str, guid: &str| {
+            ev(
+                "Microsoft-Windows-WindowsUpdateClient",
+                id,
+                t,
+                "x",
+                &[("updateTitle", "Update (KB5000001)"), ("updateGuid", guid)],
+            )
+        };
+        let c = [
+            g(20, "2026-09-20T03:00:00", "{AAAA-1}"),
+            g(19, "2026-10-01T03:00:00", "{BBBB-2}"),
+        ];
+        assert_eq!(wu_class(&c), vec![FindingClass::SoftwareRecurring]);
+        let d = [
+            g(20, "2026-09-20T03:00:00", "{AAAA-1}"),
+            g(19, "2026-10-01T03:00:00", "aaaa-1"),
+        ];
+        assert_eq!(wu_class(&d), vec![FindingClass::Historical]);
+    }
+
+    #[test]
+    fn seven_day_counter_is_relative_to_collection_time_not_newest_event() {
+        // All events are 3-5 weeks old: none of them is "fresh".
+        let old: Vec<RawEvent> = (0..5)
+            .map(|i| {
+                ev(
+                    "volsnap",
+                    33,
+                    &format!("2026-09-{:02}T03:00:00", 10 + i),
+                    "q",
+                    &[],
+                )
+            })
+            .collect();
+        let a = aggregate(&old, &[], NOW);
+        assert_eq!(a[0].count, 5);
+        assert_eq!(a[0].count_last_7_days, 0);
+        assert!(aggregate_line(&a[0]).contains("(7d: 0, 8–30d: 5)"));
+        // Collected on Sep 20: only Sep 14 is within the last 7 days.
+        let a = aggregate(&old, &[], "2026-09-20T12:00:00");
+        assert_eq!(a[0].count_last_7_days, 1);
+        // Unknown collection time: nothing is claimed as recent.
+        assert_eq!(aggregate(&old, &[], "probe")[0].count_last_7_days, 0);
+    }
+
+    #[test]
+    fn single_application_error_hang_dotnet_are_single_not_recurring() {
+        for (provider, id) in [
+            ("Application Error", 1000),
+            ("Application Hang", 1002),
+            (".NET Runtime", 1026),
+        ] {
+            let one = ev(
+                provider,
+                id,
+                "2026-10-05T12:00:00",
+                "x",
+                &[("param1", "app.exe")],
+            );
+            let act = actionable(&aggregate(std::slice::from_ref(&one), &[], NOW));
+            assert_eq!(act.len(), 1);
+            assert_eq!(act[0].class, FindingClass::SoftwareSingle, "{provider}");
+            assert_eq!(act[0].class.code(), "SOFTWARE_SINGLE");
+            assert_ne!(act[0].class, FindingClass::Historical);
+            let two = [one.clone(), one.clone()];
+            assert_eq!(
+                actionable(&aggregate(&two, &[], NOW))[0].class,
+                FindingClass::SoftwareSingle,
+                "below RECURRENCE_MIN"
+            );
+            let three = [one.clone(), one.clone(), one];
+            assert_eq!(
+                actionable(&aggregate(&three, &[], NOW))[0].class,
+                FindingClass::SoftwareRecurring
+            );
+        }
     }
 
     #[test]
@@ -1045,7 +1309,7 @@ mod tests {
             .map(|d| user(&format!("2026-09-{:02}T10:00:00", (d % 28) + 1)))
             .collect();
         events.push(kernel);
-        let aggs = aggregate(&events, &[]);
+        let aggs = aggregate(&events, &[], NOW);
         let u = aggs
             .iter()
             .find(|a| a.group == Some(Group::CodeIntegrityUser))
@@ -1082,7 +1346,7 @@ mod tests {
                 &[],
             )
         };
-        let aggs = aggregate(&[e.clone(), e], &[]);
+        let aggs = aggregate(&[e.clone(), e], &[], NOW);
         let a = &aggs[0];
         assert_eq!(a.count, 2);
         // Keyed by the executable file name; the full path stays in the
@@ -1106,6 +1370,7 @@ mod tests {
         let aggs = aggregate(
             &[mk("volsnap", 33), mk("volsnap", 25), mk("VSS", 8193)],
             &[],
+            NOW,
         );
         let cats: Vec<&str> = aggs.iter().map(|a| a.category.as_str()).collect();
         assert!(cats.contains(&"restore_point_eviction_quota"));
@@ -1135,6 +1400,7 @@ mod tests {
         let aggs = aggregate(
             &[s("2026-10-01T08:00:00"), s("2026-10-02T08:00:00"), tpm],
             &[],
+            NOW,
         );
         let sch = aggs
             .iter()
@@ -1158,7 +1424,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].field(&["param1"]), Some("Foo Service"));
         assert_eq!(services[0].name, "foosvc");
-        let aggs = aggregate(&events, &services);
+        let aggs = aggregate(&events, &services, NOW);
         let js = to_json(&aggs, None, "t");
         let v = crate::deep_checks::json::parse(&js).unwrap();
         assert_eq!(
@@ -1183,7 +1449,7 @@ mod tests {
                 e
             })
             .collect();
-        let quota = aggregate(&spread, &[]);
+        let quota = aggregate(&spread, &[], NOW);
         assert_eq!(quota.len(), 1);
         assert_eq!(quota[0].count, 39);
         assert_eq!(quota[0].count_last_7_days, 11);
@@ -1211,7 +1477,11 @@ mod tests {
             e.log = "Application".into();
             e
         };
-        let aggs = aggregate(&[mk("sdwra_1_2"), mk("sdwra_3_4"), mk("sdwra_5_6")], &[]);
+        let aggs = aggregate(
+            &[mk("sdwra_1_2"), mk("sdwra_3_4"), mk("sdwra_5_6")],
+            &[],
+            NOW,
+        );
         assert_eq!(aggs.len(), 1, "one aggregate across temp folders");
         assert_eq!(aggs[0].count, 3);
         assert!(
@@ -1254,6 +1524,7 @@ mod tests {
                 t("ScDeviceEnum", "30000", "2026-10-03T10:00:00"),
             ],
             &[],
+            NOW,
         );
         assert_eq!(aggs.len(), 2, "{aggs:?}");
         let rt = aggs
@@ -1291,7 +1562,7 @@ mod tests {
             start_mode: "Auto".into(),
             path: "svchost.exe -k LocalService".into(),
         };
-        let act = actionable(&aggregate(&events, &[svc]), None);
+        let act = actionable(&aggregate(&events, &[svc], NOW));
         assert_eq!(act.len(), 1);
         assert_eq!(act[0].class, FindingClass::SoftwareRecurring);
         assert!(
@@ -1310,7 +1581,7 @@ mod tests {
             "x",
             &[("param1", "AmmyyAdmin")],
         )];
-        let a = actionable(&aggregate(&orphan, &[]), None);
+        let a = actionable(&aggregate(&orphan, &[], NOW));
         assert_eq!(
             a[0].class,
             FindingClass::Historical,
@@ -1333,7 +1604,7 @@ mod tests {
             ],
         );
         e.log = "Application".into();
-        let act = actionable(&aggregate(&[e], &[]), None);
+        let act = actionable(&aggregate(&[e], &[], NOW));
         assert_eq!(
             act[0].title,
             "happd.exe — 1× сбой · Exception 0xc0000005 · модуль ntdll.dll"
@@ -1360,7 +1631,7 @@ mod tests {
         );
         assert_eq!(vss_category(&idle), "vss_idle_shutdown");
         assert_eq!(vss_category(&quota), "restore_point_eviction_quota");
-        let act = actionable(&aggregate(&[idle, quota], &[]), None);
+        let act = actionable(&aggregate(&[idle, quota], &[], NOW));
         assert!(
             act.iter().all(|a| a.class == FindingClass::Historical),
             "{act:?}"
