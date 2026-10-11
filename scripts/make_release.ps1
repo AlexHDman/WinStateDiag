@@ -1,4 +1,4 @@
-# WinStateDiag - versioned PORTABLE release (the only way to produce a
+﻿# WinStateDiag - versioned PORTABLE release (the only way to produce a
 # user-testable EXE).
 #
 # Rule: target\ is internal build output only. Users test ONLY
@@ -38,11 +38,23 @@ function Run([string]$name, [scriptblock]$cmd) {
     Write-Host "   PASS" -ForegroundColor Green
 }
 
-# 1. version
+# 1. version (v1.0 policy: Cargo semver 1.0.0 -> release name "1.0"; a
+#    patch digit is kept only when it is not zero, exactly as build.rs).
 $cargo = Get-Content (Join-Path $root 'Cargo.toml') -Raw
-if ($cargo -notmatch '(?ms)^\[package\].*?^version\s*=\s*"(\d+\.\d+\.\d+)"') { Fail 'version not found in Cargo.toml' }
-$version = $Matches[1]
-Write-Host "WinStateDiag release v$version" -ForegroundColor Yellow
+if ($cargo -notmatch '(?ms)^\[package\].*?^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') { Fail 'version not found in Cargo.toml' }
+$semver = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+$version = if ($Matches[3] -eq '0') { "$($Matches[1]).$($Matches[2])" } else { $semver }
+Write-Host "WinStateDiag release v$version (Cargo $semver)" -ForegroundColor Yellow
+
+# Older releases are never touched: hash them before and verify after.
+$dist = Join-Path $root 'dist'
+function Get-OtherReleaseHashes {
+    Get-ChildItem -LiteralPath $dist -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notlike (Join-Path $dist "WinStateDiag-v$version\*") } |
+        ForEach-Object { "$($_.FullName)|$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash)" } |
+        Sort-Object
+}
+$othersBefore = @(Get-OtherReleaseHashes)
 
 # 2-3. quality gate + fresh build
 Run 'cargo fmt --check' { cargo fmt --check }
@@ -59,12 +71,11 @@ if ($buildItem.LastWriteTime -lt $started) { Fail "target EXE is older than this
 # 4. version metadata
 $fileVersion = $buildItem.VersionInfo.FileVersion
 $productVersion = $buildItem.VersionInfo.ProductVersion
-if (-not ("$fileVersion" -like "$version*" -or "$productVersion" -like "$version*")) {
+if (-not ("$fileVersion" -eq "$version" -and "$productVersion" -eq "$version")) {
     Fail "EXE version metadata ($fileVersion / $productVersion) does not match Cargo version $version"
 }
 
 # 5. copy into the versioned portable folder
-$dist = Join-Path $root 'dist'
 $releaseDir = Join-Path $dist "WinStateDiag-v$version"
 $releaseExe = Join-Path $releaseDir 'WinStateDiag.exe'
 if ((Test-Path $releaseExe) -and -not $Force) {
@@ -110,5 +121,8 @@ $lines | Out-File (Join-Path $manifestDir "v$version.txt") -Encoding utf8
 Write-Host ''
 $lines | ForEach-Object { Write-Host $_ }
 if (-not $match) { Fail 'SHA256 of the dist EXE does not match the fresh build' }
+$othersAfter = @(Get-OtherReleaseHashes)
+if (($othersBefore -join "`n") -ne ($othersAfter -join "`n")) { Fail 'an older dist release changed during this run' }
+Write-Host "OLDER_RELEASES_UNCHANGED=YES ($($othersAfter.Count) files)"
 Write-Host "`nRELEASE PASS: test ONLY $releaseExe" -ForegroundColor Green
 exit 0

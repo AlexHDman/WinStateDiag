@@ -1,10 +1,19 @@
 [package]
 name = "win_state_diag"
-version = "0.4.3"
+version = "1.0.0"
 edition = "2024"
 authors = ["EXPC Design and Production"]
 description = "Portable Windows state diagnostic center"
 publish = false
+
+# The shipped EXE carries a requireAdministrator manifest (build.rs, scoped to
+# this bin). Cargo applies bin-scoped link args to the bin's own unittest
+# harness too, so the bin has no test harness: all code and tests live in the
+# library (src/lib.rs) and `cargo test` never needs elevation.
+[[bin]]
+name = "win_state_diag"
+path = "src/main.rs"
+test = false
 
 [dependencies]
 egui = "0.36"
