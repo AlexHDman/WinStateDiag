@@ -177,6 +177,9 @@ impl SmartHealthLog {
     }
 }
 
+/// Meaning of the two error-log facts (SMART counter vs log page).
+pub const ERROR_LOG_SEMANTICS: &str = "error_information_log_entries (SMART / Health log) is a lifetime counter; the Error Information log page holds only the most recent entries (Error Count 0 = empty slot), so a non-zero counter with fewer or no listed entries is normal. Neither is a failure by itself.";
+
 /// Critical Warning bits (NVMe Base Specification, SMART / Health log
 /// byte 0). Bits 6–7 are reserved and reported as such if ever set.
 pub const CRITICAL_WARNING_BITS: [(u8, &str); 6] = [
@@ -880,10 +883,21 @@ pub fn to_json(h: &NvmeHealth) -> String {
             format!("[\n{}\n    ]", items.join(",\n"))
         }
     };
+    // v1.0: the SMART counter is the LIFETIME number of error log entries;
+    // the Error Information log page keeps only the most recent entries
+    // (entries with Error Count 0 are empty slots). A non-zero counter with
+    // an empty page is normal and not a contradiction.
+    let lifetime = h
+        .smart
+        .as_ref()
+        .map(|l| json::string(&l.error_information_log_entries.to_string()))
+        .unwrap_or_else(|| "null".into());
     f.push(format!(
-        "  \"error_information_log\": {{\n    \"status\": {},\n    \"detail\": {},\n    \"entries\": {}\n  }}",
+        "  \"error_information_log\": {{\n    \"status\": {},\n    \"detail\": {},\n    \"lifetime_entries_counter\": {},\n    \"semantics\": {},\n    \"entries\": {}\n  }}",
         json::string(h.error_log_status.as_str()),
         opt_str(h.error_log_detail.as_deref()),
+        lifetime,
+        json::string(ERROR_LOG_SEMANTICS),
         entries
     ));
     f.push(match &h.reliability {
@@ -1230,6 +1244,17 @@ pub fn extract_protocol_data(out: &[u8], expected: usize) -> Result<Vec<u8>, Pro
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// v1.0 (real Netac case): SMART counter 9, empty log page — both are
+    /// written with their meaning so the pair is not read as a contradiction.
+    #[test]
+    fn error_log_counter_and_page_are_labelled_with_their_semantics() {
+        assert!(ERROR_LOG_SEMANTICS.contains("lifetime counter"));
+        assert!(ERROR_LOG_SEMANTICS.contains("only the most recent entries"));
+        let src = include_str!("nvme_health.rs");
+        assert!(src.contains("\\\"lifetime_entries_counter\\\": {}"));
+        assert!(src.contains("json::string(ERROR_LOG_SEMANTICS)"));
+    }
+
     #[test]
     fn identify_controller_thresholds_are_read_or_left_unknown() {
         let mut id = vec![0u8; IDENTIFY_LEN];

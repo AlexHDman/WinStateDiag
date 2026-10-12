@@ -404,13 +404,18 @@ where
 /// v1.0 physical transport ceiling (decimal MB/s) of a Windows bus type.
 /// SATA / ATA 6 Gb/s carry at most ~600 MB/s of payload; USB depends on the
 /// unknown link generation, so only the fastest USB link is used as the
-/// ceiling. `None` = no defensible ceiling (NVMe, RAID, unknown, virtual).
+/// ceiling; NVMe uses the absolute PCIe 5.0 x4 ceiling. `None` = no
+/// defensible ceiling (RAID, Storage Spaces, unknown, virtual).
 pub fn transport_ceiling_mb_s(bus_type: &str) -> Option<f64> {
     match bus_type.trim() {
         "SATA" | "ATA" | "ATAPI" => Some(600.0),
         "SAS" => Some(2_400.0),
         "USB" => Some(2_500.0),
         "SD" | "MMC" => Some(320.0),
+        // v1.0: no single NVMe drive exceeds the fastest link in use
+        // (PCIe 5.0 x4 ≈ 15 760 MB/s of payload); the generation itself is
+        // never guessed, only this absolute ceiling is applied.
+        "NVMe" => Some(16_000.0),
         _ => None,
     }
 }

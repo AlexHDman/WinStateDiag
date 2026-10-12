@@ -232,7 +232,11 @@ if ($env:SystemRoot) {
     if (-not $fullPath) { $fullPath = Join-Path $env:SystemRoot 'MEMORY.DMP' }
 }
 $dumps = @()
-foreach ($d in @($dirs | Select-Object -Unique)) {
+# v1.0: one folder once — case-insensitive, without a trailing "\"
+# (CrashControl "%SystemRoot%\Minidump" and $env:SystemRoot\Minidump are
+# usually the same folder in another letter case).
+$dirs = @($dirs | Where-Object { $_ } | ForEach-Object { ([string]$_).TrimEnd('\') } | Sort-Object -Unique)
+foreach ($d in $dirs) {
     try {
         if (Test-Path -LiteralPath $d) {
             $dumps += @(Get-ChildItem -LiteralPath $d -Filter *.dmp -File -ErrorAction Stop | ForEach-Object {
@@ -327,7 +331,7 @@ if ($env:SystemRoot) {
     try {
         if (Test-Path -LiteralPath $lkrRoot) {
             $lkr = @(Get-ChildItem -LiteralPath $lkrRoot -Recurse -File -Filter *.dmp -ErrorAction Stop | Sort-Object LastWriteTime -Descending | Select-Object -First 50 | ForEach-Object {
-                [PSCustomObject]@{ name = $_.Name; dir = $_.Directory.Name; size = [int64]$_.Length; t = $_.LastWriteTime.ToString('s') } })
+                [PSCustomObject]@{ name = $_.Name; dir = $_.Directory.Name; path = $_.FullName; size = [int64]$_.Length; t = $_.LastWriteTime.ToString('s') } })
         }
     } catch { $notes += 'LiveKernelReports not readable' }
 }
@@ -481,7 +485,7 @@ pub fn parse_inventory(stdout: &str) -> Option<Inventory> {
         }
     }
     bugchecks.sort_by(|a, b| b.time.cmp(&a.time));
-    let dumps = arr(v.get("dumps"))
+    let dumps: Vec<DumpFile> = arr(v.get("dumps"))
         .iter()
         .filter_map(|d| {
             Some(DumpFile {
@@ -502,6 +506,26 @@ pub fn parse_inventory(stdout: &str) -> Option<Inventory> {
                     DumpKind::Mini
                 },
             })
+        })
+        .collect();
+    // v1.0: the same dump FILE listed twice (two spellings of one folder)
+    // is one dump — identity = full path (case-insensitive) + size + time,
+    // never the file name alone.
+    let mut seen: Vec<(String, u64, String)> = Vec::new();
+    let dumps: Vec<DumpFile> = dumps
+        .into_iter()
+        .filter(|d| {
+            let id = (
+                d.path.trim().trim_end_matches('\\').to_lowercase(),
+                d.size,
+                d.modified.clone(),
+            );
+            if seen.contains(&id) {
+                false
+            } else {
+                seen.push(id);
+                true
+            }
         })
         .collect();
     let cdb = v
@@ -3013,5 +3037,21 @@ IMAGE_NAME:  ntkrnlmp.exe\n";
         assert!(json.contains("\"window_days\": 30"), "{json}");
         assert!(json.contains("\"counting_rule\""), "{json}");
         assert!(json.contains("\"unexpected_shutdowns\": 5"), "{json}");
+    }
+}
+
+#[cfg(test)]
+mod dump_identity_tests {
+    use super::*;
+
+    /// v1.0: one dump file listed through two spellings of one folder is
+    /// counted once; the same NAME in another folder is another dump.
+    #[test]
+    fn the_same_dump_file_is_counted_once_by_full_path_size_and_time() {
+        let out = r#"WSD_CRASH {"bugchecks":[],"dumps":[{"path":"C:\\Windows\\Minidump\\100326-10421-01.dmp","name":"100326-10421-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"C:\\WINDOWS\\Minidump\\100326-10421-01.dmp","name":"100326-10421-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"D:\\Dumps\\100326-10421-01.dmp","name":"100326-10421-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"}],"cdb":"","notes":[]}"#;
+        let inv = parse_inventory(out).expect("inventory");
+        assert_eq!(inv.dumps.len(), 2, "{:?}", inv.dumps);
+        assert!(INVENTORY_PS1.contains("Sort-Object -Unique)"));
+        assert!(INVENTORY_PS1.contains("path = $_.FullName; size"));
     }
 }

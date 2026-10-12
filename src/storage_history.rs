@@ -187,6 +187,43 @@ pub fn delta(previous: Option<&SessionRecord>, current: Option<u64>) -> ErrorLog
     }
 }
 
+/// v1.0: the delta of the session being completed now against the latest
+/// COMPATIBLE completed session of the same physical disk — completed,
+/// another session, and carrying the counter. A completed session without
+/// the counter (other source, read failure) never anchors a delta and
+/// never turns the result into FIRST_COMPLETED: when earlier completed
+/// sessions exist but none is comparable, the result is UNKNOWN.
+pub fn delta_against_history(
+    records: &[SessionRecord],
+    identity: &str,
+    except_session: &str,
+    current: Option<u64>,
+) -> ErrorLogDelta {
+    let completed = |r: &&SessionRecord| {
+        r.physical_identity == identity
+            && r.status == SessionStatus::Completed
+            && r.session_id != except_session
+    };
+    if current.is_none() {
+        return if records.iter().any(|r| completed(&r)) {
+            ErrorLogDelta::Unknown
+        } else {
+            ErrorLogDelta::FirstCompleted
+        };
+    }
+    let comparable: Vec<SessionRecord> = records
+        .iter()
+        .filter(completed)
+        .filter(|r| r.error_log_entries.is_some())
+        .cloned()
+        .collect();
+    match latest_completed(&comparable, identity, except_session) {
+        Some(prev) => delta(Some(prev), current),
+        None if records.iter().any(|r| completed(&r)) => ErrorLogDelta::Unknown,
+        None => ErrorLogDelta::FirstCompleted,
+    }
+}
+
 fn num(v: Option<u64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "null".into())
 }
@@ -352,6 +389,67 @@ mod tests {
             error_log_entries: log,
             media_errors: Some(0),
         }
+    }
+
+    #[test]
+    fn only_compatible_completed_sessions_anchor_the_delta() {
+        let disk = "PHYS#Samsung SSD 980 1TB#IDX0";
+        let mut h = vec![
+            rec(
+                "S1",
+                "2026-10-01T10:00:00",
+                SessionStatus::Completed,
+                Some(5),
+            ),
+            // Newer completed session WITHOUT the counter: not comparable.
+            rec("S2", "2026-10-02T10:00:00", SessionStatus::Completed, None),
+            // Cancelled with a value: never a baseline.
+            rec(
+                "S3",
+                "2026-10-03T10:00:00",
+                SessionStatus::Cancelled,
+                Some(1),
+            ),
+        ];
+        let d = delta_against_history(&h, disk, "NOW", Some(9));
+        assert_eq!(d.code(), "DELTA", "{d:?}");
+        assert_eq!(d.previous_session(), Some("S1"));
+        // Only non-comparable completed sessions: UNKNOWN, never FIRST.
+        h.remove(0);
+        assert_eq!(
+            delta_against_history(&h, disk, "NOW", Some(9)).code(),
+            "UNKNOWN"
+        );
+        // Really nothing completed before: FIRST_COMPLETED.
+        h.retain(|r| r.status != SessionStatus::Completed);
+        assert_eq!(
+            delta_against_history(&h, disk, "NOW", Some(9)).code(),
+            "FIRST_COMPLETED"
+        );
+        // Another disk's history is never compared.
+        let other = vec![rec(
+            "S9",
+            "2026-10-01T10:00:00",
+            SessionStatus::Completed,
+            Some(1),
+        )];
+        let mut o = other.clone();
+        o[0].physical_identity = "PHYS#B".into();
+        assert_eq!(
+            delta_against_history(&o, disk, "NOW", Some(9)).code(),
+            "FIRST_COMPLETED"
+        );
+        // The session being completed now is never its own baseline.
+        let own = vec![rec(
+            "NOW",
+            "2026-10-01T10:00:00",
+            SessionStatus::Completed,
+            Some(1),
+        )];
+        assert_eq!(
+            delta_against_history(&own, disk, "NOW", Some(9)).code(),
+            "FIRST_COMPLETED"
+        );
     }
 
     #[test]

@@ -863,6 +863,7 @@ mod tests {
             folder: folder.into(),
             size: 1,
             time: time.into(),
+            ..Default::default()
         }
     }
 

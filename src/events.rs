@@ -593,18 +593,64 @@ pub fn vss_category(e: &RawEvent) -> &'static str {
     let p = e.provider.to_ascii_lowercase();
     if p == "volsnap" {
         match e.id {
+            // Oldest shadow copy removed to stay below the quota: normal.
             33 => "restore_point_eviction_quota",
-            25 | 35 | 36 => "shadow_copies_deleted_storage",
+            // Storage could not grow IN TIME: shadow copies lost.
+            25 | 35 => "shadow_copies_deleted_storage",
+            // Aborted because the storage hit the USER-IMPOSED limit:
+            // a configuration consequence, analysed on its own.
+            36 => "shadow_copies_aborted_storage_limit",
+            // Aborted during detection (volume arrival / offline volume).
+            29 => "shadow_copies_aborted_detection",
             _ => "volsnap_other",
         }
     } else {
         match e.id {
+            8193 | 8194 | 12289 | 12293 | 12298 | 13 if vss_shutdown_context(e) => {
+                "vss_shutdown_context"
+            }
             8193 | 8194 | 12289 | 12293 | 12298 | 13 => "vss_operation_failure",
             // VSS service shutting down after its idle timeout: normal.
             8224 => "vss_idle_shutdown",
+            // VSS service stopped by the SCM shutdown event: normal.
+            8225 => "vss_scm_shutdown",
             _ => "vss_other",
         }
     }
+}
+
+/// VSS error raised while Windows was shutting down: HRESULT 0x8007045b
+/// (ERROR_SHUTDOWN_IN_PROGRESS) or the shutdown text. Such an error is a
+/// consequence of the shutdown, not a VSS malfunction.
+pub fn vss_shutdown_context(e: &RawEvent) -> bool {
+    let m = e.message.to_lowercase();
+    m.contains("0x8007045b")
+        || m.contains("идет завершение работы системы")
+        || m.contains("идёт завершение работы системы")
+        || m.contains("system shutdown is in progress")
+        || e.data
+            .iter()
+            .any(|(_, v)| v.to_ascii_lowercase().contains("0x8007045b"))
+}
+
+/// Volume of a Volsnap message ("volume C:" / "тома C:"); empty if none.
+pub fn volsnap_volume(e: &RawEvent) -> String {
+    let m = &e.message;
+    for key in ["volume ", "тома ", "том "] {
+        let mut from = 0;
+        while let Some(i) = m[from..].find(key) {
+            let a = from + i + key.len();
+            let v: String = m[a..].chars().take(2).collect();
+            let mut c = v.chars();
+            if let (Some(l), Some(':')) = (c.next(), c.next())
+                && l.is_ascii_alphabetic()
+            {
+                return format!("{}:", l.to_ascii_uppercase());
+            }
+            from = a;
+        }
+    }
+    String::new()
 }
 
 /// Key fields of one event (the aggregation identity inside its group).
@@ -681,7 +727,19 @@ fn key_of(group: Group, e: &RawEvent) -> (Vec<(String, String)>, String) {
             }
             (key, ci_category(e.id).to_string())
         }
-        Group::Vss => (Vec::new(), vss_category(e).to_string()),
+        Group::Vss => {
+            let volume = if e.provider.eq_ignore_ascii_case("volsnap") {
+                volsnap_volume(e)
+            } else {
+                String::new()
+            };
+            let key = if volume.is_empty() {
+                Vec::new()
+            } else {
+                vec![kv("Volume", volume)]
+            };
+            (key, vss_category(e).to_string())
+        }
         Group::AppErrors => {
             let (process, module, exception) = app_identity(e);
             let mut key = vec![
@@ -1208,14 +1266,59 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                 ));
             }
             Group::Vss => {
-                let class = if a.category == "vss_operation_failure" {
-                    FindingClass::SoftwareRecurring
-                } else {
-                    FindingClass::Historical
+                // VSS is never declared faulty without confirmed operational
+                // errors; normal activity is INFO, shutdown-time errors and
+                // quota-limit aborts are historical context.
+                let (class, what) = match a.category.as_str() {
+                    "vss_operation_failure" if a.count >= RECURRENCE_MIN => (
+                        FindingClass::SoftwareRecurring,
+                        "подтверждённая операционная ошибка VSS",
+                    ),
+                    "vss_operation_failure" => (
+                        FindingClass::Historical,
+                        "единичная операционная ошибка VSS",
+                    ),
+                    "shadow_copies_deleted_storage" => (
+                        FindingClass::Historical,
+                        "теневые копии удалены: хранилище не успело вырасти",
+                    ),
+                    "vss_shutdown_context" => (
+                        FindingClass::Historical,
+                        "ошибка во время завершения работы Windows (0x8007045b), не сбой VSS",
+                    ),
+                    "shadow_copies_aborted_storage_limit" => (
+                        FindingClass::Historical,
+                        "теневые копии прерваны: достигнут пользовательский лимит хранилища",
+                    ),
+                    "shadow_copies_aborted_detection" => (
+                        FindingClass::Historical,
+                        "теневые копии тома прерваны при обнаружении (подключение / отключение тома)",
+                    ),
+                    "restore_point_eviction_quota" => (
+                        FindingClass::Informational,
+                        "старая теневая копия удалена по квоте — штатно",
+                    ),
+                    "vss_idle_shutdown" => (
+                        FindingClass::Informational,
+                        "служба VSS остановлена по простою — штатно",
+                    ),
+                    "vss_scm_shutdown" => (
+                        FindingClass::Informational,
+                        "служба VSS остановлена при завершении работы — штатно",
+                    ),
+                    "vss_other" => (FindingClass::Informational, "информационное событие VSS"),
+                    _ => (FindingClass::Historical, "событие Volsnap"),
+                };
+                let volume = match key_val(a, "Volume") {
+                    "" => String::new(),
+                    v => format!(" · том {v}"),
                 };
                 out.push(base(
                     class,
-                    format!("{} {} ({}) — {}×", a.provider, a.id, a.category, a.count),
+                    format!(
+                        "{} {} ({}) — {}×{volume} · {what}",
+                        a.provider, a.id, a.category, a.count
+                    ),
                 ));
             }
             _ => {}
@@ -2101,8 +2204,81 @@ mod tests {
         assert_eq!(vss_category(&quota), "restore_point_eviction_quota");
         let act = actionable(&aggregate(&[idle, quota], &[], NOW));
         assert!(
-            act.iter().all(|a| a.class == FindingClass::Historical),
-            "{act:?}"
+            act.iter().all(|a| a.class == FindingClass::Informational),
+            "normal activity: {act:?}"
+        );
+    }
+
+    /// Real VSS / Volsnap messages (RU Windows, 30-day window).
+    #[test]
+    fn vss_shutdown_errors_and_volsnap_29_36_are_not_vss_failures() {
+        let app = |id: u32, t: &str, m: &str| {
+            let mut e = ev("VSS", id, t, m, &[]);
+            e.log = "Application".into();
+            e
+        };
+        let sys = |id: u32, t: &str, m: &str| ev("volsnap", id, t, m, &[]);
+        let mut events = Vec::new();
+        for d in 1..=4 {
+            events.push(app(13, &format!("2026-10-0{d}T23:59:00"), "Volume Shadow Copy Service information: The COM Server with CLSID {4e14fba2-2e22-11d1-9964-00c04fbbb345} and name CEventSystem cannot be started. [0x8007045b, Идет завершение работы системы. ]"));
+        }
+        events.push(app(8193, "2026-10-04T23:59:01", "Volume Shadow Copy Service error: Unexpected error calling routine CoCreateInstance. hr = 0x8007045b, Идет завершение работы системы. ."));
+        events.push(app(8225, "2026-10-04T23:59:02", "The VSS service is shutting down due to shutdown event from the Service Control Manager."));
+        for d in 1..=9 {
+            events.push(app(
+                8224,
+                &format!("2026-10-0{d}T12:00:00"),
+                "The VSS service is shutting down due to idle timeout.",
+            ));
+        }
+        events.push(sys(36, "2026-10-02T03:00:00", "The shadow copies of volume C: were aborted because the shadow copy storage could not grow due to a user imposed limit."));
+        events.push(sys(
+            29,
+            "2026-10-03T03:00:00",
+            "The shadow copies of volume F: were aborted during detection.",
+        ));
+        events.push(sys(33, "2026-10-03T03:00:00", "The oldest shadow copy of volume C: was deleted to keep disk space usage for shadow copies of volume C: below the user defined limit."));
+        let aggs = aggregate(&events, &[], NOW);
+        let cat = |id: u32| aggs.iter().find(|a| a.id == id).unwrap().category.clone();
+        assert_eq!(cat(13), "vss_shutdown_context");
+        assert_eq!(cat(8193), "vss_shutdown_context");
+        assert_eq!(cat(8225), "vss_scm_shutdown");
+        assert_eq!(cat(36), "shadow_copies_aborted_storage_limit");
+        assert_eq!(cat(29), "shadow_copies_aborted_detection");
+        let act = actionable(&aggs);
+        assert!(
+            act.iter()
+                .all(|g| g.class != FindingClass::SoftwareRecurring),
+            "no confirmed VSS failure: {act:?}"
+        );
+        let v29 = act
+            .iter()
+            .find(|g| g.title.starts_with("volsnap 29"))
+            .unwrap();
+        assert!(v29.title.contains("том F:"), "{}", v29.title);
+        let v36 = act
+            .iter()
+            .find(|g| g.title.starts_with("volsnap 36"))
+            .unwrap();
+        assert!(
+            v36.title.contains("том C:") && v36.title.contains("пользовательский лимит"),
+            "{}",
+            v36.title
+        );
+        let s13 = act.iter().find(|g| g.title.starts_with("VSS 13")).unwrap();
+        assert_eq!(s13.class, FindingClass::Historical);
+        assert!(s13.title.contains("0x8007045b"), "{}", s13.title);
+        // A confirmed operational error outside shutdown stays a failure.
+        let real: Vec<RawEvent> = (1..=3)
+            .map(|d| app(8193, &format!("2026-10-0{d}T10:00:00"), "Volume Shadow Copy Service error: Unexpected error querying for the IVssWriterCallback interface. hr = 0x80070005, Access is denied."))
+            .collect();
+        let act = actionable(&aggregate(&real, &[], NOW));
+        assert_eq!(act[0].class, FindingClass::SoftwareRecurring);
+        let one = actionable(&aggregate(&real[..1], &[], NOW));
+        assert_eq!(
+            one[0].class,
+            FindingClass::Historical,
+            "one error is not recurring"
         );
     }
     // ---- v1.0 Evidence Fix (Phase 02): real-world messages ----

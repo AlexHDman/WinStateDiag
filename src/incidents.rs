@@ -33,13 +33,49 @@ pub struct CorrelatedEvent {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LiveKernelReport {
     pub name: String,
     /// Report folder (WATCHDOG, NDIS, USBHUB3, …).
     pub folder: String,
     pub size: u64,
     pub time: String,
+    /// v1.0: full path of the report file (empty in older evidence).
+    pub path: String,
+}
+
+impl LiveKernelReport {
+    /// v1.0 identity of a report FILE: full path (case-insensitive; folder +
+    /// name when the path is missing) + size + time. Two reports with the
+    /// same file name in different folders, or the same name rewritten with
+    /// another size / time, are different reports; only the very same file
+    /// listed twice is one.
+    pub fn identity(&self) -> (String, u64, String) {
+        let path = if self.path.trim().is_empty() {
+            format!("{}\\{}", self.folder.trim(), self.name.trim())
+        } else {
+            self.path.trim().to_string()
+        };
+        (path.to_lowercase(), self.size, self.time.clone())
+    }
+}
+
+/// Removes repeated listings of the same report file (`identity`), keeping
+/// the first occurrence and the order.
+pub fn dedup_live_kernel_reports(reports: Vec<LiveKernelReport>) -> Vec<LiveKernelReport> {
+    let mut seen = Vec::new();
+    reports
+        .into_iter()
+        .filter(|r| {
+            let id = r.identity();
+            if seen.contains(&id) {
+                false
+            } else {
+                seen.push(id);
+                true
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,15 +449,18 @@ pub fn parse_incidents(v: Option<&json::Value>) -> Vec<Incident> {
 }
 
 pub fn parse_live_kernel_reports(v: Option<&json::Value>) -> Vec<LiveKernelReport> {
-    arr(v)
-        .iter()
-        .map(|r| LiveKernelReport {
-            name: s(r, "name"),
-            folder: s(r, "dir"),
-            size: num(r, "size").max(0.0) as u64,
-            time: s(r, "t"),
-        })
-        .collect()
+    dedup_live_kernel_reports(
+        arr(v)
+            .iter()
+            .map(|r| LiveKernelReport {
+                name: s(r, "name"),
+                folder: s(r, "dir"),
+                size: num(r, "size").max(0.0) as u64,
+                time: s(r, "t"),
+                path: s(r, "path"),
+            })
+            .collect(),
+    )
 }
 
 /// Evidence JSON (`Incidents_<stamp>.json`): every incident with its
@@ -554,9 +593,10 @@ pub fn to_json(
     for (k, r) in reports.iter().enumerate() {
         o.push_str(if k == 0 { "\n" } else { ",\n" });
         o.push_str(&format!(
-            "    {{ \"folder\": {}, \"name\": {}, \"size\": {}, \"time\": {} }}",
+            "    {{ \"folder\": {}, \"name\": {}, \"path\": {}, \"size\": {}, \"time\": {} }}",
             q(&r.folder),
             q(&r.name),
+            q(&r.path),
             r.size,
             q(&r.time)
         ));
@@ -712,6 +752,7 @@ pub(crate) mod tests {
             folder: f.into(),
             size: 1,
             time: t.into(),
+            ..Default::default()
         };
         let reports = [
             r("2026-10-04T20:57:30", "WATCHDOG"),
@@ -753,5 +794,35 @@ pub(crate) mod tests {
         assert_eq!(inc[0].sources, ["KP41", "EL6008"]);
         let lkr = parse_live_kernel_reports(v.get("lkr"));
         assert_eq!(lkr[0].folder, "WATCHDOG");
+    }
+
+    /// v1.0: live kernel reports are deduplicated by full path + size +
+    /// time — never by the file name alone.
+    #[test]
+    fn live_kernel_reports_dedup_by_full_path_size_and_time() {
+        let v = json::parse(r#"{"lkr":[
+            {"name":"WATCHDOG-20261004-2057.dmp","dir":"WATCHDOG","path":"C:\\Windows\\LiveKernelReports\\WATCHDOG\\WATCHDOG-20261004-2057.dmp","size":10,"t":"2026-10-04T20:57:30"},
+            {"name":"WATCHDOG-20261004-2057.dmp","dir":"WATCHDOG","path":"C:\\WINDOWS\\LiveKernelReports\\WATCHDOG\\WATCHDOG-20261004-2057.dmp","size":10,"t":"2026-10-04T20:57:30"},
+            {"name":"WATCHDOG-20261004-2057.dmp","dir":"old","path":"C:\\Windows\\LiveKernelReports\\WATCHDOG\\old\\WATCHDOG-20261004-2057.dmp","size":10,"t":"2026-10-04T20:57:30"},
+            {"name":"WATCHDOG-20261004-2057.dmp","dir":"WATCHDOG","path":"C:\\Windows\\LiveKernelReports\\WATCHDOG\\WATCHDOG-20261004-2057.dmp","size":12,"t":"2026-10-05T08:00:00"},
+            {"name":"a.dmp","dir":"NDIS","size":3,"t":"2026-10-01T10:00:00"},
+            {"name":"a.dmp","dir":"NDIS","size":3,"t":"2026-10-01T10:00:00"}
+        ]}"#)
+        .unwrap();
+        let r = parse_live_kernel_reports(v.get("lkr"));
+        assert_eq!(r.len(), 4, "{r:?}");
+        assert_eq!(
+            r.iter()
+                .filter(|x| x.name == "WATCHDOG-20261004-2057.dmp")
+                .count(),
+            3,
+            "same name, different folder / size / time = different reports"
+        );
+        assert!(r[0].path.ends_with("WATCHDOG-20261004-2057.dmp"));
+        let js = to_json(&[], 0, &r);
+        assert!(
+            js.contains("\"path\": \"C:\\\\Windows\\\\LiveKernelReports"),
+            "{js}"
+        );
     }
 }

@@ -380,9 +380,13 @@ impl Finding {
             }
             Finding::ErrorLogEntries(n) => {
                 if ru {
-                    format!("Записей журнала ошибок контроллера: {n} — факт, само по себе не отказ")
+                    format!(
+                        "Записей журнала ошибок контроллера за срок службы: {n} (счётчик SMART; страница журнала хранит только последние записи) — факт, само по себе не отказ"
+                    )
                 } else {
-                    format!("Error log entries: {n} — a fact, not a failure by itself")
+                    format!(
+                        "Error log entries over the drive's lifetime: {n} (SMART counter; the log page keeps only the latest entries) — a fact, not a failure by itself"
+                    )
                 }
             }
             Finding::UnsafeShutdowns(n) => {
@@ -870,8 +874,8 @@ pub fn to_json_with(
     let temp = inputs
         .nvme
         .as_ref()
-        .and_then(crate::nvme_health::temperature_provenance)
-        .map(|(c, s)| format!("{{\"celsius\": {c}, \"source\": {}}}", json::string(s)))
+        .and_then(|h| crate::nvme_health::temperature_provenance(h).map(|t| (h, t)))
+        .map(|(h, (c, s))| temperature_json(h, c, s))
         .unwrap_or_else(|| "null".into());
     let session = extras
         .session
@@ -999,6 +1003,39 @@ pub fn collect_events(host: &str) -> EventsInput {
         },
         Err(_) => EventsInput::NotCollected,
     }
+}
+
+/// v1.0: temperature with its provenance — the value, its source, WHEN it
+/// was read (this disk's health read) and the drive's internal sensors.
+/// The composite value is the drive's own summary; an internal sensor may
+/// be hotter (controller) and a Sensors-page value read at another time
+/// may differ — values from different sources / times are never compared
+/// as if they were one measurement.
+pub fn temperature_json(h: &crate::nvme_health::NvmeHealth, celsius: f64, source: &str) -> String {
+    let sensors = h
+        .smart
+        .as_ref()
+        .map(|l| l.temperature_sensors_c())
+        .unwrap_or_default();
+    let list: Vec<String> = sensors
+        .iter()
+        .map(|(n, c)| format!("{{\"sensor\": {n}, \"celsius\": {c}}}"))
+        .collect();
+    let hottest = sensors
+        .iter()
+        .map(|(_, c)| *c)
+        .max()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"celsius\": {celsius}, \"source\": {}, \"measured_at\": {}, \"internal_sensors\": [{}], \"hottest_internal_sensor_celsius\": {hottest}, \"note\": {}}}",
+        json::string(source),
+        json::string(&h.captured_at),
+        list.join(", "),
+        json::string(
+            "Composite = the drive's own summary value at measured_at; internal sensors (e.g. the controller) may be hotter. Sensor-page values read at another time / by another provider can differ and are not the same measurement."
+        )
+    )
 }
 
 /// `MSFT_StorageReliabilityCounter` (root/Microsoft/Windows/Storage) fields
@@ -1635,5 +1672,38 @@ pub(crate) mod tests {
         // Plain to_json stays valid with null blocks.
         let plain = to_json(&i, &c, "m", None, &[]);
         assert!(json::parse(&plain).is_some(), "{plain}");
+    }
+
+    /// v1.0: temperature carries its time and the internal sensors, so a
+    /// composite 46 °C next to a 64 °C controller sensor or a later
+    /// Sensors-page value is explained, never a contradiction.
+    #[test]
+    fn temperature_block_has_time_source_and_internal_sensors() {
+        let mut h = sata_health(ata(&[(5, 100, 10, 0)]));
+        h.captured_at = "2026-10-12T07:38:24".into();
+        h.smart = Some(
+            crate::nvme_health::parse_smart_log(&crate::nvme_health::tests::smart_bytes()).unwrap(),
+        );
+        let js = temperature_json(&h, 42.0, "nvme_smart_composite_temperature");
+        let v = json::parse(&js).expect("valid JSON");
+        assert_eq!(
+            v.get("measured_at").and_then(|x| x.as_str()),
+            Some("2026-10-12T07:38:24")
+        );
+        assert_eq!(
+            v.get("source").and_then(|x| x.as_str()),
+            Some("nvme_smart_composite_temperature")
+        );
+        assert!(js.contains("{\"sensor\": 1, \"celsius\": 45}"), "{js}");
+        assert!(
+            js.contains("\"hottest_internal_sensor_celsius\": 52"),
+            "{js}"
+        );
+        assert!(js.contains("not the same measurement"));
+        let text = Finding::ErrorLogEntries(9).text(true);
+        assert!(
+            text.contains("за срок службы: 9") && text.contains("не отказ"),
+            "{text}"
+        );
     }
 }

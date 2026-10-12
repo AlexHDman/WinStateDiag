@@ -50,25 +50,67 @@ impl Attribute {
 pub fn attribute_name(id: u8) -> &'static str {
     match id {
         1 => "Raw Read Error Rate",
+        2 => "Throughput Performance",
+        3 => "Spin-Up Time",
+        4 => "Start/Stop Count",
         5 => "Reallocated Sectors Count",
+        7 => "Seek Error Rate",
+        8 => "Seek Time Performance",
         9 => "Power-On Hours",
         10 => "Spin Retry Count",
+        11 => "Calibration Retry Count",
         12 => "Power Cycle Count",
         177 => "Wear Leveling Count (vendor)",
+        183 => "SATA Downshift Error Count (vendor)",
         184 => "End-to-End Error",
         187 => "Reported Uncorrectable Errors",
         188 => "Command Timeout",
+        189 => "High Fly Writes (vendor)",
         190 => "Airflow Temperature",
+        191 => "G-Sense Error Rate",
+        192 => "Power-off Retract Count",
+        193 => "Load Cycle Count",
         194 => "Temperature",
+        195 => "Hardware ECC Recovered (vendor)",
         196 => "Reallocation Event Count",
         197 => "Current Pending Sector Count",
         198 => "Offline Uncorrectable Sector Count",
         199 => "UDMA CRC Error Count",
+        200 => "Multi-Zone Error Rate (vendor)",
         202 => "Percent Lifetime Remaining (vendor)",
+        220 => "Disk Shift",
+        222 => "Loaded Hours",
+        223 => "Load/Unload Retry Count",
+        224 => "Load Friction",
+        226 => "Load-in Time",
         231 => "SSD Life Left (vendor)",
         233 => "Media Wearout Indicator (vendor)",
+        240 => "Head Flying Hours (vendor)",
         241 => "Total LBAs Written",
+        242 => "Total LBAs Read",
         _ => "",
+    }
+}
+
+/// v1.0 meaning of a raw value whose 48 bits are NOT a plain counter:
+/// temperatures pack min / max in the upper bytes, and the error-RATE
+/// attributes (1, 7, 195) are vendor-encoded (Seagate: operations in the
+/// upper bytes) — never an error count. `None` = plain counter / unknown.
+pub fn raw_decoded(a: &Attribute) -> Option<String> {
+    match a.id {
+        190 | 194 => {
+            let t = a.raw & 0xFF;
+            (1..=100)
+                .contains(&t)
+                .then(|| format!("{t} °C (upper bytes: vendor min / max)"))
+        }
+        1 | 7 | 195 => Some(
+            "vendor-encoded rate, not an error count (judge by the normalised value vs threshold)"
+                .into(),
+        ),
+        9 => Some(format!("{} h (low 32 bits)", a.raw & 0xFFFF_FFFF)),
+        240 => Some(format!("{} h (low 32 bits; vendor)", a.raw & 0xFFFF_FFFF)),
+        _ => None,
     }
 }
 
@@ -259,7 +301,7 @@ pub fn to_json(s: &AtaSmart) -> String {
         .iter()
         .map(|a| {
             format!(
-                "{{\"id\": {}, \"name\": {}, \"current\": {}, \"worst\": {}, \"threshold\": {}, \"raw\": {}, \"threshold_exceeded\": {}}}",
+                "{{\"id\": {}, \"name\": {}, \"current\": {}, \"worst\": {}, \"threshold\": {}, \"raw\": {}, \"raw_decoded\": {}, \"threshold_exceeded\": {}}}",
                 a.id,
                 json::string(attribute_name(a.id)),
                 a.current,
@@ -268,6 +310,9 @@ pub fn to_json(s: &AtaSmart) -> String {
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "null".into()),
                 a.raw,
+                raw_decoded(a)
+                    .map(|d| json::string(&d))
+                    .unwrap_or_else(|| "null".into()),
                 a.failing()
             )
         })
@@ -620,5 +665,59 @@ mod tests {
         }
         assert!(code.contains("pub const SMART_READ_DATA: u8 = 0xD0;"));
         assert!(code.contains("pub const SMART_READ_THRESHOLDS: u8 = 0xD1;"));
+    }
+
+    /// Real SATA HDD values (Seagate / Toshiba): packed temperature raw,
+    /// vendor-encoded error RATES and standard names.
+    #[test]
+    fn raw_values_are_decoded_with_their_semantics() {
+        let a = |id: u8, current: u8, raw: u64| Attribute {
+            id,
+            current,
+            worst: current,
+            threshold: Some(0),
+            raw,
+        };
+        assert_eq!(
+            raw_decoded(&a(194, 100, 171_799_871_516)).as_deref(),
+            Some("28 °C (upper bytes: vendor min / max)")
+        );
+        assert_eq!(
+            raw_decoded(&a(190, 68, 572_325_920)).as_deref(),
+            Some("32 °C (upper bytes: vendor min / max)")
+        );
+        let rate = raw_decoded(&a(1, 80, 103_338_720)).unwrap();
+        assert!(rate.contains("not an error count"), "{rate}");
+        assert!(
+            raw_decoded(&a(7, 80, 91_899_100))
+                .unwrap()
+                .contains("not an error count")
+        );
+        assert_eq!(raw_decoded(&a(5, 100, 0)), None, "plain counter");
+        for (id, name) in [
+            (3u8, "Spin-Up Time"),
+            (4, "Start/Stop Count"),
+            (7, "Seek Error Rate"),
+            (192, "Power-off Retract Count"),
+            (193, "Load Cycle Count"),
+            (242, "Total LBAs Read"),
+        ] {
+            assert_eq!(attribute_name(id), name);
+        }
+        // A huge vendor-encoded read error rate never raises attention.
+        let s = AtaSmart {
+            state: AtaState::Ok,
+            detail: String::new(),
+            attributes: vec![
+                a(1, 80, 103_338_720),
+                a(7, 80, 91_899_100),
+                a(194, 32, 103_079_215_136),
+            ],
+        };
+        assert_eq!(s.health(), "SMART: OK");
+        assert_eq!(s.temperature_c(), Some(32));
+        let js = to_json(&s);
+        assert!(json::parse(&format!("{{\"x\": {js}}}")).is_some(), "{js}");
+        assert!(js.contains("\"raw_decoded\": \"32 °C"), "{js}");
     }
 }

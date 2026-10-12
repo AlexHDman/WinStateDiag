@@ -2135,13 +2135,16 @@ $continue = Invoke-Step -Number 5 -Title 'VSS Shadow Storage и события V
 
     }
 
-    # Real VSS operational failures (30 days): Volsnap 25/33/35/36 in System,
+    # Real VSS operational failures (30 days): Volsnap 25/35 in System,
     # VSS 8193/12289 in Application. Recent = last 7 days.
     # v1.0: Volsnap 33 (oldest shadow copy removed by quota) and VSS 8224
-    # (idle shutdown) are normal activity, never failures.
+    # (idle shutdown) are normal activity, never failures. Volsnap 36
+    # (user-imposed storage limit) and 29 (aborted during detection) are
+    # analysed separately; VSS errors with 0x8007045b (shutdown in
+    # progress) are a consequence of the Windows shutdown, not failures.
     $vssFailures = @()
     try {
-        $vssFailures += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='volsnap'; Id=25,35,36; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)
+        $vssFailures += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='volsnap'; Id=25,35; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)
     } catch {}
     $vssQuota = @()
     try {
@@ -2150,9 +2153,29 @@ $continue = Invoke-Step -Number 5 -Title 'VSS Shadow Storage и события V
     if ($vssQuota.Count -gt 0) {
         Write-Log ('Volsnap 33 (удаление старой теневой копии по квоте — штатная активность, не сбой): {0}' -f $vssQuota.Count)
     }
+    $vssShutdown = 0
     try {
-        $vssFailures += @(Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='VSS'; Id=8193,12289; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)
+        foreach ($ve in @(Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='VSS'; Id=8193,12289; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)) {
+            $vm = [string]$ve.Message
+            if ($vm -match '0x8007045b' -or $vm -match 'завершение работы системы' -or $vm -match 'shutdown is in progress') {
+                $vssShutdown++
+            } else {
+                $vssFailures += $ve
+            }
+        }
     } catch {}
+    if ($vssShutdown -gt 0) {
+        Write-Log ('VSS 8193/12289 с 0x8007045b (во время завершения работы Windows — следствие выключения, не сбой VSS): {0}' -f $vssShutdown)
+    }
+    foreach ($vsId in 36, 29) {
+        $vsEv = @()
+        try { $vsEv = @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='volsnap'; Id=$vsId; StartTime=(Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue) } catch {}
+        if ($vsEv.Count -gt 0) {
+            $vols = @($vsEv | ForEach-Object { if ([string]$_.Message -match '(?:volume|тома?)\s+([A-Za-z]:)') { $Matches[1].ToUpper() } } | Sort-Object -Unique) -join ', '
+            $what = if ($vsId -eq 36) { 'теневые копии прерваны: достигнут пользовательский лимит хранилища (конфигурация, не неисправность VSS)' } else { 'теневые копии прерваны при обнаружении тома (подключение / отключение тома)' }
+            Write-Log ('Volsnap {0}: {1}; событий: {2}; тома: {3}' -f $vsId, $what, $vsEv.Count, $(if ($vols) { $vols } else { 'не указаны' }))
+        }
+    }
     $recentCut = (Get-Date).AddDays(-7)
     $recentFailures = @($vssFailures | Where-Object { $_.TimeCreated -ge $recentCut }).Count
     $olderFailures = @($vssFailures).Count - $recentFailures

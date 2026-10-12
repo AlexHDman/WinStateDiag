@@ -496,6 +496,15 @@ fn stability_level(spread: f64) -> StabilityLevel {
     }
 }
 
+/// v1.0: the one stability rule of the TXT / JSON evidence and the GUI.
+const BENCH_STABILITY_RULE: &str = "STABLE <= 5 % spread, ACCEPT <= 12 %, UNSTABLE > 12 % (worse of read / write); stable = STABLE or ACCEPT";
+/// How the benchmark bypasses the Windows file cache (facts of the engine).
+const BENCH_IO_MODE: &str = "FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH, OVERLAPPED QD4, dedicated temporary file: the Windows file cache is bypassed";
+const BENCH_IO_MODE_RU: &str =
+    "FILE_FLAG_NO_BUFFERING + WRITE_THROUGH, QD4 — кэш файловой системы Windows не используется";
+const BENCH_SCOPE: &str = "512 MiB x 4 passes: short burst within the drive's own cache (SLC / DRAM); not a sustained-write rate";
+const BENCH_SCOPE_RU: &str = "512 MiB × 4 прохода — короткий пиковый замер в пределах кэша накопителя (SLC / DRAM), не устойчивая скорость записи";
+
 fn stability_text(level: StabilityLevel) -> &'static str {
     match level {
         StabilityLevel::Stable => "STABLE",
@@ -1318,6 +1327,8 @@ fn ssd_benchmark_evidence_for(
         result.profile.pass_count
     ));
     text.push_str(&format!("Длительность: {duration_seconds:.1} с\r\n"));
+    text.push_str(&format!("Режим I/O: {BENCH_IO_MODE_RU}\r\n"));
+    text.push_str(&format!("Объём теста: {BENCH_SCOPE_RU}\r\n"));
     text.push_str(&format!(
         "READ: {:.1} MB/s (min {:.1}, max {:.1}, разброс {:.2}%)\r\n",
         mb(result.summary_read_mib_s),
@@ -1340,7 +1351,7 @@ fn ssd_benchmark_evidence_for(
     let write_level = stability_level(result.write_variation_percent);
     let overall_level = read_level.max(write_level);
     text.push_str(&format!(
-        "Стабильность: {}\r\n",
+        "Стабильность: {} ({BENCH_STABILITY_RULE})\r\n",
         stability_text(overall_level)
     ));
     match previous {
@@ -1385,7 +1396,7 @@ fn ssd_benchmark_evidence_for(
         out
     };
     let json = format!(
-        "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"run_role\":{},\"captured_at\":{},\"retest_of\":{},\"physical_disk_index\":{},\"model\":{},\"test_dir\":{},\"disk\":{},\"block_size\":{},\"queue_depth\":{},\"test_file_size\":{},\"pass_count\":{},\"duration_s\":{:.3},\"read_mb_s\":{:.3},\"write_mb_s\":{:.3},\"read_variation_percent\":{:.3},\"write_variation_percent\":{:.3},\"stability\":{},\"stable\":{},\"passes\":[{}]}}",
+        "{{\"schema\":\"winstatediag.ssd_benchmark/1\",\"run_role\":{},\"captured_at\":{},\"retest_of\":{},\"physical_disk_index\":{},\"model\":{},\"test_dir\":{},\"disk\":{},\"block_size\":{},\"queue_depth\":{},\"test_file_size\":{},\"pass_count\":{},\"duration_s\":{:.3},\"read_mb_s\":{:.3},\"write_mb_s\":{:.3},\"read_variation_percent\":{:.3},\"write_variation_percent\":{:.3},\"stability\":{},\"stable\":{},\"stability_rule\":{},\"io_mode\":{},\"test_scope\":{},\"passes\":[{}]}}",
         json_str(role.code()),
         json_str(&local_iso(t)),
         retest_of
@@ -1407,7 +1418,13 @@ fn ssd_benchmark_evidence_for(
         result.read_variation_percent,
         result.write_variation_percent,
         json_str(stability_text(overall_level)),
-        overall_level == StabilityLevel::Stable,
+        // v1.0: `stable` = the run is ACCEPTED as a measurement (STABLE or
+        // ACCEPT), the same verdict as `stability` — never "ACCEPT" with
+        // "stable": false.
+        overall_level != StabilityLevel::Unstable,
+        json_str(BENCH_STABILITY_RULE),
+        json_str(BENCH_IO_MODE),
+        json_str(BENCH_SCOPE),
         passes.join(",")
     );
     let mut txt = vec![0xEF, 0xBB, 0xBF];
@@ -2657,12 +2674,10 @@ impl WinStateDiagApp {
         // delta is claimed and the file is not overwritten.
         let loaded = crate::storage_history::load(&history_path);
         let error_log_delta = smart_now.map(|_| match &loaded {
-            Ok(history) => crate::storage_history::delta(
-                crate::storage_history::latest_completed(
-                    history,
-                    identity,
-                    &self.storage_session_id,
-                ),
+            Ok(history) => crate::storage_history::delta_against_history(
+                history,
+                identity,
+                &self.storage_session_id,
                 record.error_log_entries,
             ),
             Err(_) => crate::storage_history::ErrorLogDelta::HistoryUnavailable,
@@ -8725,6 +8740,49 @@ mod ssd_stability_tests {
         let files = ssd_benchmark_evidence(&unstable, &dir, 12.0, None, "test".into());
         let txt = String::from_utf8_lossy(&files[0].bytes).to_string();
         assert!(txt.contains("Стабильность: UNSTABLE"), "{txt}");
+        let json_unstable = String::from_utf8_lossy(&files[1].bytes).to_string();
+        assert!(
+            json_unstable.contains("\"stable\":false"),
+            "{json_unstable}"
+        );
+    }
+
+    /// v1.0 (real case): "stability": "ACCEPT" with "stable": false was a
+    /// contradiction. `stable` now means "accepted measurement" and the
+    /// rule, the I/O mode (no OS cache) and the test scope are written.
+    #[test]
+    fn accept_is_stable_true_and_io_mode_and_scope_are_recorded() {
+        let dir = std::env::temp_dir();
+        let summary = summary_with_spread(7.45, 9.73);
+        let files = ssd_benchmark_evidence(&summary, &dir, 0.6, None, "test".into());
+        let txt = String::from_utf8_lossy(&files[0].bytes).to_string();
+        let json = String::from_utf8_lossy(&files[1].bytes).to_string();
+        assert!(
+            json.contains("\"stability\":\"ACCEPT\",\"stable\":true"),
+            "{json}"
+        );
+        assert!(json.contains("FILE_FLAG_NO_BUFFERING"), "{json}");
+        assert!(json.contains("\"test_scope\":\"512 MiB"), "{json}");
+        assert!(
+            crate::deep_checks::json::parse(&json).is_some(),
+            "valid JSON"
+        );
+        assert!(
+            txt.contains("кэш файловой системы Windows не используется"),
+            "{txt}"
+        );
+        assert!(txt.contains("Стабильность: ACCEPT (STABLE <= 5 %"), "{txt}");
+        // A single NVMe drive faster than PCIe 5.0 x4 is not the disk.
+        let mut fast = summary_with_spread(1.0, 1.0);
+        fast.read_max_mib_s = 21_000.0 / 1.048_576;
+        assert!(crate::storage_benchmark::implausible_reason("NVMe", &fast).is_some());
+        let mut real = summary_with_spread(7.45, 9.73);
+        real.read_max_mib_s = 12_416.2 / 1.048_576;
+        real.write_max_mib_s = 13_349.0 / 1.048_576;
+        assert!(
+            crate::storage_benchmark::implausible_reason("NVMe", &real).is_none(),
+            "a real PCIe 5.0 drive result stays valid"
+        );
     }
 }
 

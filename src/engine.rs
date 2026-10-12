@@ -4048,8 +4048,8 @@ mod expc_v044_tests {
     fn volsnap_33_quota_and_vss_8224_are_not_failures() {
         let s = script();
         assert!(
-            s.contains("ProviderName='volsnap'; Id=25,35,36;"),
-            "33 removed from failures"
+            s.contains("ProviderName='volsnap'; Id=25,35;"),
+            "33 removed from failures (v1.0: 36 / 29 analysed separately)"
         );
         assert!(!s.contains("Id=25,33,35,36"));
         assert!(!s.contains("Id=8193,12289,8224"));
@@ -4072,5 +4072,33 @@ mod expc_v044_tests {
         let s = script();
         assert!(s.contains("$label = '{0} — {1}×' -f $appName, $g.Count"));
         assert!(s.contains("$label += (' · Exception {0}' -f $exc)"));
+    }
+}
+
+/// v1.0 Evidence Fix: EXPC stage 05 never declares VSS faulty without a
+/// confirmed operational error. Volsnap 36 / 29 are analysed on their own
+/// and VSS 8193 / 12289 raised during the Windows shutdown (0x8007045b)
+/// are not counted as failures.
+#[cfg(test)]
+mod vss_stage_tests {
+    use super::EXPC_DIAGNOSTIC_PS1;
+
+    #[test]
+    fn vss_failures_exclude_shutdown_context_and_volsnap_36_29() {
+        let s = String::from_utf8_lossy(EXPC_DIAGNOSTIC_PS1).replace("\r\n", "\n");
+        let start = s
+            .find("$vssFailures = @()")
+            .expect("VSS failure collection");
+        let end = start + s[start..].find("$recentCut =").expect("recent cut");
+        let block = &s[start..end];
+        assert!(
+            block.contains("ProviderName='volsnap'; Id=25,35;"),
+            "{block}"
+        );
+        assert!(!block.contains("Id=25,35,36"), "36 is not a VSS failure");
+        assert!(block.contains("'0x8007045b'"));
+        assert!(block.contains("$vssShutdown++"));
+        assert!(block.contains("foreach ($vsId in 36, 29)"));
+        assert!(block.contains("пользовательский лимит хранилища"));
     }
 }
