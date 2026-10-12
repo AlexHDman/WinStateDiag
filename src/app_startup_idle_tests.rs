@@ -555,6 +555,43 @@ fn a_storage_run_keeps_its_session_after_another_benchmark_starts() {
     let _ = std::fs::remove_dir_all(exe.parent().unwrap());
 }
 
+/// B1 (review round 3): while a finished run's health / events probe is
+/// pending, no new benchmark can start (it would replace the run's pending
+/// assessment — and with another client, leak it into another session).
+#[test]
+fn no_new_benchmark_while_the_previous_runs_probe_is_pending() {
+    let (mut app, exe) = app_in("probe-pending");
+    app.client_name = "Клиент А".into();
+    app.benchmark_path = exe.display().to_string();
+    app.apply(Action::BenchmarkStart);
+    let a = session(&app).unwrap();
+    // A's measurement finished; its health / events probe is still running.
+    app.benchmark_state = BenchmarkUiState::Idle;
+    let (_probe_tx, probe_rx) = std::sync::mpsc::channel();
+    app.nvme_rx = Some(probe_rx);
+    assert!(
+        !app.build_vm(0.0, 0.0).ssd_controls_enabled,
+        "start disabled"
+    );
+    app.client_name = "Клиент Б".into();
+    let requests = app.collector_requests.len();
+    app.apply(Action::BenchmarkStart);
+    assert_eq!(app.collector_requests.len(), requests, "no second run");
+    assert!(!app.benchmark_is_running());
+    assert_eq!(
+        session(&app).unwrap(),
+        a,
+        "no session opened by a refused start"
+    );
+    // The probe ends: the next start runs, in B's own session.
+    app.nvme_rx = None;
+    assert!(app.build_vm(0.0, 0.0).ssd_controls_enabled);
+    app.apply(Action::BenchmarkStart);
+    assert!(app.benchmark_is_running());
+    assert_eq!(session(&app).unwrap().client, "Клиент Б");
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
 /// N3: the analysis that follows an "Analyze" scan stays in the session
 /// the click opened, even if the Client field is edited during the scan.
 #[test]

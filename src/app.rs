@@ -2499,7 +2499,10 @@ impl WinStateDiagApp {
     }
 
     fn start_benchmark(&mut self) {
-        if self.benchmark_is_running() || self.is_running() {
+        // v1.0: the previous run's health / events probe still belongs to
+        // that run (and its session): a new run would replace its pending
+        // assessment, so it waits (the start control is disabled meanwhile).
+        if self.benchmark_is_running() || self.is_running() || self.nvme_rx.is_some() {
             return;
         }
         self.begin_operation(false);
@@ -3729,7 +3732,8 @@ impl WinStateDiagApp {
         // v1.0: the current session and any earlier session a module still
         // completed into (each package once).
         let mut packages: Vec<SharedPackage> = vec![Arc::clone(&self.package)];
-        for p in self.op_packages.values() {
+        let pinned = self.assessments.values().filter_map(|a| a.package.as_ref());
+        for p in self.op_packages.values().chain(pinned) {
             if !packages.iter().any(|q| Arc::ptr_eq(p, q)) {
                 packages.push(Arc::clone(p));
             }
@@ -4593,7 +4597,9 @@ impl WinStateDiagApp {
             overall,
             operation,
             ssd,
-            ssd_controls_enabled: !running && !bench_running,
+            // A storage run is complete only after its health / events
+            // probe: no new run (or disk switch) before that.
+            ssd_controls_enabled: !running && !bench_running && self.nvme_rx.is_none(),
             ssd_disks: self
                 .ssd_candidates
                 .iter()
