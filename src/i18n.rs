@@ -62,6 +62,8 @@ pub struct Dict {
     pub crypto_no_hash: &'static str,
     pub crypto_not_installed: &'static str,
     pub crypto_check_error: &'static str,
+    /// v1.0 Startup Idle: not checked yet (runs with the diagnostic).
+    pub crypto_not_checked: &'static str,
     pub crypto_rehash_button: &'static str,
 
     // ---- EXPC Diagnostics card ----
@@ -106,6 +108,9 @@ pub struct Dict {
     pub driver_running: &'static str,
     pub driver_readonly_note: &'static str,
     pub driver_unavailable: &'static str,
+    /// v1.0 Startup Idle: the audit has not run in this session.
+    pub driver_not_run: &'static str,
+    pub driver_not_run_hint: &'static str,
     pub driver_status_ok: &'static str,
     pub driver_status_warning: &'static str,
     pub driver_status_problem: &'static str,
@@ -180,6 +185,8 @@ pub struct Dict {
     pub ssd_module_name: &'static str,
     /// `{module} {path}`
     pub journal_module_added_fmt: &'static str,
+    /// v1.0 Client Identity: `{session}`, `{client}`, `{computer}`.
+    pub journal_session_started_fmt: &'static str,
     pub journal_ssd_target_unavailable: &'static str,
     /// v1.0 physically impossible benchmark result.
     pub ssd_benchmark_invalid: &'static str,
@@ -429,6 +436,7 @@ pub struct Dict {
     // ---- Driver Audit popup body (v0.3.6 Visual Master alignment §11) ----
     pub driver_popup_running: &'static str,
     pub driver_popup_retry: &'static str,
+    pub driver_popup_run: &'static str,
     pub driver_popup_rerun: &'static str,
     /// `{status} {problems} {warnings} {ok} {devices} {days} {generated}`
     pub driver_popup_summary_fmt: &'static str,
@@ -633,6 +641,7 @@ pub static RU: Dict = Dict {
     crypto_no_hash: "НЕТ HASH",
     crypto_not_installed: "НЕ УСТАНОВЛЕН",
     crypto_check_error: "ОШИБКА ПРОВЕРКИ",
+    crypto_not_checked: "НЕ ПРОВЕРЕНО",
     crypto_rehash_button: "Проверка",
 
     expc_title: "Диагностика ПК EXPC",
@@ -717,6 +726,8 @@ pub static RU: Dict = Dict {
     driver_running: "Проверка драйверов выполняется…",
     driver_readonly_note: "Только чтение: PnP, драйверы, журналы Windows.",
     driver_unavailable: "Проверка драйверов недоступна",
+    driver_not_run: "Проверка драйверов не запускалась",
+    driver_not_run_hint: "Выполняется при запуске диагностики или из «Подробнее».",
     driver_status_ok: "OK",
     driver_status_warning: "Внимание",
     driver_status_problem: "Проблема",
@@ -783,6 +794,7 @@ pub static RU: Dict = Dict {
     ssd_empty_slot: "SSD не обнаружен",
     ssd_module_name: "Тест SSD",
     journal_module_added_fmt: "{module}: данные добавлены в отчёт сессии ({path}).",
+    journal_session_started_fmt: "[INFO] Сессия {session}: клиент «{client}», компьютер «{computer}».",
     journal_ssd_target_unavailable: "[WARN] Выбранный накопитель недоступен для теста.",
     ssd_benchmark_invalid: "ЗАМЕР НЕДОСТОВЕРЕН / РЕЗУЛЬТАТ НЕ ПРИНЯТ",
     journal_ssd_no_writable_fmt: "[WARN] {disk}: нет доступного для записи тома на этом накопителе.",
@@ -1020,6 +1032,7 @@ pub static RU: Dict = Dict {
     driver_details_title: "Проверка драйверов — подробности",
     driver_popup_running: "Проверка выполняется…",
     driver_popup_retry: "Повторить проверку",
+    driver_popup_run: "Запустить проверку",
     driver_popup_rerun: "Проверить заново",
     driver_popup_summary_fmt: "Итог: {status} — проблем: {problems}, предупреждений: {warnings}, без замечаний: {ok}; устройств: {devices}; события за {days} дн.; {generated}",
     driver_popup_note: "Статус ставится только по конкретным признакам (ошибка PnP, сбой в модуле драйвера, Code Integrity, отказ загрузки). Возраст драйвера сам по себе не считается проблемой.",
@@ -1235,6 +1248,7 @@ pub static EN: Dict = Dict {
     crypto_no_hash: "NO HASH",
     crypto_not_installed: "NOT INSTALLED",
     crypto_check_error: "CHECK ERROR",
+    crypto_not_checked: "NOT CHECKED",
     crypto_rehash_button: "ReHash",
 
     expc_title: "EXPC PC Diagnostics",
@@ -1319,6 +1333,8 @@ pub static EN: Dict = Dict {
     driver_running: "Driver check running…",
     driver_readonly_note: "Read-only: PnP, drivers, Windows logs.",
     driver_unavailable: "Driver check unavailable",
+    driver_not_run: "Driver check has not run",
+    driver_not_run_hint: "Runs with the diagnostic or from Details.",
     driver_status_ok: "OK",
     driver_status_warning: "Warning",
     driver_status_problem: "Problem",
@@ -1385,6 +1401,7 @@ pub static EN: Dict = Dict {
     ssd_empty_slot: "No SSD detected",
     ssd_module_name: "SSD benchmark",
     journal_module_added_fmt: "{module}: data added to the session report ({path}).",
+    journal_session_started_fmt: "[INFO] Session {session}: client \"{client}\", computer \"{computer}\".",
     journal_ssd_target_unavailable: "[WARN] The selected drive is not available for the test.",
     ssd_benchmark_invalid: "BENCHMARK INVALID / RESULT NOT TRUSTED",
     journal_ssd_no_writable_fmt: "[WARN] {disk}: no writable volume on this drive.",
@@ -1622,6 +1639,7 @@ pub static EN: Dict = Dict {
     driver_details_title: "Driver Check — Details",
     driver_popup_running: "Check in progress…",
     driver_popup_retry: "Retry check",
+    driver_popup_run: "Run check",
     driver_popup_rerun: "Check again",
     driver_popup_summary_fmt: "Summary: {status} — problems: {problems}, warnings: {warnings}, no issues: {ok}; devices: {devices}; events over {days} days; {generated}",
     driver_popup_note: "Status is set only from specific signals (a PnP error, a driver-module crash, Code Integrity, a boot failure). Driver age alone is never treated as a problem.",

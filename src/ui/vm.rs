@@ -460,6 +460,8 @@ pub struct DriverRow {
 
 #[derive(Clone, Debug)]
 pub enum DriversVm {
+    /// v1.0 Startup Idle: the audit has not run in this session.
+    NotRun,
     Running,
     /// Collection failed or is unavailable; the message says why.
     Unavailable(String),
@@ -530,6 +532,8 @@ pub enum CryptoVm {
     NoHash,
     NotInstalled,
     CheckError,
+    /// v1.0 Startup Idle: not checked yet (runs with the diagnostic).
+    NotChecked,
 }
 
 #[derive(Clone, Debug)]

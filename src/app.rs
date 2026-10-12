@@ -10,7 +10,8 @@ use crate::events;
 use crate::i18n::{self, Language};
 use crate::nvme_health;
 use crate::report_package::{
-    self, EvidenceFile, SessionPackage, SharedPackage, evidence_stamp, identity_date,
+    self, EvidenceFile, SessionIdentity, SessionPackage, SharedPackage, evidence_stamp,
+    identity_date,
 };
 use crate::ssd_history::{self, HistoryEntry};
 use crate::storage_benchmark::{self, DiagnosticProgress, StorageDiagnosticSummary};
@@ -1108,9 +1109,12 @@ fn report_attention(report_exists: bool, opened: bool) -> bool {
     report_exists && !opened
 }
 
-/// Driver Audit lifecycle: a read-only audit runs in the background at
-/// start-up and again inside every diagnostic session (for the report).
+/// Driver Audit lifecycle: a read-only audit runs inside every diagnostic
+/// session (for the report) or when the user starts it from Details.
+/// v1.0 Startup Idle: never at start-up.
 enum DriverAuditState {
+    /// Not run in this WinStateDiag session yet.
+    Idle,
     Running(Receiver<Result<AuditReport, String>>),
     Done(Box<AuditReport>),
     Failed(String),
@@ -2165,6 +2169,22 @@ pub struct WinStateDiagApp {
     language_pref_dir: PathBuf,
     /// VISUAL_REFERENCE mode (`--visual-reference`), QA only.
     reference: Option<ReferenceMode>,
+    /// v1.0 Client Identity: sessions opened by this process (SessionId
+    /// suffix, unique within the second-resolution stamp + PID).
+    session_seq: u32,
+    /// Crash analyzer clicked before any inventory existed: the scan runs
+    /// first and the analysis follows it.
+    crash_analyze_after_scan: bool,
+    /// Test seam: every diagnostic collector start request, in order (unit
+    /// tests never start the real collectors / subprocesses).
+    #[cfg(test)]
+    collector_requests: Vec<&'static str>,
+    /// Test seam: (client, computer) of the last diagnostic engine request
+    /// and its event sender (tests inject Cancelled / Finished).
+    #[cfg(test)]
+    test_session_request: Option<(String, String)>,
+    #[cfg(test)]
+    engine_test_tx: Option<Sender<EngineEvent>>,
 }
 
 /// `%SystemDrive%` (for the CHKDSK manual command text), `C:` if unset.
@@ -2242,7 +2262,7 @@ impl Default for WinStateDiagApp {
             crypto: None,
             crypto_detection: cryptopro::Detection::NotInstalled,
             crypto_rx: None,
-            driver_audit: DriverAuditState::Failed(String::new()),
+            driver_audit: DriverAuditState::Idle,
             drivers_open: false,
             page: Page::Diagnostics,
             crash: CrashState::default(),
@@ -2285,6 +2305,14 @@ impl Default for WinStateDiagApp {
             language: i18n::load(&exe_dir()),
             language_pref_dir: exe_dir(),
             reference: ReferenceMode::from_args(),
+            session_seq: 0,
+            crash_analyze_after_scan: false,
+            #[cfg(test)]
+            collector_requests: Vec::new(),
+            #[cfg(test)]
+            test_session_request: None,
+            #[cfg(test)]
+            engine_test_tx: None,
             window_icons: Default::default(),
         };
         // v1.0 polish QA: `--visual-reference --lang en|ru`.
@@ -2293,15 +2321,15 @@ impl Default for WinStateDiagApp {
             Some("ru") => app.language = Language::Ru,
             _ => {}
         }
-        // Unit tests never start the (read-only) PowerShell collector.
-        if app.reference.is_none() && !cfg!(test) {
-            app.driver_audit = start_driver_audit();
-            app.start_crypto_check();
-            app.start_hardware_collectors();
-        }
-        // Physical SSD/NVMe enumeration (v0.3.6): Windows-only real probe,
-        // behind the same "not in QA reference / not under test" guard as
-        // the other startup collectors above. On any other target this
+        // v1.0 Startup Idle: a launch starts NO diagnostic collector (Driver
+        // Audit, CryptoPro, crash / sensor / passport / SMART reads, events)
+        // and creates no report or session; they run only after an explicit
+        // user action (Start, or a module's own button).
+        //
+        // Physical SSD/NVMe enumeration (v0.3.6) only fills the disk
+        // selector: in-process volume / device-property queries, no
+        // subprocess, no SMART, nothing written to the report. Windows-only,
+        // not in QA reference / not under test. On any other target this
         // stays empty — never a fabricated single "C:" candidate.
         #[cfg(windows)]
         if app.reference.is_none() && !cfg!(test) {
@@ -2423,6 +2451,7 @@ impl WinStateDiagApp {
         if self.benchmark_is_running() || self.is_running() {
             return;
         }
+        self.begin_operation(false);
         // A user-started run is always an initial run.
         self.retest_identity = None;
         self.launch_benchmark();
@@ -2473,6 +2502,7 @@ impl WinStateDiagApp {
         }
         let path = PathBuf::from(self.benchmark_path.trim());
         let test_dir = path.clone();
+        self.request_collector("ssd_benchmark");
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         // Tests drive the run through this sender instead (no disk I/O).
@@ -3170,6 +3200,75 @@ impl WinStateDiagApp {
         }
     }
 
+    /// v1.0 Client Identity: fixes the session of the operation the user
+    /// starts now. A full diagnostic always opens a NEW session (unique
+    /// SessionId; Client / Computer frozen from the input fields now). A
+    /// separate module opens one only when none is bound yet or Client /
+    /// Computer changed since — a stale identity is never reused; while a
+    /// diagnostic is running, modules join that running session.
+    fn begin_operation(&mut self, full_diagnostic: bool) {
+        let unchanged = report_package::lock(&self.package)
+            .session()
+            .is_some_and(|s| s.same_identity(&self.client_name, &self.computer_name));
+        if !full_diagnostic && (self.is_running() || unchanged) {
+            return;
+        }
+        self.session_seq += 1;
+        let t = sysinfo::local_time();
+        let stamp = format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            t.year, t.month, t.day, t.hour, t.minute, t.second
+        );
+        let session = SessionIdentity::new(
+            &format!(
+                "{}-{:02}",
+                crate::storage_history::new_session_id(&stamp),
+                self.session_seq
+            ),
+            &self.client_name,
+            &self.computer_name,
+        );
+        let successor = {
+            let mut package = report_package::lock(&self.package);
+            if package.is_fresh() {
+                package.bind_session(session.clone());
+                None
+            } else {
+                Some(package.successor(session.clone()))
+            }
+        };
+        if let Some(next) = successor {
+            // Operations still running keep their own (previous) package.
+            self.package = Arc::new(Mutex::new(next));
+        }
+        let line = i18n::t(self.language)
+            .journal_session_started_fmt
+            .replace("{session}", &session.session_id)
+            .replace(
+                "{client}",
+                if session.client.is_empty() {
+                    "—"
+                } else {
+                    &session.client
+                },
+            )
+            .replace("{computer}", &session.computer);
+        push_journal(&mut self.journal, line);
+    }
+
+    /// Every diagnostic collector start goes through here (test seam; the
+    /// collectors themselves never run under unit tests).
+    fn request_collector(&mut self, name: &'static str) {
+        #[cfg(test)]
+        self.collector_requests.push(name);
+        let _ = name;
+    }
+
+    /// The identity of the current session (bound by `begin_operation`).
+    fn session_identity(&self) -> Option<SessionIdentity> {
+        report_package::lock(&self.package).session().cloned()
+    }
+
     fn start_diagnostics(&mut self) {
         if self.is_running() || self.benchmark_is_running() {
             return;
@@ -3177,11 +3276,18 @@ impl WinStateDiagApp {
         let exe_dir = exe_dir();
 
         self.reports_root = exe_dir.join("Reports");
+        // New run: the dashboard card starts empty; the session journal
+        // (full viewer / Save / Copy) keeps every earlier line.
+        self.journal.clear_view();
+        self.begin_operation(true);
+        let session = self
+            .session_identity()
+            .unwrap_or_else(|| SessionIdentity::new("", &self.client_name, &self.computer_name));
         let cancel = Arc::new(AtomicBool::new(false));
         self.session_cancel = Some(Arc::clone(&cancel));
         let req = SessionRequest {
-            client_name: self.client_name.clone(),
-            computer_name: self.computer_name.clone(),
+            client_name: session.client.clone(),
+            computer_name: session.computer.clone(),
             mode: self.mode,
             deep_checks: self.deep_checks,
             include_hardware: self.include_hardware,
@@ -3190,11 +3296,17 @@ impl WinStateDiagApp {
         };
 
         let (tx, rx): (Sender<EngineEvent>, Receiver<EngineEvent>) = std::sync::mpsc::channel();
+        self.request_collector("expc_session");
+        // Unit tests record the request only (no engine, no PowerShell).
+        #[cfg(not(test))]
         std::thread::spawn(move || engine::run_session(req, tx));
+        #[cfg(test)]
+        {
+            let _ = engine::run_session;
+            self.test_session_request = Some((req.client_name.clone(), req.computer_name.clone()));
+            self.engine_test_tx = Some(tx);
+        }
 
-        // New run: the dashboard card starts empty; the session journal
-        // (full viewer / Save / Copy) keeps every earlier line.
-        self.journal.clear_view();
         self.expc_tracker.reset();
         self.deep_check_results.clear();
         self.expc_checks.clear();
@@ -3218,10 +3330,15 @@ impl WinStateDiagApp {
         // v1.0: a fresh ATA SMART scan joins this session's report.
         self.ata_evidence_pending = true;
         self.start_ata_scan();
+        // v1.0 Startup Idle: the checks that used to run at launch run
+        // here, for this session (the engine runs its own Driver Audit).
+        self.start_crypto_check();
+        self.start_passport();
     }
 
     /// v1.0 read-only event evidence for this session (joins its ZIP).
     fn start_event_collection(&mut self) {
+        self.request_collector("events");
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.events_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -3522,6 +3639,12 @@ impl WinStateDiagApp {
             push_journal(&mut self.journal, msg);
             return;
         }
+        self.begin_operation(false);
+        // v1.0 Startup Idle: the Hardware page's passport and ATA SMART
+        // rows are read on this explicit action (or with the diagnostic).
+        self.start_passport();
+        self.ata_evidence_pending = true;
+        self.start_ata_scan();
         let now = sysinfo::local_time();
         let date = identity_date(now);
         // The session destination is resolved once and passed to the
@@ -3539,7 +3662,11 @@ impl WinStateDiagApp {
             package: Arc::clone(&self.package),
         };
         let (tx, rx) = std::sync::mpsc::channel();
+        self.request_collector("hardware_view");
+        #[cfg(not(test))]
         std::thread::spawn(move || engine::run_hardware_view(req, tx));
+        #[cfg(test)]
+        let _ = (engine::run_hardware_view, req, tx);
         let d = i18n::t(self.language);
         push_journal(
             &mut self.journal,
@@ -3635,6 +3762,10 @@ impl WinStateDiagApp {
     // -----------------------------------------------------------------
 
     fn start_crypto_check(&mut self) {
+        self.request_collector("cryptopro");
+        if self.reference.is_some() || cfg!(test) || self.crypto_rx.is_some() {
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let det = cryptopro::detect(&cryptopro::program_files_roots());
@@ -3696,7 +3827,9 @@ impl WinStateDiagApp {
 
     fn crypto_vm(&self) -> CryptoVm {
         match &self.crypto {
-            None => CryptoVm::Checking,
+            None if self.crypto_rx.is_some() => CryptoVm::Checking,
+            // v1.0 Startup Idle: checked with the diagnostic, not at launch.
+            None => CryptoVm::NotChecked,
             Some(cryptopro::HashState::HashOk) => CryptoVm::HashOk,
             Some(cryptopro::HashState::NoHash) => CryptoVm::NoHash,
             Some(cryptopro::HashState::NotInstalled) => CryptoVm::NotInstalled,
@@ -4297,6 +4430,7 @@ impl WinStateDiagApp {
                 None => DriversVm::Running,
             },
             DriverAuditState::Failed(msg) => DriversVm::Unavailable(msg.clone()),
+            DriverAuditState::Idle => DriversVm::NotRun,
         };
         DashboardVm {
             controls_enabled: !running,
@@ -4409,9 +4543,17 @@ impl WinStateDiagApp {
             // v1.0: the hidden install is observed to its end and re-detects
             // the analyzer itself (no blind periodic re-scans).
             Action::InstallAnalyzer => self.install_analyzer(),
-            Action::RefreshSensors => self.start_sensor_read(true),
+            // v1.0: an explicit module run (its own session when Client /
+            // Computer changed, see `begin_operation`).
+            Action::RefreshSensors => {
+                self.begin_operation(false);
+                self.start_sensor_read(true);
+            }
             Action::ShowSensorDetails => self.sensors_details_open = true,
-            Action::RunGpoCheck => self.start_gpo_check(),
+            Action::RunGpoCheck => {
+                self.begin_operation(false);
+                self.start_gpo_check();
+            }
             Action::ShowGpoDetails => self.gpo_details_open = true,
             Action::CopyClientInfo => {
                 self.clipboard_out = Some(passport::client_clipboard_text(
@@ -4522,6 +4664,10 @@ impl WinStateDiagApp {
             [980.0, 760.0],
             &mut open,
             |ui| match &self.driver_audit {
+                DriverAuditState::Idle => {
+                    ui.label(d.driver_not_run);
+                    rerun = ui.button(d.driver_popup_run).clicked();
+                }
                 DriverAuditState::Running(_) => {
                     ui.label(d.driver_popup_running);
                 }
@@ -4702,17 +4848,30 @@ impl WinStateDiagApp {
         if let Some(action) = export {
             self.driver_issues_export(ctx, action);
         }
-        if rerun && !matches!(self.driver_audit, DriverAuditState::Running(_)) {
-            self.driver_export_status = None;
-            // Unchanged re-check; unit tests never start the collector.
-            #[cfg(not(test))]
-            {
-                self.driver_audit = start_driver_audit();
-            }
-            #[cfg(test)]
-            {
-                self.driver_rerun_requests += 1;
-            }
+        if rerun {
+            self.request_driver_audit();
+        }
+    }
+
+    /// Run / re-run of the Driver Audit from its Details window: a separate
+    /// module run in its own correctly identified session (nothing else is
+    /// started).
+    fn request_driver_audit(&mut self) {
+        if matches!(self.driver_audit, DriverAuditState::Running(_)) {
+            return;
+        }
+        self.driver_export_status = None;
+        self.begin_operation(false);
+        self.request_collector("driver_audit");
+        // Unit tests never start the collector.
+        #[cfg(not(test))]
+        {
+            self.driver_audit = start_driver_audit();
+        }
+        #[cfg(test)]
+        {
+            let _ = start_driver_audit;
+            self.driver_rerun_requests += 1;
         }
     }
 
@@ -5775,18 +5934,10 @@ impl WinStateDiagApp {
 
     // ---- start-up / triggers ------------------------------------------
 
-    /// Start-up: crash inventory + power sensors (display only; evidence is
-    /// written on explicit actions).
-    fn start_hardware_collectors(&mut self) {
-        self.start_crash_scan();
-        self.start_sensor_read(false);
-        self.start_passport();
-        self.start_ata_scan();
-    }
-
     /// v1.0 read-only ATA SMART of every physical disk (SMART READ DATA /
     /// READ THRESHOLDS only). NVMe / bridges / RAID report UNSUPPORTED.
     fn start_ata_scan(&mut self) {
+        self.request_collector("ata_smart");
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.ata_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -5865,6 +6016,7 @@ impl WinStateDiagApp {
 
     /// v0.4.5: Windows / CPU / RAM / board passport (display only).
     fn start_passport(&mut self) {
+        self.request_collector("passport");
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.passport_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -5968,6 +6120,7 @@ impl WinStateDiagApp {
     }
 
     fn start_crash_scan(&mut self) {
+        self.request_collector("crash_scan");
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.crash_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -5980,6 +6133,19 @@ impl WinStateDiagApp {
     }
 
     fn start_crash_analysis(&mut self) {
+        if !matches!(self.crash.inventory, Some(Ok(_))) {
+            // v1.0 Startup Idle: no inventory is read at launch; the click
+            // scans first and the analysis follows the scan.
+            if self.crash.busy == CrashBusy::Idle {
+                self.begin_operation(false);
+                self.crash_analyze_after_scan = true;
+                self.start_crash_scan();
+            }
+            return;
+        }
+        if self.crash_rx.is_none() {
+            self.begin_operation(false);
+        }
         let Some(Ok(inv)) = &self.crash.inventory else {
             return;
         };
@@ -6181,6 +6347,13 @@ impl WinStateDiagApp {
                 // The scan started with a diagnostic run joins its report.
                 if self.is_running() {
                     self.contribute_incidents();
+                }
+                // "Analyze" clicked before any inventory: analyze now (when
+                // there is something to analyze and an analyzer).
+                if std::mem::take(&mut self.crash_analyze_after_scan)
+                    && matches!(self.crash.inventory, Some(Ok(_)))
+                {
+                    self.start_crash_analysis();
                 }
             }
             CrashMsg::Analyzed(list) => self.accept_crash_analyses(list),
@@ -6412,6 +6585,7 @@ impl WinStateDiagApp {
     /// load applied). Evidence is written for explicit refreshes and for
     /// diagnostic sessions.
     fn start_sensor_read(&mut self, evidence: bool) {
+        self.request_collector("sensors");
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.sensors_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -6594,6 +6768,7 @@ impl WinStateDiagApp {
     }
 
     fn start_gpo_check(&mut self) {
+        self.request_collector("gpo");
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.gpo_rx.is_none() {
             let reference_dir = exe_dir().join("Reference");
@@ -6856,8 +7031,10 @@ impl WinStateDiagApp {
             debugger_missing: inventory_known
                 && !matches!(debugger, crash_dump::DebuggerStatus::Installed { .. }),
             busy,
-            can_analyze: matches!(debugger, crash_dump::DebuggerStatus::Installed { .. })
-                && matches!(&self.crash.inventory, Some(Ok(inv)) if !inv.analysis_queue().is_empty()),
+            // v1.0 Startup Idle: before any inventory the click scans first.
+            can_analyze: self.crash.inventory.is_none()
+                || (matches!(debugger, crash_dump::DebuggerStatus::Installed { .. })
+                    && matches!(&self.crash.inventory, Some(Ok(inv)) if !inv.analysis_queue().is_empty())),
             has_details: inventory_known || !self.crash.analyses.is_empty(),
             rows,
             analysis: self.analysis_progress_vm(),
@@ -10232,9 +10409,9 @@ mod session_package_tests {
     }
 
     #[test]
-    fn ssd_benchmark_and_start_up_driver_audit_join_the_same_package() {
+    fn ssd_benchmark_and_held_driver_audit_join_the_same_package() {
         let (mut app, exe) = app_with_exe("mods");
-        // Start-up audit before any package: held, no folder created.
+        // Audit offered to an unbound, unresolved package: held, no folder.
         let held = report_package::lock(&app.package)
             .offer(vec![EvidenceFile::new(
                 "DriverAudit_24-09-26_09-00-00.json",
@@ -10357,7 +10534,13 @@ mod session_package_tests {
     #[test]
     fn crypto_card_offers_rehash_only_for_no_hash() {
         let (mut app, exe) = app_with_exe("crypto");
+        // v1.0 Startup Idle: not checked at launch; "Checking" only while a
+        // check actually runs.
+        assert_eq!(app.build_vm(0.0, 0.0).crypto, CryptoVm::NotChecked);
+        let (_keep, rx) = std::sync::mpsc::channel();
+        app.crypto_rx = Some(rx);
         assert_eq!(app.build_vm(0.0, 0.0).crypto, CryptoVm::Checking);
+        app.crypto_rx = None;
         for (state, vm, starts_rehash) in [
             (cryptopro::HashState::HashOk, CryptoVm::HashOk, false),
             (
@@ -12961,3 +13144,7 @@ mod v10_tests;
 #[cfg(test)]
 #[path = "app_v044_tests.rs"]
 mod v044_tests;
+
+#[cfg(test)]
+#[path = "app_startup_idle_tests.rs"]
+mod startup_idle_tests;

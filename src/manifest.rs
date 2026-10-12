@@ -12,6 +12,9 @@
 //!   "producer_version": "<Cargo package version>",
 //!   "package": "<report>.zip",
 //!   "computer_name": "...",
+//!   "session": { "session_id": "...", "client_name": "..." | "" },
+//!                       (v1.0 additive: the diagnostic session the report
+//!                        belongs to, fixed when the user started it)
 //!   "created_at": "YYYY-MM-DDTHH:MM:SS",          (local time)
 //!   "windows": { "product": "...", "build": "..." },
 //!   "modules": [
@@ -74,6 +77,8 @@ pub struct ManifestContext {
     /// v1.0 (additive): separate system / hardware state codes.
     pub system_state: Option<String>,
     pub hardware_state: Option<String>,
+    /// v1.0 (additive): `(session_id, client_name)` of the session.
+    pub session: Option<(String, String)>,
 }
 
 fn module_name(m: EvidenceModule) -> &'static str {
@@ -695,6 +700,13 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
         "  \"computer_name\": {},\n",
         json::string(&ctx.computer_name)
     ));
+    if let Some((session_id, client)) = &ctx.session {
+        out.push_str(&format!(
+            "  \"session\": {{\n    \"session_id\": {},\n    \"client_name\": {}\n  }},\n",
+            json::string(session_id),
+            json::string(client)
+        ));
+    }
     out.push_str(&format!(
         "  \"created_at\": {},\n",
         json::string(&iso(ctx.created_at))
@@ -749,6 +761,7 @@ mod tests {
             windows_build: "26200.7462".into(),
             system_state: None,
             hardware_state: None,
+            session: None,
         }
     }
 
@@ -1463,6 +1476,24 @@ mod tests {
         assert!(s(st, "note").contains("does not mean the computer is healthy"));
         // Without states the field is simply absent (backward compatible).
         assert!(parsed(&build(&ctx(), &entries())).get("state").is_none());
+    }
+
+    /// v1.0 Client Identity: the session id and client of the report.
+    #[test]
+    fn session_identity_is_in_the_manifest_and_additive() {
+        let mut c = ctx();
+        c.session = Some(("S-20260928-103500-1".into(), "Алексей".into()));
+        let v = parsed(&build(&c, &entries()));
+        let session = v.get("session").unwrap();
+        assert_eq!(s(session, "session_id"), "S-20260928-103500-1");
+        assert_eq!(s(session, "client_name"), "Алексей");
+        assert_eq!(s(&v, "computer_name"), "MSI");
+        // Empty client stays an empty string (only the computer names it).
+        c.session = Some(("S-2".into(), String::new()));
+        let v = parsed(&build(&c, &entries()));
+        assert_eq!(s(v.get("session").unwrap(), "client_name"), "");
+        // Unbound package: field absent (backward compatible).
+        assert!(parsed(&build(&ctx(), &entries())).get("session").is_none());
     }
 
     #[test]

@@ -2,6 +2,13 @@
 
 ## [1.0] - unreleased - v1.0 Stable candidate (master consolidation, evidence intelligence, live fixes)
 
+### v1.0 Startup Idle / Client Identity microfix (2026-10-13)
+- **Startup Idle:** a launch no longer starts the Driver Audit, the CryptoPro check, or the crash-inventory, sensor, passport and ATA SMART reads, and creates no report folder, session or ZIP. The initial state is IDLE / «Ожидание запуска». The cards show honest idle states: «Проверка драйверов не запускалась», CryptoPro «НЕ ПРОВЕРЕНО». Only the in-process SSD/NVMe selector enumeration remains (no subprocess, no SMART).
+- The start-up log moved to `Reports\Logs\startup_graphics.log`. Each session copies a snapshot of it into its own report.
+- **Client Identity:** «Запустить диагностику» freezes Client / Computer and opens a new session with a unique SessionId (`WSD-<stamp>-<pid>-<NN>`). All evidence, the manifest and the ZIP of that session use the frozen identity. The manifest gains an additive `session { session_id, client_name }`. A different client never reuses another client's report folder: the old adoption and renaming of same-PC/date folders is gone. An empty Client reports under the Computer only.
+- **Explicit modules** (sensors, Hardware with passport + ATA SMART, crash analyzer (scans first), SSD benchmark, GPO, Driver Audit «Запустить проверку») start only themselves. They join the current session while Client / Computer are unchanged and open a new one when they changed. During a running diagnostic they join that session.
+- Regression tests: startup starts no collector / subprocess (runtime + source contract), creates no Reports / session / ZIP, page switching starts nothing, identity in manifest + evidence, re-run with another client, empty client, cancel, separate modules, RU / EN.
+
 ### v1.0 Stable consolidation (2026-10-10)
 Every confirmed real-machine defect became a deterministic regression test (Linux harness 536 tests; Windows gate re-runs the full suite).
 
