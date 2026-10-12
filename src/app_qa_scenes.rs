@@ -451,7 +451,7 @@ fn qa_audit() -> AuditReport {
     }
 }
 
-fn qa_inventory() -> crash_dump::Inventory {
+pub(super) fn qa_inventory() -> crash_dump::Inventory {
     crash_dump::Inventory {
         bugchecks: vec![crash_dump::BugcheckEvent {
             time: "2026-10-03T00:34:42".into(),

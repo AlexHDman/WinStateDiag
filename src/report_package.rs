@@ -222,6 +222,48 @@ pub fn find_or_new_report_dir(root: &Path, client: &str, computer: &str, date: &
     }
 }
 
+/// v1.0: the report folder of one session: the first of
+/// `<Client> - <Computer> - <date>`, `… (2)`, `… (3)`, … that does not
+/// exist yet or already holds THIS session's report (its ZIP manifest names
+/// `session_id`). A folder of another session — another client whose name
+/// sanitizes to the same text, or an earlier same-day run — is never used.
+pub fn session_report_dir(
+    root: &Path,
+    session_id: &str,
+    client: &str,
+    computer: &str,
+    date: &str,
+) -> PathBuf {
+    let base = report_base_name(client, computer, date);
+    for n in 1..1000 {
+        let name = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base} ({n})")
+        };
+        let dir = root.join(&name);
+        if !dir.exists()
+            || zip_session_id(&dir.join(format!("{name}.zip"))).as_deref() == Some(session_id)
+        {
+            return dir;
+        }
+    }
+    root.join(format!("{base} ({session_id})"))
+}
+
+/// `session.session_id` of a report ZIP's manifest, if readable.
+fn zip_session_id(zip: &Path) -> Option<String> {
+    let manifest = read_zip(zip)
+        .ok()?
+        .into_iter()
+        .find(|e| e.name == crate::manifest::MANIFEST_FILE)?;
+    let v = crate::deep_checks::json::parse(std::str::from_utf8(&manifest.bytes).ok()?)?;
+    v.get("session")?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// v1.0 identity of one diagnostic session / separate module operation:
 /// fixed when the user starts it and never taken from the live input
 /// fields afterwards.
@@ -355,10 +397,12 @@ impl SessionPackage {
     }
 
     /// Resolves the report destination once; later calls return the same
-    /// identity. A bound session's Client / Computer win over the values
-    /// passed. One Client + Computer + date = one report folder: an
-    /// existing folder of exactly that identity (an earlier run) is reused;
-    /// new results never overwrite old ones (see `store_evidence`).
+    /// identity. v1.0 Client Identity: a package bound to a session gets a
+    /// folder of its own — `<Client> - <Computer> - <date>`, or `… (2)`,
+    /// `… (3)` when that folder holds another session's report — so its ZIP
+    /// and manifest contain only this session's evidence. An unbound
+    /// package (legacy callers) reuses the folder of exactly its identity.
+    /// New results never overwrite old ones (see `store_evidence`).
     pub fn resolve(&mut self, client: &str, computer: &str, date: &str) -> PackageIdentity {
         if let Some(id) = &self.identity {
             return id.clone();
@@ -371,7 +415,12 @@ impl SessionPackage {
         if !computer.trim().is_empty() {
             self.computer = computer.trim().to_string();
         }
-        let report_dir = find_or_new_report_dir(&self.reports_root, client, computer, date);
+        let report_dir = match &bound {
+            Some(s) => {
+                session_report_dir(&self.reports_root, &s.session_id, client, computer, date)
+            }
+            None => find_or_new_report_dir(&self.reports_root, client, computer, date),
+        };
         let base = report_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1543,13 +1592,47 @@ mod tests {
         let mut c = package(&exe, None);
         c.bind_session(SessionIdentity::new("S-3", "   ", "MSI"));
         let zip_c = c.contribute("Боб", "MSI", "24-09-26", hw()).unwrap();
-        assert_eq!(zip_c, bare.join("MSI - 24-09-26.zip"));
+        // The client-less folder of the same date belongs to another
+        // (earlier) session: this session gets its own.
+        let own_c = reports.join("MSI - 24-09-26 (2)");
+        assert_eq!(zip_c, own_c.join("MSI - 24-09-26 (2).zip"));
         assert_eq!(
             manifest_session(&zip_c),
             ("S-3".into(), String::new(), "MSI".into())
         );
+        assert!(!names(&zip_c).contains(&"Hardware_bare.txt".to_string()));
 
-        // The same client again (any case) reuses only its own folder.
+        // The same client again in a NEW session: its own folder and ZIP;
+        // the first session's report is left exactly as it was.
+        let zip_a_bytes = fs::read(&zip_a).unwrap();
+        let mut a2 = package(&exe, None);
+        a2.bind_session(SessionIdentity::new("S-4", "Алексей", "MSI"));
+        let zip_a2 = a2.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_eq!(
+            zip_a2,
+            reports
+                .join("Алексей - MSI - 24-09-26 (2)")
+                .join("Алексей - MSI - 24-09-26 (2).zip")
+        );
+        assert_eq!(manifest_session(&zip_a2).0, "S-4");
+        assert_eq!(fs::read(&zip_a).unwrap(), zip_a_bytes);
+        // Within one session every contribution stays in its own folder.
+        let again = a.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_eq!(again, zip_a);
+        assert_eq!(manifest_session(&zip_a).0, "S-1");
+
+        // Clients whose names sanitize to the same folder text never merge.
+        let mut x = package(&exe, None);
+        x.bind_session(SessionIdentity::new("S-5", "A/B", "MSI"));
+        let zip_x = x.contribute("", "", "24-09-26", hw()).unwrap();
+        let mut y = package(&exe, None);
+        y.bind_session(SessionIdentity::new("S-6", "A:B", "MSI"));
+        let zip_y = y.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_ne!(zip_x.parent(), zip_y.parent());
+        assert_eq!(manifest_session(&zip_x).1, "A/B");
+        assert_eq!(manifest_session(&zip_y).1, "A:B");
+
+        // Unbound (legacy) lookups reuse only exactly their own folder.
         assert_eq!(
             find_or_new_report_dir(&reports, "алексей", "MSI", "24-09-26"),
             dir_a

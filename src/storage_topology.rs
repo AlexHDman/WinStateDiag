@@ -654,35 +654,65 @@ pub mod windows_source {
         }
 
         fn volumes(&self) -> Vec<VolumeInfo> {
-            let mask = unsafe { GetLogicalDrives() };
-            let mut volumes = Vec::new();
-            for i in 0..26u32 {
-                if mask & (1 << i) == 0 {
-                    continue;
-                }
-                let letter = (b'A' + i as u8) as char;
-                let mount_point = format!("{letter}:\\");
-                let root_wide = wide(&mount_point);
-                if unsafe { GetDriveTypeW(root_wide.as_ptr()) } != DRIVE_FIXED {
-                    continue;
-                }
-                if let Some(physical_disk_index) = physical_index_for_volume(&mount_point) {
-                    volumes.push(VolumeInfo {
-                        mount_point: mount_point.clone(),
-                        physical_disk_index,
-                        writable: probe_writable(&mount_point),
-                        label: volume_label(&mount_point),
-                    });
-                }
-            }
-            volumes
+            fixed_volumes(true)
         }
 
         fn system_drive_physical_index(&self) -> Option<u32> {
-            let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-            let mount_point = format!("{}\\", system_drive.trim_end_matches('\\'));
-            physical_index_for_volume(&mount_point)
+            system_drive_index()
         }
+    }
+
+    /// v1.0 Startup Idle: the disk selector at launch. The same in-process
+    /// device / volume queries, but nothing is written: writability is NOT
+    /// probed (assumed until the explicit benchmark start re-enumerates
+    /// with [`WindowsTopologySource`], which probes for real).
+    pub struct LaunchTopologySource;
+
+    impl TopologySource for LaunchTopologySource {
+        fn physical_disks(&self) -> Vec<PhysicalDiskInfo> {
+            WindowsTopologySource.physical_disks()
+        }
+
+        fn volumes(&self) -> Vec<VolumeInfo> {
+            fixed_volumes(false)
+        }
+
+        fn system_drive_physical_index(&self) -> Option<u32> {
+            system_drive_index()
+        }
+    }
+
+    /// Fixed volumes with their physical disk; `probe_writes` decides
+    /// whether writability is tested with a temporary file.
+    fn fixed_volumes(probe_writes: bool) -> Vec<VolumeInfo> {
+        let mask = unsafe { GetLogicalDrives() };
+        let mut volumes = Vec::new();
+        for i in 0..26u32 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let letter = (b'A' + i as u8) as char;
+            let mount_point = format!("{letter}:\\");
+            let root_wide = wide(&mount_point);
+            if unsafe { GetDriveTypeW(root_wide.as_ptr()) } != DRIVE_FIXED {
+                continue;
+            }
+            if let Some(physical_disk_index) = physical_index_for_volume(&mount_point) {
+                volumes.push(VolumeInfo {
+                    mount_point: mount_point.clone(),
+                    physical_disk_index,
+                    writable: !probe_writes || probe_writable(&mount_point),
+                    label: volume_label(&mount_point),
+                });
+            }
+        }
+        volumes
+    }
+
+    fn system_drive_index() -> Option<u32> {
+        let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        let mount_point = format!("{}\\", system_drive.trim_end_matches('\\'));
+        physical_index_for_volume(&mount_point)
     }
 }
 

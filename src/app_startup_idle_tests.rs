@@ -40,6 +40,7 @@ fn frame(app: &mut WinStateDiagApp, ctx: &egui::Context) {
     app.poll_crash_redetect();
     app.poll_events();
     app.poll_ata_scan();
+    app.poll_disk_selector();
     app.finalize_report_if_idle();
     let vm = app.build_vm(0.016, 1.0);
     let mut actions = Vec::new();
@@ -179,10 +180,31 @@ fn the_launch_code_path_contains_no_collector_start() {
         "begin_operation",
         "contribute",
         "StartupLog",
+        "WindowsTopologySource",
+        "candidates_from",
     ] {
         assert!(!ctor.contains(forbidden), "launch code calls `{forbidden}`");
     }
-    // The renderer entry opens only the start-up log (Reports\Logs).
+    // Its only work: the disk selector, in the background, write-free.
+    assert_eq!(ctor.matches("app.enumerate_disk_selector();").count(), 1);
+    let at = src
+        .find("    fn enumerate_disk_selector(&mut self) {")
+        .unwrap();
+    let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
+    assert!(body.contains("thread::spawn"), "never on the UI thread");
+    assert!(body.contains("LaunchTopologySource"));
+    assert!(
+        !body.contains("WindowsTopologySource"),
+        "no write probe at launch"
+    );
+    let topo = include_str!("storage_topology.rs");
+    let at = topo
+        .find("impl TopologySource for LaunchTopologySource")
+        .unwrap();
+    let launch = &topo[at..at + topo[at..].find("\n    }\n").unwrap()];
+    assert!(launch.contains("fixed_volumes(false)"));
+    assert!(!launch.contains("probe_writable"));
+    // The renderer entry builds the app the same way.
     let lib = include_str!("lib.rs");
     assert!(lib.contains("let mut inner = app::WinStateDiagApp::default();"));
 }
@@ -336,18 +358,150 @@ fn a_new_run_with_another_client_never_reuses_the_old_identity() {
         str_of(manifest(&zip1).get("session").unwrap(), "client_name"),
         "Иванов"
     );
-    // Same client again: a new session id, its own folder reused.
+    // Same client again: a new session with its OWN folder / ZIP; the first
+    // session's report keeps its own evidence and SessionId.
     app.state = RunState::Idle;
     app.client_name = "Иванов".into();
     app.apply(Action::Start);
     let third = session(&app).unwrap();
     assert_ne!(third.session_id, first.session_id);
     deliver_sensors(&mut app);
-    assert_eq!(zip_of(&app), zip1);
+    let base3 = format!("Иванов - MSI - {} (2)", today());
+    assert_eq!(zip_of(&app), zip_in(&exe, &base3));
     assert_eq!(
-        str_of(manifest(&zip1).get("session").unwrap(), "session_id"),
+        str_of(
+            manifest(&zip_of(&app)).get("session").unwrap(),
+            "session_id"
+        ),
         third.session_id
     );
+    assert_eq!(std::fs::read(&zip1).unwrap(), zip1_bytes);
+    assert_eq!(
+        str_of(manifest(&zip1).get("session").unwrap(), "session_id"),
+        first.session_id
+    );
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+// ---------------- INDEPENDENT REVIEW (PR #1) FINDINGS ----------------
+
+/// A module started for client A that completes after a session for B was
+/// opened still reports into A's session (never B's).
+#[test]
+fn a_running_module_keeps_the_session_it_was_started_in() {
+    let (mut app, exe) = app_in("owner");
+    app.client_name = "Клиент А".into();
+    app.apply(Action::RefreshSensors);
+    let a = session(&app).unwrap();
+    // A's read is still running; the user switches to B and starts.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.sensors_rx = Some(rx);
+    app.client_name = "Клиент Б".into();
+    app.apply(Action::Start);
+    let b = session(&app).unwrap();
+    assert_ne!(a.session_id, b.session_id);
+    // A's sensor read completes now.
+    tx.send(sensors::Snapshot::default()).unwrap();
+    app.poll_sensors();
+    let a_zip = zip_in(&exe, &format!("Клиент А - MSI - {}", today()));
+    let m = manifest(&a_zip);
+    assert_eq!(
+        str_of(m.get("session").unwrap(), "session_id"),
+        a.session_id
+    );
+    assert_eq!(str_of(m.get("session").unwrap(), "client_name"), "Клиент А");
+    // B's session has no report yet (nothing of A leaked into it).
+    assert!(report_package::lock(&app.package).final_zip().is_none());
+    assert!(!zip_in(&exe, &format!("Клиент Б - MSI - {}", today())).exists());
+    // Both packages are finalized when idle (A's loose files too).
+    app.state = RunState::Idle;
+    app.sensors_rx = None;
+    app.finalize_report_if_idle();
+    let loose: Vec<_> = std::fs::read_dir(a_zip.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(loose.len(), 1, "only the verified ZIP stays: {loose:?}");
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+/// "Analyze" before any inventory: the scan's last message and the closing
+/// of its channel arrive in the same poll; the analysis that follows must
+/// keep its own (new) channel.
+#[test]
+fn analyze_after_scan_keeps_the_analysis_channel() {
+    let (mut app, exe) = app_in("crash");
+    app.apply(Action::AnalyzeDumps);
+    assert!(app.crash_analyze_after_scan);
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(CrashMsg::Inventory(Ok(qa_scenes::qa_inventory())))
+        .unwrap();
+    drop(tx); // the scan worker ends right after its result
+    app.crash_rx = Some(rx);
+    app.crash.busy = CrashBusy::Scanning;
+    app.poll_crash();
+    assert!(!app.crash_analyze_after_scan);
+    assert!(app.crash_rx.is_some(), "the analysis channel survives");
+    assert_eq!(app.crash.busy, CrashBusy::Analyzing);
+    assert!(app.crash.progress.is_some());
+    // A failed scan never loops into another scan.
+    let (mut app, _) = app_in("crash-err");
+    app.apply(Action::AnalyzeDumps);
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(CrashMsg::Inventory(Err("x".into()))).unwrap();
+    drop(tx);
+    app.crash_rx = Some(rx);
+    let before = app.collector_requests.len();
+    app.poll_crash();
+    assert!(app.crash_rx.is_none() && !app.crash_analyze_after_scan);
+    assert_eq!(app.collector_requests.len(), before);
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+/// After a finished diagnostic for A, a module run for B opens B's session:
+/// the result view / Open report never stand for A's report any more.
+#[test]
+fn a_new_session_never_opens_the_previous_clients_report() {
+    let (mut app, exe) = app_in("open");
+    app.client_name = "Клиент А".into();
+    app.apply(Action::Start);
+    deliver_sensors(&mut app);
+    let a_zip = zip_of(&app);
+    app.state = RunState::Done {
+        zip_path: a_zip.clone(),
+    };
+    app.client_name = "Клиент Б".into();
+    app.apply(Action::RunGpoCheck);
+    assert!(matches!(app.state, RunState::Idle));
+    assert!(app.final_report().is_err(), "no report of B yet");
+    // Same identity: the finished view stays.
+    let (mut app2, exe2) = app_in("open-same");
+    app2.client_name = "Клиент А".into();
+    app2.apply(Action::Start);
+    deliver_sensors(&mut app2);
+    let zip = zip_of(&app2);
+    app2.state = RunState::Done {
+        zip_path: zip.clone(),
+    };
+    app2.apply(Action::RunGpoCheck);
+    assert!(matches!(app2.state, RunState::Done { .. }));
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    let _ = std::fs::remove_dir_all(exe2.parent().unwrap());
+}
+
+/// Storage history / correlation records carry the session's own id.
+#[test]
+fn storage_records_use_the_session_id() {
+    let (mut app, exe) = app_in("storage-id");
+    app.client_name = "Клиент А".into();
+    app.apply(Action::RefreshSensors);
+    let a = session(&app).unwrap();
+    assert_eq!(app.storage_session_id, a.session_id);
+    app.client_name = "Клиент Б".into();
+    app.apply(Action::RunGpoCheck);
+    let b = session(&app).unwrap();
+    assert_eq!(app.storage_session_id, b.session_id);
+    assert_ne!(a.session_id, b.session_id);
     let _ = std::fs::remove_dir_all(exe.parent().unwrap());
 }
 
