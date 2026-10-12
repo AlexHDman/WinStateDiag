@@ -1901,6 +1901,10 @@ struct StorageAssessment {
     classification: Option<storage_health::Classification>,
     /// v1.0 item 18: session start (benchmark accepted).
     started_at: String,
+    /// v1.0 Client Identity: the session package of THIS run; its health,
+    /// correlation and storage history record belong to that session even
+    /// when another benchmark / session starts before they complete.
+    package: Option<SharedPackage>,
 }
 
 fn bench_facts(r: &StorageDiagnosticSummary) -> storage_health::BenchmarkFacts {
@@ -2854,6 +2858,7 @@ impl WinStateDiagApp {
                 events_pending: probing,
                 classification: None,
                 started_at: local_iso(sysinfo::local_time()),
+                package: Some(self.package_of("storage")),
             },
         );
         if unstable {
@@ -3002,8 +3007,9 @@ impl WinStateDiagApp {
             _ => crate::storage_history::SessionStatus::Completed,
         };
         let smart_now = inputs.nvme.as_ref().and_then(|h| h.smart.as_ref());
+        let run_session = self.storage_session_of(identity);
         let record = crate::storage_history::SessionRecord {
-            session_id: self.storage_session_id.clone(),
+            session_id: run_session.clone(),
             physical_identity: identity.to_string(),
             start_time: a.started_at.clone(),
             end_time: inputs.assessed_at.clone(),
@@ -3023,7 +3029,7 @@ impl WinStateDiagApp {
             Ok(history) => crate::storage_history::delta_against_history(
                 history,
                 identity,
-                &self.storage_session_id,
+                &run_session,
                 record.error_log_entries,
             ),
             Err(_) => crate::storage_history::ErrorLogDelta::HistoryUnavailable,
@@ -3077,8 +3083,9 @@ impl WinStateDiagApp {
         if let Some(a) = self.assessments.get_mut(identity) {
             a.classification = Some(c);
         }
-        self.contribute_evidence(
-            "storage",
+        let package = self.storage_package_of(identity);
+        self.contribute_evidence_to(
+            package,
             d.ssd_module_name,
             vec![EvidenceFile::new(name, json.into_bytes())],
         );
@@ -3192,8 +3199,9 @@ impl WinStateDiagApp {
         self.nvme_health.insert(identity.clone(), health);
         // v1.0: the correlation references the health file by its STORED
         // name (a same-day collision stores it as `_NN`).
+        let package = self.storage_package_of(&identity);
         let stored = self
-            .contribute_evidence("storage", d.nvme_module_name, vec![file])
+            .contribute_evidence_to(package, d.nvme_module_name, vec![file])
             .into_iter()
             .next()
             .unwrap_or(name);
@@ -3233,6 +3241,23 @@ impl WinStateDiagApp {
         self.op_packages.insert(owner, Arc::clone(&self.package));
     }
 
+    /// The session package of the storage run of disk `identity` (the
+    /// storage owner's when the run is unknown).
+    fn storage_package_of(&self, identity: &str) -> SharedPackage {
+        self.assessments
+            .get(identity)
+            .and_then(|a| a.package.clone())
+            .unwrap_or_else(|| self.package_of("storage"))
+    }
+
+    /// The SessionId of the storage run of disk `identity`.
+    fn storage_session_of(&self, identity: &str) -> String {
+        report_package::lock(&self.storage_package_of(identity))
+            .session()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_else(|| self.storage_session_id.clone())
+    }
+
     /// The package of `owner`'s current / last operation (the current
     /// session when it never claimed one).
     fn package_of(&self, owner: &'static str) -> SharedPackage {
@@ -3252,8 +3277,18 @@ impl WinStateDiagApp {
         module: &str,
         files: Vec<EvidenceFile>,
     ) -> Vec<String> {
-        let date = identity_date(sysinfo::local_time());
         let package = self.package_of(owner);
+        self.contribute_evidence_to(package, module, files)
+    }
+
+    /// [`contribute_evidence`] into one given session package.
+    fn contribute_evidence_to(
+        &mut self,
+        package: SharedPackage,
+        module: &str,
+        files: Vec<EvidenceFile>,
+    ) -> Vec<String> {
+        let date = identity_date(sysinfo::local_time());
         let current = Arc::ptr_eq(&package, &self.package);
         let created = report_package::lock(&package).final_zip().is_none();
         let requested: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
@@ -6249,21 +6284,28 @@ impl WinStateDiagApp {
         }
     }
 
+    /// The analyzer's "Analyze" click (explicit): fixes the session, then
+    /// analyzes — or, without an inventory yet (v1.0 Startup Idle: none is
+    /// read at launch), scans first and the analysis follows the scan in
+    /// that same session.
     fn start_crash_analysis(&mut self) {
-        if !matches!(self.crash.inventory, Some(Ok(_))) {
-            // v1.0 Startup Idle: no inventory is read at launch; the click
-            // scans first and the analysis follows the scan.
-            if self.crash.busy == CrashBusy::Idle {
-                self.begin_operation(false);
-                self.crash_analyze_after_scan = true;
-                self.start_crash_scan();
-            }
+        if self.crash.busy != CrashBusy::Idle || self.crash_rx.is_some() {
             return;
         }
-        if self.crash_rx.is_none() {
-            self.begin_operation(false);
-            self.claim_package("crash");
+        self.begin_operation(false);
+        if !matches!(self.crash.inventory, Some(Ok(_))) {
+            self.crash_analyze_after_scan = true;
+            self.start_crash_scan();
+            return;
         }
+        self.claim_package("crash");
+        self.run_crash_analysis();
+    }
+
+    /// Analyzes the inventory's queue for the session that owns "crash"
+    /// (never re-reads the input fields: a continuation after the scan
+    /// stays in the session the click opened).
+    fn run_crash_analysis(&mut self) {
         let Some(Ok(inv)) = &self.crash.inventory else {
             return;
         };
@@ -6415,7 +6457,7 @@ impl WinStateDiagApp {
             if std::mem::take(&mut self.crash_analyze_after_scan)
                 && matches!(self.crash.inventory, Some(Ok(_)))
             {
-                self.start_crash_analysis();
+                self.run_crash_analysis();
             }
         }
     }

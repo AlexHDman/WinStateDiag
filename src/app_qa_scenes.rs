@@ -254,6 +254,7 @@ impl WinStateDiagApp {
                 events_pending: false,
                 classification: Some(classification),
                 started_at: String::new(),
+                package: None,
             },
         );
         self.benchmark_state = BenchmarkUiState::Done {
@@ -318,7 +319,12 @@ impl WinStateDiagApp {
     }
 }
 
-fn qa_summary(read: f64, write: f64, rspread: f64, wspread: f64) -> StorageDiagnosticSummary {
+pub(super) fn qa_summary(
+    read: f64,
+    write: f64,
+    rspread: f64,
+    wspread: f64,
+) -> StorageDiagnosticSummary {
     StorageDiagnosticSummary {
         profile: crate::storage_benchmark::StorageDiagnosticProfile {
             block_size: 1024 * 1024,

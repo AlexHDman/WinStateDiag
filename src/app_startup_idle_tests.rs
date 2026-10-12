@@ -420,8 +420,15 @@ fn a_running_module_keeps_the_session_it_was_started_in() {
     let loose: Vec<_> = std::fs::read_dir(a_zip.parent().unwrap())
         .unwrap()
         .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .collect();
     assert_eq!(loose.len(), 1, "only the verified ZIP stays: {loose:?}");
+    // The hidden session marker names A's session.
+    assert_eq!(
+        std::fs::read_to_string(a_zip.parent().unwrap().join(report_package::SESSION_MARKER))
+            .unwrap(),
+        a.session_id
+    );
     let _ = std::fs::remove_dir_all(exe.parent().unwrap());
 }
 
@@ -487,6 +494,91 @@ fn a_new_session_never_opens_the_previous_clients_report() {
     assert!(matches!(app2.state, RunState::Done { .. }));
     let _ = std::fs::remove_dir_all(exe.parent().unwrap());
     let _ = std::fs::remove_dir_all(exe2.parent().unwrap());
+}
+
+// ---------------- INDEPENDENT REVIEW ROUND 2 (N1–N4) ----------------
+
+/// N2 + N4: a storage run's pending health / correlation and its storage
+/// history record stay in the run's own session even when another client's
+/// benchmark (and session) starts before they complete.
+#[test]
+fn a_storage_run_keeps_its_session_after_another_benchmark_starts() {
+    let (mut app, exe) = app_in("storage-owner");
+    app.client_name = "Клиент А".into();
+    app.benchmark_path = exe.display().to_string();
+    app.apply(Action::BenchmarkStart);
+    let a = session(&app).unwrap();
+    // A's measurement finished; its health is still pending.
+    app.benchmark_state = BenchmarkUiState::Idle;
+    let package_a = app.package_of("storage");
+    app.assessments.insert(
+        "DISK-1".into(),
+        StorageAssessment {
+            disk: None,
+            first: qa_scenes::qa_summary(1000.0, 900.0, 0.5, 0.5),
+            first_duration: 1.0,
+            first_previous: None,
+            second: None,
+            second_duration: None,
+            retest: storage_health::RetestOutcome::NotNeeded,
+            benchmark_files: Vec::new(),
+            health_file: None,
+            events: storage_health::EventsInput::NotCollected,
+            health_pending: true,
+            events_pending: false,
+            classification: None,
+            started_at: "2026-10-13T10:00:00".into(),
+            package: Some(package_a),
+        },
+    );
+    // Client B starts another benchmark meanwhile (new session).
+    app.client_name = "Клиент Б".into();
+    app.apply(Action::BenchmarkStart);
+    let b = session(&app).unwrap();
+    assert_ne!(a.session_id, b.session_id);
+    assert_eq!(app.storage_session_id, b.session_id);
+    // A's health completes now.
+    app.assessments.get_mut("DISK-1").unwrap().health_pending = false;
+    app.finalize_assessment("DISK-1");
+    let a_zip = zip_in(&exe, &format!("Клиент А - MSI - {}", today()));
+    let m = manifest(&a_zip);
+    assert_eq!(
+        str_of(m.get("session").unwrap(), "session_id"),
+        a.session_id
+    );
+    assert!(!zip_in(&exe, &format!("Клиент Б - MSI - {}", today())).exists());
+    // The storage history record names A's session, never B's.
+    let history =
+        std::fs::read_to_string(app.reports_root.join(crate::storage_history::FILE_NAME)).unwrap();
+    assert!(history.contains(&a.session_id), "{history}");
+    assert!(!history.contains(&b.session_id), "{history}");
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+/// N3: the analysis that follows an "Analyze" scan stays in the session
+/// the click opened, even if the Client field is edited during the scan.
+#[test]
+fn crash_analysis_after_the_scan_stays_in_the_clicked_session() {
+    let (mut app, exe) = app_in("crash-owner");
+    app.client_name = "Клиент А".into();
+    app.apply(Action::AnalyzeDumps);
+    let a = session(&app).unwrap();
+    app.client_name = "Клиент Б".into();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(CrashMsg::Inventory(Ok(qa_scenes::qa_inventory())))
+        .unwrap();
+    drop(tx);
+    app.crash_rx = Some(rx);
+    app.crash.busy = CrashBusy::Scanning;
+    app.poll_crash();
+    assert_eq!(app.crash.busy, CrashBusy::Analyzing);
+    assert_eq!(session(&app).unwrap(), a, "no new session by itself");
+    let owner = report_package::lock(&app.package_of("crash"))
+        .session()
+        .cloned()
+        .unwrap();
+    assert_eq!(owner, a);
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
 }
 
 /// Storage history / correlation records carry the session's own id.

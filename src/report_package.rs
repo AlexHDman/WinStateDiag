@@ -222,11 +222,16 @@ pub fn find_or_new_report_dir(root: &Path, client: &str, computer: &str, date: &
     }
 }
 
+/// Hidden marker naming the session that reserved a report folder (never in
+/// the ZIP and never removed by `finalize`: `list_files` skips dot files).
+pub const SESSION_MARKER: &str = ".wsd-session";
+
 /// v1.0: the report folder of one session: the first of
-/// `<Client> - <Computer> - <date>`, `… (2)`, `… (3)`, … that does not
-/// exist yet or already holds THIS session's report (its ZIP manifest names
-/// `session_id`). A folder of another session — another client whose name
-/// sanitizes to the same text, or an earlier same-day run — is never used.
+/// `<Client> - <Computer> - <date>`, `… (2)`, `… (3)`, … that this session
+/// can RESERVE (created atomically now, marked with its id) or already owns
+/// (marker or ZIP manifest names `session_id`). A folder of another session
+/// — another client whose name sanitizes to the same text, an earlier
+/// same-day run, or a session that reserved it a moment ago — is never used.
 pub fn session_report_dir(
     root: &Path,
     session_id: &str,
@@ -235,6 +240,7 @@ pub fn session_report_dir(
     date: &str,
 ) -> PathBuf {
     let base = report_base_name(client, computer, date);
+    let _ = fs::create_dir_all(root);
     for n in 1..1000 {
         let name = if n == 1 {
             base.clone()
@@ -242,10 +248,21 @@ pub fn session_report_dir(
             format!("{base} ({n})")
         };
         let dir = root.join(&name);
-        if !dir.exists()
-            || zip_session_id(&dir.join(format!("{name}.zip"))).as_deref() == Some(session_id)
-        {
-            return dir;
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                let _ = fs::write(dir.join(SESSION_MARKER), session_id);
+                return dir;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = fs::read_to_string(dir.join(SESSION_MARKER))
+                    .ok()
+                    .or_else(|| zip_session_id(&dir.join(format!("{name}.zip"))));
+                if owner.as_deref() == Some(session_id) {
+                    return dir;
+                }
+            }
+            // Not creatable (read-only medium …): the later write reports it.
+            Err(_) => return dir,
         }
     }
     root.join(format!("{base} ({session_id})"))
@@ -1620,6 +1637,31 @@ mod tests {
         let again = a.contribute("", "", "24-09-26", hw()).unwrap();
         assert_eq!(again, zip_a);
         assert_eq!(manifest_session(&zip_a).0, "S-1");
+
+        // N1: two sessions of the same identity that both resolve BEFORE
+        // either one writes anything still get different folders (the
+        // first resolve reserves its folder with the session marker).
+        let mut p1 = package(&exe, None);
+        p1.bind_session(SessionIdentity::new("S-7", "Ева", "MSI"));
+        let mut p2 = package(&exe, None);
+        p2.bind_session(SessionIdentity::new("S-8", "Ева", "MSI"));
+        let id1 = p1.resolve("", "", "24-09-26");
+        let id2 = p2.resolve("", "", "24-09-26");
+        assert_ne!(id1.report_dir, id2.report_dir);
+        assert_eq!(
+            fs::read_to_string(id1.report_dir.join(SESSION_MARKER)).unwrap(),
+            "S-7"
+        );
+        let z2 = p2.contribute("", "", "24-09-26", hw()).unwrap();
+        let z1 = p1.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_eq!(manifest_session(&z1).0, "S-7");
+        assert_eq!(manifest_session(&z2).0, "S-8");
+        assert!(!names(&z1).contains(&SESSION_MARKER.to_string()));
+        // A resolve again in the same session finds its own folder.
+        assert_eq!(
+            session_report_dir(&reports, "S-7", "Ева", "MSI", "24-09-26"),
+            id1.report_dir
+        );
 
         // Clients whose names sanitize to the same folder text never merge.
         let mut x = package(&exe, None);
