@@ -63,7 +63,7 @@ WinStateDiag.exe                     (bootstrap: supervises, never renders)
 
 ## 4. Startup log
 
-`<EXE folder>\Reports\startup_graphics.log`. If that folder is not writable, the log goes to `%TEMP%\WinStateDiag\startup_graphics.log`. It is rotated to `.old` above 512 KB.
+`<EXE folder>\Reports\Logs\startup_graphics.log` (v1.0 Startup Idle: a launch never creates a report session folder; a diagnostic session copies the current log into its own report / ZIP). If that folder is not writable, the log goes to `%TEMP%\WinStateDiag\startup_graphics.log`. It is rotated to `.old` above 512 KB.
 
 Each line contains the date, time, role and pid. Recorded events:
 

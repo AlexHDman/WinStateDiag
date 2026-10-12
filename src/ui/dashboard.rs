@@ -521,6 +521,7 @@ fn draw_crypto(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>
         CryptoVm::NoHash => (d.crypto_no_hash, c::YELLOW_WARNING),
         CryptoVm::NotInstalled => (d.crypto_not_installed, c::TEXT_MUTED),
         CryptoVm::CheckError => (d.crypto_check_error, c::TEXT_SECONDARY),
+        CryptoVm::NotChecked => (d.crypto_not_checked, c::TEXT_MUTED),
     };
     match vm.crypto {
         CryptoVm::HashOk => {
@@ -532,7 +533,7 @@ fn draw_crypto(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>
             c::YELLOW_WARNING,
             c::BG_CARD,
         ),
-        CryptoVm::NotInstalled => {
+        CryptoVm::NotInstalled | CryptoVm::NotChecked => {
             paint::circle_outline(
                 &p,
                 icon.center(),
@@ -1113,13 +1114,17 @@ fn draw_drivers(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action
                 if vm.animate { Some(vm.time) } else { None },
             );
         }
-        DriversVm::Unavailable(msg) => {
+        DriversVm::Unavailable(_) | DriversVm::NotRun => {
+            let (title, note) = match &vm.drivers {
+                DriversVm::Unavailable(msg) => (d.driver_unavailable, msg.as_str()),
+                _ => (d.driver_not_run, d.driver_not_run_hint),
+            };
             paint::text(
                 &p,
                 mx(o, l::DRIVER_NAME_X),
                 row_b(0),
                 Align::Min,
-                d.driver_unavailable,
+                title,
                 t::DRIVER_NAME,
                 c::TEXT_SECONDARY,
             );
@@ -1128,7 +1133,7 @@ fn draw_drivers(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action
                 mx(o, l::DRIVER_NAME_X),
                 row_b(1),
                 mx(o, l::DRIVER_ROW_RIGHT_X) - mx(o, l::DRIVER_NAME_X),
-                msg,
+                note,
                 t::CAPTION,
                 c::TEXT_MUTED,
             );

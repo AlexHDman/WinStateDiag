@@ -230,26 +230,21 @@ pub fn describe_exit_code(code: Option<i32>) -> String {
 pub struct StartupLog {
     path: PathBuf,
     tag: String,
-    /// `<EXE>\Reports`: the log lives in this PC's report folder of today
-    /// (`Reports\<Client - Computer - DD-MM-YY>\`), found again for every
-    /// line so a later rename of that folder (client added) is followed.
-    reports_root: Option<PathBuf>,
 }
 
 impl StartupLog {
-    /// `Reports\<Client - Computer - DD-MM-YY>\startup_graphics.log` next to
-    /// the EXE (the one report folder of this PC and date); if that is not
-    /// writable, `%TEMP%\WinStateDiag\startup_graphics.log`.
+    /// `<EXE>\Reports\Logs\startup_graphics.log` (v1.0 Startup Idle: a
+    /// launch never creates a report folder; a diagnostic session copies
+    /// this log into its own package); if that is not writable,
+    /// `%TEMP%\WinStateDiag\startup_graphics.log`.
     pub fn open(tag: &str) -> Self {
         let exe_reports = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("Reports")));
         if let Some(root) = exe_reports {
-            let dir = report_dir_for_today(&root);
+            let dir = crate::report_package::logs_dir(&root);
             if is_writable_dir(&dir) {
-                let mut log = Self::at(&dir, tag);
-                log.reports_root = Some(root);
-                return log;
+                return Self::at(&dir, tag);
             }
         }
         let temp = std::env::temp_dir().join("WinStateDiag");
@@ -273,16 +268,11 @@ impl StartupLog {
         Self {
             path,
             tag: tag.to_string(),
-            reports_root: None,
         }
     }
 
-    /// Current log file (follows the report folder of this PC and date).
     pub fn path(&self) -> PathBuf {
-        match &self.reports_root {
-            Some(root) => report_dir_for_today(root).join(LOG_FILE_NAME),
-            None => self.path.clone(),
-        }
+        self.path.clone()
     }
 
     /// v1.0 explicit session delimiter: the log keeps the history of
@@ -338,18 +328,6 @@ pub fn session_start_lines(
         format!("computer: {computer}"),
         format!("graphics_mode: {graphics_mode}"),
     ]
-}
-
-/// Today's report folder of this PC under `root` (the one folder per PC and
-/// date, see report_package).
-fn report_dir_for_today(root: &Path) -> PathBuf {
-    let date = crate::report_package::identity_date(crate::ui::sysinfo::local_time());
-    crate::report_package::find_or_new_report_dir(
-        root,
-        "",
-        &crate::report_package::computer_name(),
-        &date,
-    )
 }
 
 fn is_writable_dir(dir: &Path) -> bool {
@@ -957,21 +935,24 @@ mod tests {
         assert!(describe_exit_code(Some(3)).contains("renderer initialisation failed"));
     }
 
-    /// The start-up log lives in today's report folder of this PC, never
-    /// loose in `Reports\`.
+    /// v1.0 Startup Idle: the start-up log lives in `Reports\Logs`, never
+    /// loose in `Reports\` and never in a (new) report session folder.
     #[test]
-    fn startup_log_goes_into_the_pc_report_folder() {
+    fn startup_log_goes_into_reports_logs_not_a_report_folder() {
         let root = std::env::temp_dir().join(format!("wsd-gs-root-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let dir = report_dir_for_today(&root);
-        let mut log = StartupLog::at(&dir, "test");
-        log.reports_root = Some(root.clone());
+        let log = StartupLog::at(&crate::report_package::logs_dir(&root), "test");
         log.line("hello");
         let path = log.path();
-        assert!(path.starts_with(&root));
-        assert_ne!(path.parent().unwrap(), root.as_path());
+        assert_eq!(path, root.join("Logs").join(LOG_FILE_NAME));
         assert!(fs::read_to_string(&path).unwrap().contains("hello"));
         assert!(!root.join(LOG_FILE_NAME).exists());
+        let dirs: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(dirs, vec!["Logs".to_string()]);
         let _ = fs::remove_dir_all(&root);
     }
 

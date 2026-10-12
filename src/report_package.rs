@@ -1,10 +1,13 @@
 //! Unified session report package.
 //!
-//! One running WinStateDiag owns ONE report destination:
+//! One diagnostic session owns ONE report destination:
 //! `<EXE>\Reports\<Client> - <Computer> - DD-MM-YY\<same>.zip`.
-//! Every diagnostic module (EXPC Diagnostic, Hardware Report, Driver Audit,
-//! SSD benchmark) contributes its evidence to that package as soon as it has
-//! it; the user never has to save anything by hand.
+//! v1.0 Startup Idle / Client Identity: a launch creates no session; a
+//! session (unique SessionId, frozen Client / Computer) is opened by an
+//! explicit user action (see [`SessionPackage::bind_session`]). Every
+//! diagnostic module (EXPC Diagnostic, Hardware Report, Driver Audit, SSD
+//! benchmark) of that session contributes its evidence to that package as
+//! soon as it has it; the user never has to save anything by hand.
 //!
 //! * Evidence is persisted first, as plain files, in the hidden
 //!   `<report dir>\.evidence\` folder (never only in %TEMP%).
@@ -187,50 +190,128 @@ pub fn computer_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "UNKNOWN-PC".into())
 }
 
-/// The ONE report folder of a PC and a date under `root`:
-/// `<Client> - <Computer> - <date>` or `<Computer> - <date>`.
-/// An existing folder of that PC+date is reused (preferring the one with
-/// `client`, then any client, then the bare one); otherwise the new name
-/// (not created here). A bare folder is renamed to include `client` once a
-/// client is known, when that is possible.
+/// `<EXE>\Reports\Logs`: saved journals and the start-up log (application
+/// logs, never a report session folder).
+pub fn logs_dir(reports_root: &Path) -> PathBuf {
+    reports_root.join("Logs")
+}
+
+/// The report folder of exactly this Client + Computer + date under `root`:
+/// `<Client> - <Computer> - <date>` or `<Computer> - <date>` (empty Client).
+/// An existing folder with that exact name (case-insensitive) is reused, so
+/// same-day runs of the same client accumulate; otherwise the new name (not
+/// created here). v1.0 Client Identity: a folder of ANOTHER client (or the
+/// client-less one) is never adopted or renamed — its evidence belongs to
+/// that other identity.
 pub fn find_or_new_report_dir(root: &Path, client: &str, computer: &str, date: &str) -> PathBuf {
-    let bare = report_base_name("", computer, date);
     let wanted = report_base_name(client, computer, date);
-    let bare_l = bare.to_lowercase();
-    let suffix = format!(" - {bare_l}");
-    let mut candidates: Vec<String> = fs::read_dir(root)
+    let wanted_l = wanted.to_lowercase();
+    let mut existing: Vec<String> = fs::read_dir(root)
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|n| {
-                    let l = n.to_lowercase();
-                    l == bare_l || l.ends_with(&suffix)
-                })
+                .filter(|n| n.to_lowercase() == wanted_l)
                 .collect()
         })
         .unwrap_or_default();
-    candidates.sort();
-    let pick = candidates
-        .iter()
-        .find(|n| n.to_lowercase() == wanted.to_lowercase())
-        .or_else(|| candidates.iter().find(|n| n.to_lowercase() != bare_l))
-        .or_else(|| candidates.first())
-        .cloned();
-    match pick {
-        None => root.join(wanted),
-        Some(name) if name.to_lowercase() == bare_l && wanted != bare => {
-            let from = root.join(&name);
-            let to = root.join(&wanted);
-            if !to.exists() && fs::rename(&from, &to).is_ok() {
-                // The package ZIP is derived; the old-named one goes away.
-                let _ = fs::remove_file(to.join(format!("{name}.zip")));
-                to
-            } else {
-                from
-            }
-        }
+    existing.sort();
+    match existing.into_iter().next() {
         Some(name) => root.join(name),
+        None => root.join(wanted),
+    }
+}
+
+/// Hidden marker naming the session that reserved a report folder (never in
+/// the ZIP and never removed by `finalize`: `list_files` skips dot files).
+pub const SESSION_MARKER: &str = ".wsd-session";
+
+/// v1.0: the report folder of one session: the first of
+/// `<Client> - <Computer> - <date>`, `… (2)`, `… (3)`, … that this session
+/// can RESERVE (created atomically now, marked with its id) or already owns
+/// (marker or ZIP manifest names `session_id`). A folder of another session
+/// — another client whose name sanitizes to the same text, an earlier
+/// same-day run, or a session that reserved it a moment ago — is never used.
+pub fn session_report_dir(
+    root: &Path,
+    session_id: &str,
+    client: &str,
+    computer: &str,
+    date: &str,
+) -> PathBuf {
+    let base = report_base_name(client, computer, date);
+    let _ = fs::create_dir_all(root);
+    for n in 1..1000 {
+        let name = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base} ({n})")
+        };
+        let dir = root.join(&name);
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                let _ = fs::write(dir.join(SESSION_MARKER), session_id);
+                return dir;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = fs::read_to_string(dir.join(SESSION_MARKER))
+                    .ok()
+                    .or_else(|| zip_session_id(&dir.join(format!("{name}.zip"))));
+                if owner.as_deref() == Some(session_id) {
+                    return dir;
+                }
+            }
+            // Not creatable (read-only medium …): the later write reports it.
+            Err(_) => return dir,
+        }
+    }
+    root.join(format!("{base} ({session_id})"))
+}
+
+/// `session.session_id` of a report ZIP's manifest, if readable.
+fn zip_session_id(zip: &Path) -> Option<String> {
+    let manifest = read_zip(zip)
+        .ok()?
+        .into_iter()
+        .find(|e| e.name == crate::manifest::MANIFEST_FILE)?;
+    let v = crate::deep_checks::json::parse(std::str::from_utf8(&manifest.bytes).ok()?)?;
+    v.get("session")?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// v1.0 identity of one diagnostic session / separate module operation:
+/// fixed when the user starts it and never taken from the live input
+/// fields afterwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionIdentity {
+    pub session_id: String,
+    /// Trimmed; may be empty (then only the computer names the report).
+    pub client: String,
+    pub computer: String,
+}
+
+impl SessionIdentity {
+    /// Freezes the current Client / Computer input under `session_id`
+    /// (an empty Computer falls back to `COMPUTERNAME`).
+    pub fn new(session_id: &str, client: &str, computer: &str) -> Self {
+        let computer = computer.trim();
+        Self {
+            session_id: session_id.to_string(),
+            client: client.trim().to_string(),
+            computer: if computer.is_empty() {
+                computer_name()
+            } else {
+                computer.to_string()
+            },
+        }
+    }
+
+    /// Same Client and Computer (the session id is not compared).
+    pub fn same_identity(&self, client: &str, computer: &str) -> bool {
+        let other = Self::new("", client, computer);
+        self.client == other.client && self.computer == other.computer
     }
 }
 
@@ -250,13 +331,17 @@ pub struct SessionPackage {
     /// A verified rebuild happened since the last `finalize`.
     needs_finalize: bool,
     completed: BTreeSet<EvidenceModule>,
-    /// Evidence offered before the package existed (automatic start-up
-    /// Driver Audit): joins the package when the first module creates it.
+    /// Driver Audit evidence offered to a package that is neither resolved
+    /// nor bound to a session: joins it when the first module creates it.
     pending: Vec<EvidenceFile>,
     zip_ready: bool,
     template: Option<Vec<u8>>,
     /// v1.0 (system, hardware) state codes for the manifest.
     states: Option<(String, String)>,
+    /// v1.0 Client Identity: the session this package belongs to. Once
+    /// bound, its Client / Computer name the report; the values callers
+    /// pass are ignored, so a later edit of the input fields never leaks in.
+    session: Option<SessionIdentity>,
     #[cfg(test)]
     pub fail_next_replace: bool,
 }
@@ -273,9 +358,36 @@ impl SessionPackage {
             zip_ready: false,
             template,
             states: None,
+            session: None,
             #[cfg(test)]
             fail_next_replace: false,
         }
+    }
+
+    /// v1.0: binds this (still unresolved) package to one session.
+    pub fn bind_session(&mut self, session: SessionIdentity) {
+        self.computer = session.computer.clone();
+        self.session = Some(session);
+    }
+
+    /// The session this package belongs to, if bound.
+    pub fn session(&self) -> Option<&SessionIdentity> {
+        self.session.as_ref()
+    }
+
+    /// Nothing resolved, bound or pending yet (a just-created package).
+    pub fn is_fresh(&self) -> bool {
+        self.identity.is_none() && self.session.is_none() && self.pending.is_empty()
+    }
+
+    /// A new, empty package of the same Reports folder and template, bound
+    /// to `session` (the next session of this WinStateDiag). The previous
+    /// package — and every operation still holding it — keeps its own
+    /// identity.
+    pub fn successor(&self, session: SessionIdentity) -> Self {
+        let mut next = Self::new(self.reports_root.clone(), self.template.clone());
+        next.bind_session(session);
+        next
     }
 
     /// v1.0: the current (system, hardware) state codes written into the
@@ -302,17 +414,30 @@ impl SessionPackage {
     }
 
     /// Resolves the report destination once; later calls return the same
-    /// identity. One PC + one date = one report folder: an existing folder
-    /// of that PC and date (an earlier run, the start-up log) is reused;
-    /// new results never overwrite old ones (see `store_evidence`).
+    /// identity. v1.0 Client Identity: a package bound to a session gets a
+    /// folder of its own — `<Client> - <Computer> - <date>`, or `… (2)`,
+    /// `… (3)` when that folder holds another session's report — so its ZIP
+    /// and manifest contain only this session's evidence. An unbound
+    /// package (legacy callers) reuses the folder of exactly its identity.
+    /// New results never overwrite old ones (see `store_evidence`).
     pub fn resolve(&mut self, client: &str, computer: &str, date: &str) -> PackageIdentity {
         if let Some(id) = &self.identity {
             return id.clone();
         }
+        let bound = self.session.clone();
+        let (client, computer) = match &bound {
+            Some(s) => (s.client.as_str(), s.computer.as_str()),
+            None => (client, computer),
+        };
         if !computer.trim().is_empty() {
             self.computer = computer.trim().to_string();
         }
-        let report_dir = find_or_new_report_dir(&self.reports_root, client, computer, date);
+        let report_dir = match &bound {
+            Some(s) => {
+                session_report_dir(&self.reports_root, &s.session_id, client, computer, date)
+            }
+            None => find_or_new_report_dir(&self.reports_root, client, computer, date),
+        };
         let base = report_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -370,6 +495,7 @@ impl SessionPackage {
         // first; if the ZIP cannot be read, the new evidence is still kept
         // as loose files and the existing ZIP is left untouched.
         let restored = restore_loose(&id);
+        self.attach_startup_log(&id);
         let stored = match store_evidence(&evidence_dir, &all) {
             Ok(names) => names,
             Err(err) => {
@@ -412,7 +538,24 @@ impl SessionPackage {
             )
         })?;
         restore_loose(&id)?;
+        self.attach_startup_log(&id);
         Ok(id)
+    }
+
+    /// v1.0 Startup Idle: the start-up log lives in `Reports\Logs`; a
+    /// session takes its current snapshot into its own folder (append-only:
+    /// a copy that is not a continuation of the folder's one is left alone).
+    fn attach_startup_log(&self, id: &PackageIdentity) {
+        let Ok(current) = fs::read(logs_dir(&self.reports_root).join(STARTUP_LOG_FILE)) else {
+            return;
+        };
+        let target = id.report_dir.join(STARTUP_LOG_FILE);
+        match fs::read(&target) {
+            Ok(old) if old == current || !current.starts_with(&old) => {}
+            _ => {
+                let _ = write_new_file(&target, &current);
+            }
+        }
     }
 
     /// A verified rebuild is waiting for `finalize`.
@@ -494,16 +637,22 @@ impl SessionPackage {
         Ok(removed)
     }
 
-    /// Evidence produced automatically (start-up Driver Audit): joins the
-    /// package if it exists, otherwise waits in memory for the first
-    /// module that creates the package. Returns the ZIP when updated now.
+    /// Driver Audit evidence: joins the package if it exists or is bound to
+    /// a session (v1.0: an explicit run always is), otherwise waits in
+    /// memory for the first module that creates the package. Returns the
+    /// ZIP when updated now.
     pub fn offer(&mut self, files: Vec<EvidenceFile>) -> Result<Option<PathBuf>, String> {
-        match self.identity.clone() {
-            Some(id) if id.report_dir.is_dir() => {
-                let zip = self.contribute("", "", "", files)?;
+        let exists = self
+            .identity
+            .as_ref()
+            .is_some_and(|id| id.report_dir.is_dir());
+        match exists || self.session.is_some() {
+            true => {
+                let date = identity_date(crate::ui::sysinfo::local_time());
+                let zip = self.contribute("", "", &date, files)?;
                 Ok(Some(zip))
             }
-            _ => {
+            false => {
                 self.pending.extend(files);
                 Ok(None)
             }
@@ -541,6 +690,10 @@ impl SessionPackage {
             producer_version: crate::manifest::PRODUCER_VERSION.to_string(),
             system_state: self.states.as_ref().map(|s| s.0.clone()),
             hardware_state: self.states.as_ref().map(|s| s.1.clone()),
+            session: self
+                .session
+                .as_ref()
+                .map(|s| (s.session_id.clone(), s.client.clone())),
             package: id
                 .zip_path
                 .file_name()
@@ -1385,27 +1538,150 @@ mod tests {
         let _ = fs::remove_dir_all(&exe);
     }
 
-    /// The start-up log creates `<Computer> - <date>` before a client is
-    /// known; the first module with a client renames that same folder.
+    fn manifest_session(zip: &Path) -> (String, String, String) {
+        let m = read_zip(zip)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == crate::manifest::MANIFEST_FILE)
+            .unwrap();
+        let v = crate::deep_checks::json::parse(std::str::from_utf8(&m.bytes).unwrap()).unwrap();
+        let s = v.get("session").unwrap();
+        let get = |o: &crate::deep_checks::json::Value, k: &str| {
+            o.get(k).unwrap().as_str().unwrap().to_string()
+        };
+        (
+            get(s, "session_id"),
+            get(s, "client_name"),
+            get(&v, "computer_name"),
+        )
+    }
+
+    /// v1.0 Client Identity: each session reports under the Client /
+    /// Computer frozen at its start; a folder of another client (or the
+    /// client-less one) of the same PC and date is never adopted, renamed or
+    /// written to, and the start-up log (Reports\Logs) joins as a snapshot.
     #[test]
-    fn bare_startup_folder_becomes_the_client_folder() {
-        let exe = scratch("bare");
+    fn sessions_never_reuse_another_clients_identity() {
+        let exe = scratch("ident");
         let reports = exe.join("Reports");
         let bare = reports.join("MSI - 24-09-26");
         fs::create_dir_all(&bare).unwrap();
-        fs::write(bare.join(STARTUP_LOG_FILE), b"startup").unwrap();
-        let mut pkg = package(&exe, None);
-        let zip = pkg.contribute("Алексей", "MSI", "24-09-26", hw()).unwrap();
-        let dir = reports.join("Алексей - MSI - 24-09-26");
-        assert_eq!(zip, dir.join("Алексей - MSI - 24-09-26.zip"));
-        assert!(!bare.exists());
-        assert!(names(&zip).contains(&STARTUP_LOG_FILE.to_string()));
-        // Later lookups (start-up log lines) find the same folder.
-        assert_eq!(find_or_new_report_dir(&reports, "", "MSI", "24-09-26"), dir);
-        // Another client on the same PC and date: still the one folder.
+        fs::write(bare.join("Hardware_bare.txt"), b"bare session").unwrap();
+        fs::create_dir_all(logs_dir(&reports)).unwrap();
+        fs::write(logs_dir(&reports).join(STARTUP_LOG_FILE), b"startup\r\n").unwrap();
+
+        // Session 1: client A. The live values a caller passes later
+        // (a stale or edited input field) are ignored once bound.
+        let mut a = package(&exe, None);
+        a.bind_session(SessionIdentity::new("S-1", "  Алексей ", "MSI"));
+        let zip_a = a.contribute("STALE", "OTHER-PC", "24-09-26", hw()).unwrap();
+        let dir_a = reports.join("Алексей - MSI - 24-09-26");
+        assert_eq!(zip_a, dir_a.join("Алексей - MSI - 24-09-26.zip"));
         assert_eq!(
-            find_or_new_report_dir(&reports, "Боб", "MSI", "24-09-26"),
-            dir
+            manifest_session(&zip_a),
+            ("S-1".into(), "Алексей".into(), "MSI".into())
+        );
+        assert!(names(&zip_a).contains(&STARTUP_LOG_FILE.to_string()));
+        // The client-less folder is untouched.
+        assert_eq!(
+            fs::read(bare.join("Hardware_bare.txt")).unwrap(),
+            b"bare session"
+        );
+        assert!(!names(&zip_a).contains(&"Hardware_bare.txt".to_string()));
+
+        // Session 2: another client on the same PC and date: own folder.
+        let mut b = package(&exe, None);
+        b.bind_session(SessionIdentity::new("S-2", "Боб", "MSI"));
+        let zip_b = b.contribute("Алексей", "MSI", "24-09-26", hw()).unwrap();
+        assert_eq!(
+            zip_b,
+            reports
+                .join("Боб - MSI - 24-09-26")
+                .join("Боб - MSI - 24-09-26.zip")
+        );
+        assert_eq!(
+            manifest_session(&zip_b),
+            ("S-2".into(), "Боб".into(), "MSI".into())
+        );
+        assert!(zip_a.is_file());
+
+        // Session 3: empty client: only the computer names the report.
+        let mut c = package(&exe, None);
+        c.bind_session(SessionIdentity::new("S-3", "   ", "MSI"));
+        let zip_c = c.contribute("Боб", "MSI", "24-09-26", hw()).unwrap();
+        // The client-less folder of the same date belongs to another
+        // (earlier) session: this session gets its own.
+        let own_c = reports.join("MSI - 24-09-26 (2)");
+        assert_eq!(zip_c, own_c.join("MSI - 24-09-26 (2).zip"));
+        assert_eq!(
+            manifest_session(&zip_c),
+            ("S-3".into(), String::new(), "MSI".into())
+        );
+        assert!(!names(&zip_c).contains(&"Hardware_bare.txt".to_string()));
+
+        // The same client again in a NEW session: its own folder and ZIP;
+        // the first session's report is left exactly as it was.
+        let zip_a_bytes = fs::read(&zip_a).unwrap();
+        let mut a2 = package(&exe, None);
+        a2.bind_session(SessionIdentity::new("S-4", "Алексей", "MSI"));
+        let zip_a2 = a2.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_eq!(
+            zip_a2,
+            reports
+                .join("Алексей - MSI - 24-09-26 (2)")
+                .join("Алексей - MSI - 24-09-26 (2).zip")
+        );
+        assert_eq!(manifest_session(&zip_a2).0, "S-4");
+        assert_eq!(fs::read(&zip_a).unwrap(), zip_a_bytes);
+        // Within one session every contribution stays in its own folder.
+        let again = a.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_eq!(again, zip_a);
+        assert_eq!(manifest_session(&zip_a).0, "S-1");
+
+        // N1: two sessions of the same identity that both resolve BEFORE
+        // either one writes anything still get different folders (the
+        // first resolve reserves its folder with the session marker).
+        let mut p1 = package(&exe, None);
+        p1.bind_session(SessionIdentity::new("S-7", "Ева", "MSI"));
+        let mut p2 = package(&exe, None);
+        p2.bind_session(SessionIdentity::new("S-8", "Ева", "MSI"));
+        let id1 = p1.resolve("", "", "24-09-26");
+        let id2 = p2.resolve("", "", "24-09-26");
+        assert_ne!(id1.report_dir, id2.report_dir);
+        assert_eq!(
+            fs::read_to_string(id1.report_dir.join(SESSION_MARKER)).unwrap(),
+            "S-7"
+        );
+        let z2 = p2.contribute("", "", "24-09-26", hw()).unwrap();
+        let z1 = p1.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_eq!(manifest_session(&z1).0, "S-7");
+        assert_eq!(manifest_session(&z2).0, "S-8");
+        assert!(!names(&z1).contains(&SESSION_MARKER.to_string()));
+        // A resolve again in the same session finds its own folder.
+        assert_eq!(
+            session_report_dir(&reports, "S-7", "Ева", "MSI", "24-09-26"),
+            id1.report_dir
+        );
+
+        // Clients whose names sanitize to the same folder text never merge.
+        let mut x = package(&exe, None);
+        x.bind_session(SessionIdentity::new("S-5", "A/B", "MSI"));
+        let zip_x = x.contribute("", "", "24-09-26", hw()).unwrap();
+        let mut y = package(&exe, None);
+        y.bind_session(SessionIdentity::new("S-6", "A:B", "MSI"));
+        let zip_y = y.contribute("", "", "24-09-26", hw()).unwrap();
+        assert_ne!(zip_x.parent(), zip_y.parent());
+        assert_eq!(manifest_session(&zip_x).1, "A/B");
+        assert_eq!(manifest_session(&zip_y).1, "A:B");
+
+        // Unbound (legacy) lookups reuse only exactly their own folder.
+        assert_eq!(
+            find_or_new_report_dir(&reports, "алексей", "MSI", "24-09-26"),
+            dir_a
+        );
+        assert_eq!(
+            find_or_new_report_dir(&reports, "Ева", "MSI", "24-09-26"),
+            reports.join("Ева - MSI - 24-09-26")
         );
         // No runtime artifacts next to the folder.
         let root_files: Vec<_> = fs::read_dir(&reports)
