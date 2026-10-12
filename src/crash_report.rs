@@ -60,13 +60,21 @@ impl Counters {
     pub fn line(&self, ru: bool) -> String {
         if ru {
             format!(
-                "Неожиданные выключения: {} · BugCheck / BSOD: {} · Дампы: {} · LiveKernelReports: {}",
-                self.unexpected_shutdowns, self.bugchecks, self.dumps, self.live_kernel_reports
+                "За {} дн.: неожиданные выключения: {} · BugCheck / BSOD: {} · Дампы (все файлы): {} · LiveKernelReports: {}",
+                crate::incidents::WINDOW_DAYS,
+                self.unexpected_shutdowns,
+                self.bugchecks,
+                self.dumps,
+                self.live_kernel_reports
             )
         } else {
             format!(
-                "Unexpected shutdowns: {} · BugCheck / BSOD: {} · Dumps: {} · LiveKernelReports: {}",
-                self.unexpected_shutdowns, self.bugchecks, self.dumps, self.live_kernel_reports
+                "Last {} days: unexpected shutdowns: {} · BugCheck / BSOD: {} · Dumps (all files): {} · LiveKernelReports: {}",
+                crate::incidents::WINDOW_DAYS,
+                self.unexpected_shutdowns,
+                self.bugchecks,
+                self.dumps,
+                self.live_kernel_reports
             )
         }
     }
@@ -202,6 +210,8 @@ pub struct Report {
     pub found: Vec<String>,
     pub incidents: Vec<IncidentRow>,
     pub cause: Vec<String>,
+    /// v1.0.1 «ПОЧЕМУ СДЕЛАН ВЫВОД»: the evidence behind the cause.
+    pub why: Vec<String>,
     pub checks: Vec<String>,
     pub counters: Counters,
 }
@@ -236,7 +246,7 @@ fn module_label(a: &DumpAnalysis) -> Option<String> {
 pub fn build(inv: &Inventory, analyses: &[DumpAnalysis], ru: bool) -> Report {
     let counters = Counters::of(inv);
     let lkr = lkr_groups(&inv.live_kernel_reports, ru);
-    let verdicts = crate::crash_dump::incident_verdicts(inv);
+    let verdicts = crate::crash_dump::incident_verdicts(inv, analyses);
     let best = strongest_analysis(analyses);
 
     // --- СОСТОЯНИЕ -------------------------------------------------------
@@ -418,49 +428,110 @@ pub fn build(inv: &Inventory, analyses: &[DumpAnalysis], ru: bool) -> Report {
 
     // --- ВЕРОЯТНАЯ ПРИЧИНА (evidence priority, item 45) -------------------
     let mut cause: Vec<String> = Vec::new();
+    let mut why: Vec<String> = Vec::new();
+    let incomplete = analyses
+        .iter()
+        .find(|a| a.confidence == crate::crash_dump::Confidence::ParserIncomplete);
     if let Some(a) = best {
         let m = module_label(a).unwrap_or_default();
-        let who = a
-            .resolution
-            .as_ref()
-            .filter(|r| r.present)
-            .map(|r| {
-                let mut parts: Vec<String> = Vec::new();
-                if !r.service_name.is_empty() {
-                    parts.push(if ru {
-                        format!("служба {}", r.service_name)
-                    } else {
-                        format!("service {}", r.service_name)
-                    });
-                }
-                if !r.product.is_empty() {
-                    parts.push(r.product.clone());
-                }
-                if !r.company.is_empty() {
-                    parts.push(r.company.clone());
-                }
-                if parts.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {}", parts.join(", "))
-                }
-            })
-            .unwrap_or_default();
+        let owner = match a.software_owner() {
+            Some((o, true)) => format!(" / {o}"),
+            Some((o, false)) if ru => format!(" / {o} (по имени модуля)"),
+            Some((o, false)) => format!(" / {o} (by module name)"),
+            None => String::new(),
+        };
         cause.push(if ru {
             format!(
-                "1. Анализ дампа: драйвер {m}{who}; уверенность {}.",
+                "Драйвер {m}{owner} — вероятная причина исторического BSOD; достоверность {} (обоснованная, не абсолютная).",
                 a.confidence.code()
             )
         } else {
             format!(
-                "1. Dump analysis: driver {m}{who}; confidence {}.",
+                "Driver {m}{owner} — probable cause of the historical BSOD; confidence {} (reasoned, not absolute).",
                 a.confidence.code()
             )
         });
-        if let Some(l) = a.linked.first() {
+        if let Some(r) = a.resolution.as_ref().filter(|r| r.present)
+            && !r.service_name.is_empty()
+        {
             cause.push(if ru {
+                format!("Служба {} ({}).", r.service_name, r.service_state)
+            } else {
+                format!("Service {} ({}).", r.service_name, r.service_state)
+            });
+        }
+        // ПОЧЕМУ СДЕЛАН ВЫВОД: the debugger's own fields + stack evidence.
+        let code = a
+            .bugcheck_code()
+            .map(|c| format!("0x{c:X}"))
+            .unwrap_or_else(|| "—".into());
+        why.push(format!(
+            "BugCheck {code}{}{}",
+            a.parsed
+                .bugcheck_name
+                .as_deref()
+                .map(|n| format!(" {n}"))
+                .unwrap_or_default(),
+            a.parsed
+                .bugcheck_parameters
+                .first()
+                .map(|p| format!(" · Arg1 {p}"))
+                .unwrap_or_default()
+        ));
+        for (k, v) in [
+            ("MODULE_NAME", &a.parsed.module_name),
+            ("IMAGE_NAME", &a.parsed.image_name),
+            ("SYMBOL_NAME", &a.parsed.symbol_name),
+            ("FAILURE_BUCKET_ID", &a.parsed.failure_bucket_id),
+            ("PROCESS_NAME", &a.parsed.process_name),
+        ] {
+            if let Some(v) = v {
+                why.push(format!("{k}: {v}"));
+            }
+        }
+        let frames = a.module_frames();
+        if !frames.is_empty() {
+            why.push(if ru {
                 format!(
-                    "2. Driver Audit подтверждает: [{}] {} — {} ×{}.",
+                    "Стек вызовов: {} кадр(а) модуля ({})",
+                    frames.len(),
+                    frames
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!(
+                    "Call stack: {} frame(s) of the module ({})",
+                    frames.len(),
+                    frames
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+        }
+        why.push(if ru {
+            format!(
+                "Символы: {} · анализ: {}",
+                a.parsed.symbol_status().code(),
+                a.status.code()
+            )
+        } else {
+            format!(
+                "Symbols: {} · analysis: {}",
+                a.parsed.symbol_status().code(),
+                a.status.code()
+            )
+        });
+        if let Some(l) = a.linked.first() {
+            why.push(if ru {
+                format!(
+                    "Driver Audit подтверждает: [{}] {} — {} ×{}",
                     l.status.label_ru(),
                     l.device,
                     l.kind.code(),
@@ -468,7 +539,7 @@ pub fn build(inv: &Inventory, analyses: &[DumpAnalysis], ru: bool) -> Report {
                 )
             } else {
                 format!(
-                    "2. Driver Audit corroborates: [{}] {} — {} ×{}.",
+                    "Driver Audit corroborates: [{}] {} — {} ×{}",
                     l.status.code(),
                     l.device,
                     l.kind.code(),
@@ -476,6 +547,27 @@ pub fn build(inv: &Inventory, analyses: &[DumpAnalysis], ru: bool) -> Report {
                 )
             });
         }
+        why.push(t(
+            ru,
+            "ntoskrnl / nt! в стеке — обработчик ошибки ядра, не причина сам по себе.",
+            "ntoskrnl / nt! in the stack is the kernel's failure handler, not a cause by itself.",
+        ));
+        why.push(t(
+            ru,
+            "Это исторический сбой: продолжающаяся неисправность без новых событий не утверждается.",
+            "This is a historical failure: no ongoing fault is claimed without new events.",
+        ));
+    } else if let Some(a) = incomplete {
+        let m = crate::crash_dump::raw_module_candidate(&a.raw_output).unwrap_or_default();
+        cause.push(if ru {
+            format!(
+                "PARSER_INCOMPLETE: вывод WinDbg называет модуль {m}, но структурированный разбор неполон — см. «Технические данные WinDbg». Это не «причина не определена»."
+            )
+        } else {
+            format!(
+                "PARSER_INCOMPLETE: the WinDbg output names module {m} but the structured parse is incomplete — see the raw WinDbg data. This is not \"cause not determined\"."
+            )
+        });
     } else if analyses
         .iter()
         .any(|a| a.status == crate::crash_dump::AnalysisStatus::Completed)
@@ -537,13 +629,17 @@ pub fn build(inv: &Inventory, analyses: &[DumpAnalysis], ru: bool) -> Report {
     let mut checks: Vec<String> = Vec::new();
     if let Some(a) = best {
         let m = module_label(a).unwrap_or_default();
+        let target = match a.software_owner() {
+            Some((o, _)) => format!("{m} ({o})"),
+            None => m.clone(),
+        };
         checks.push(if ru {
             format!(
-                "Обновите {m} у производителя ПО / устройства; если сбой повторяется — временно отключите программу, установившую этот драйвер (вручную)."
+                "Сбой исторический: проверьте, повторяется ли BSOD. При повторении обновите {target} у производителя или временно отключите это ПО (вручную) и понаблюдайте."
             )
         } else {
             format!(
-                "Update {m} from the software / device vendor; if the failure repeats, temporarily disable the program that installed this driver (manually)."
+                "Historical failure: check whether the BSOD repeats. If it does, update {target} from the vendor or temporarily disable that software (manually) and observe."
             )
         });
     }
@@ -592,6 +688,7 @@ pub fn build(inv: &Inventory, analyses: &[DumpAnalysis], ru: bool) -> Report {
         found,
         incidents: rows,
         cause,
+        why,
         checks,
         counters,
     }
@@ -643,6 +740,19 @@ pub fn to_text(r: &Report, ru: bool) -> String {
     );
     for l in &r.cause {
         o.push_str(&format!("{l}\r\n"));
+    }
+    if !r.why.is_empty() {
+        h(
+            &mut o,
+            if ru {
+                "ПОЧЕМУ СДЕЛАН ВЫВОД"
+            } else {
+                "WHY THIS CONCLUSION"
+            },
+        );
+        for l in &r.why {
+            o.push_str(&format!("• {l}\r\n"));
+        }
     }
     h(
         &mut o,
@@ -849,5 +959,37 @@ mod tests {
         assert!(j.iter().any(|l| l.contains("48.0 MB / 48.0 MB")));
         assert!(j.iter().any(|l| l == "Установка: успешно."));
         assert!(j.last().unwrap().contains("cdb не найден"));
+    }
+
+    /// v1.0.1: EXPC stage 07, the crash inventory, Incidents.json and the
+    /// crash Details count with ONE window and ONE rule, and say so.
+    #[test]
+    fn counting_window_and_rule_are_shared_and_explicit() {
+        let days = crate::incidents::WINDOW_DAYS;
+        assert_eq!(days, 30);
+        assert!(crate::crash_dump::INVENTORY_PS1.contains(&format!("AddDays(-{days})")));
+        let expc = include_str!("../embedded/EXPC-Diagnostic/EXPC-Diagnostic.ps1");
+        assert!(expc.contains(&format!("$start = (Get-Date).AddDays(-{days})")));
+        assert!(expc.contains("одно выключение = одна загрузка"));
+        assert!(
+            expc.contains("($t - $clustered[-1]).TotalMinutes -gt 15.0"),
+            "per-boot clustering"
+        );
+        assert!(
+            expc.contains("Kernel-Power 41 с кодом"),
+            "coded KP41 counted as BugCheck"
+        );
+        let mut i = inv();
+        i.unexpected_shutdowns = 5;
+        let c = Counters::of(&i);
+        assert!(
+            c.line(true)
+                .starts_with("За 30 дн.: неожиданные выключения: 5")
+        );
+        assert!(
+            c.line(false)
+                .starts_with("Last 30 days: unexpected shutdowns: 5")
+        );
+        assert!(crate::incidents::COUNTING_RULE.contains("15 minutes"));
     }
 }

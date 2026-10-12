@@ -102,6 +102,32 @@ pub struct Verdict {
     pub confidence: Confidence,
     /// Human-readable evidence lines that produced the verdict.
     pub signals: Vec<String>,
+    /// v1.0.1: the dump analysis of this boot's BugCheck, when it names a
+    /// specific driver. It outranks the event-signal subsystem guess.
+    pub dump_cause: Option<DumpCause>,
+}
+
+/// v1.0.1: cause established by the crash-dump analysis of the same boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpCause {
+    pub dump: String,
+    pub bugcheck: String,
+    /// e.g. `RvNetMP60.sys`.
+    pub module: String,
+    /// Software owner and whether the installed file confirms it.
+    pub owner: Option<(String, bool)>,
+    /// `HIGH` / `MEDIUM` / `PARSER_INCOMPLETE` (never absolute).
+    pub confidence: String,
+}
+
+impl DumpCause {
+    pub fn label(&self) -> String {
+        match &self.owner {
+            Some((o, true)) => format!("{} / {o}", self.module),
+            Some((o, false)) => format!("{} / {o} (by module name)", self.module),
+            None => self.module.clone(),
+        }
+    }
 }
 
 impl Verdict {
@@ -119,13 +145,18 @@ impl Verdict {
             } else {
                 "BSOD NOT REGISTERED"
             },
-            match self.subsystem {
-                Some(s) => format!(
+            match (&self.dump_cause, self.subsystem) {
+                (Some(d), _) => format!(
+                    "PROBABLE DRIVER {} ({}, dump analysis)",
+                    d.label(),
+                    d.confidence
+                ),
+                (None, Some(s)) => format!(
                     "PROBABLE SUBSYSTEM {} ({})",
                     s.code(),
                     self.confidence.code()
                 ),
-                None => "CAUSE NOT DETERMINED".into(),
+                (None, None) => "CAUSE NOT DETERMINED".into(),
             }
         )
     }
@@ -316,6 +347,7 @@ pub fn classify(inc: &Incident, reports: &[LiveKernelReport], bugcheck_same_boot
         subsystem,
         confidence,
         signals: signals.into_iter().map(|(_, l)| l).collect(),
+        dump_cause: None,
     }
 }
 
@@ -394,6 +426,13 @@ pub fn parse_live_kernel_reports(v: Option<&json::Value>) -> Vec<LiveKernelRepor
 
 /// Evidence JSON (`Incidents_<stamp>.json`): every incident with its
 /// verdict, correlated events and the live kernel reports.
+/// v1.0.1: one sampling window and counting rule for EXPC stage 07, the
+/// crash inventory, Incidents.json and the crash Details.
+pub const WINDOW_DAYS: u32 = 30;
+pub const COUNTING_RULE: &str = "one unexpected shutdown = one boot: Kernel-Power 41 and EventLog 6008 logged within 15 minutes are one incident; BugCheck = WER 1001 or Kernel-Power 41 with a non-zero code, deduplicated within 15 minutes";
+/// Incidents with full event timelines (the count above is the total).
+pub const MAX_LISTED_INCIDENTS: usize = 5;
+
 pub fn to_json(
     incidents: &[(Incident, Verdict)],
     unexpected_shutdowns: usize,
@@ -412,6 +451,8 @@ pub fn to_json(
     o.push_str(&format!(
         "  \"unexpected_shutdowns\": {unexpected_shutdowns},\n"
     ));
+    o.push_str(&format!("  \"window_days\": {WINDOW_DAYS},\n"));
+    o.push_str(&format!("  \"counting_rule\": {},\n", q(COUNTING_RULE)));
     o.push_str(&format!("  \"incident_count\": {},\n", incidents.len()));
     o.push_str("  \"incidents\": [");
     for (n, (i, v)) in incidents.iter().enumerate() {
@@ -457,6 +498,24 @@ pub fn to_json(
         o.push_str(&format!(
             "      \"confidence\": {},\n",
             q(v.confidence.code())
+        ));
+        o.push_str(&format!(
+            "      \"dump_cause\": {},\n",
+            match &v.dump_cause {
+                None => "null".to_string(),
+                Some(d) => format!(
+                    "{{\"dump\": {}, \"bugcheck\": {}, \"module\": {}, \"software_owner\": {}, \"owner_confirmed\": {}, \"confidence\": {}}}",
+                    q(&d.dump),
+                    q(&d.bugcheck),
+                    q(&d.module),
+                    d.owner
+                        .as_ref()
+                        .map(|(o, _)| q(o))
+                        .unwrap_or_else(|| "null".into()),
+                    d.owner.as_ref().is_some_and(|(_, c)| *c),
+                    q(&d.confidence)
+                ),
+            }
         ));
         o.push_str(&format!(
             "      \"signals\": [{}],\n",

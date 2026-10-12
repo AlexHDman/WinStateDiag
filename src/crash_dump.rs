@@ -208,7 +208,8 @@ pub fn parse_wer_bugcheck(text: &str) -> Option<(u32, Vec<u64>)> {
 /// Read-only inventory collector (PowerShell). Prints one
 /// `WSD_CRASH <json>` line.
 pub const INVENTORY_PS1: &str = r#"$ErrorActionPreference = 'Continue'
-$since = (Get-Date).AddDays(-60)
+# v1.0.1: the same 30-day window as EXPC stage 07 (incidents::WINDOW_DAYS).
+$since = (Get-Date).AddDays(-30)
 $bc = @()
 try {
     $bc += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'; Id=1001; StartTime=$since } -ErrorAction Stop | ForEach-Object {
@@ -345,21 +346,46 @@ pub fn counts_line(inv: &Inventory) -> String {
 /// Verdict of every incident (BugCheck of the same boot = within 15 min).
 pub fn incident_verdicts(
     inv: &Inventory,
+    analyses: &[DumpAnalysis],
 ) -> Vec<(crate::incidents::Incident, crate::incidents::Verdict)> {
     inv.incidents
         .iter()
         .map(|i| {
-            let same_boot =
+            let boot_bugcheck =
                 inv.bugchecks
                     .iter()
-                    .any(|b| match (minutes(&b.time), minutes(&i.logged)) {
+                    .find(|b| match (minutes(&b.time), minutes(&i.logged)) {
                         (Some(a), Some(c)) => (a - c).abs() <= 15,
                         _ => false,
                     });
-            (
-                i.clone(),
-                crate::incidents::classify(i, &inv.live_kernel_reports, same_boot),
-            )
+            let mut v =
+                crate::incidents::classify(i, &inv.live_kernel_reports, boot_bugcheck.is_some());
+            // v1.0.1: the dump analysis of this boot's BugCheck names the
+            // driver — the verdict must not say "cause not determined".
+            v.dump_cause = boot_bugcheck.and_then(|b| {
+                analyses
+                    .iter()
+                    .find(|a| a.bugcheck.as_ref().is_some_and(|x| x.time == b.time))
+                    .and_then(|a| {
+                        let module = a.probable_module()?;
+                        Some(crate::incidents::DumpCause {
+                            dump: a.dump.name.clone(),
+                            bugcheck: format!(
+                                "0x{:08X}{}",
+                                a.bugcheck_code().unwrap_or(b.code),
+                                a.parsed
+                                    .bugcheck_name
+                                    .as_deref()
+                                    .map(|n| format!(" {n}"))
+                                    .unwrap_or_default()
+                            ),
+                            module,
+                            owner: a.software_owner(),
+                            confidence: a.confidence.code().to_string(),
+                        })
+                    })
+            });
+            (i.clone(), v)
         })
         .collect()
 }
@@ -620,50 +646,140 @@ pub struct ParsedAnalysis {
     pub image_name: Option<String>,
     pub process_name: Option<String>,
     pub probably_caused_by: Option<String>,
+    /// v1.0.1: `SYMBOL_NAME` (e.g. `RvNetMP60+2572`).
+    pub symbol_name: Option<String>,
     pub stack_text: Vec<String>,
     pub symbol_errors: Vec<String>,
 }
 
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.strip_prefix(key)
-        .and_then(|r| r.strip_prefix(':'))
+        .and_then(|r| r.trim_start_matches([' ', '\t']).strip_prefix(':'))
         .map(str::trim)
         .filter(|v| !v.is_empty())
 }
 
+/// Removes DML markup (`<link cmd="…">x</link>`, `<exec …>`) and ANSI
+/// colour sequences a debugger may emit, keeping the visible text.
+fn plain_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // ESC [ … letter
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if d.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            }
+            '<' => {
+                // Only well-formed DML tags are removed; a lone '<' stays.
+                let rest: String = chars.clone().take(8).collect();
+                let tag = rest.trim_start_matches('/');
+                if ["link", "exec", "b>", "i>", "u>", "col", "/col"]
+                    .iter()
+                    .any(|t| tag.starts_with(t))
+                {
+                    for d in chars.by_ref() {
+                        if d == '>' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Sets `slot` only when it is still empty: repeated keys (a second
+/// `!analyze` block, KEY_VALUES echoes) never overwrite the first value.
+fn first(slot: &mut Option<String>, v: &str) {
+    if slot.is_none() && !v.trim().is_empty() {
+        *slot = Some(v.trim().to_string());
+    }
+}
+
 pub fn parse_analyze_output(text: &str) -> ParsedAnalysis {
     let mut p = ParsedAnalysis::default();
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<String> = text.lines().map(plain_line).collect();
+    let mut kv_key: Option<String> = None;
     let mut i = 0;
     while i < lines.len() {
-        let line = lines[i].trim_end();
-        let t = line.trim();
+        let t = lines[i].trim();
+        // KEY_VALUES_STRING block: "Key  : Failure.Bucket" / "Value: …".
+        if let Some(k) = field(t, "Key") {
+            kv_key = Some(k.to_string());
+            i += 1;
+            continue;
+        }
+        if let (Some(k), Some(v)) = (kv_key.take(), field(t, "Value")) {
+            match k.as_str() {
+                "Failure.Bucket" => {
+                    if p.failure_bucket_id.is_none() {
+                        p.failure_bucket_id = Some(v.to_string());
+                    }
+                }
+                "Bugcheck.Code.LegacyAPI" | "Bugcheck.Code.TargetModel" => {
+                    if p.bugcheck_code.is_none() {
+                        p.bugcheck_code = u32::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
         if let Some(v) = field(t, "BUGCHECK_CODE") {
-            p.bugcheck_code = u32::from_str_radix(v.trim_start_matches("0x"), 16).ok();
-        } else if let Some(v) = field(t, "BUGCHECK_STR").filter(|_| p.bugcheck_name.is_none()) {
-            p.bugcheck_name = Some(v.to_string());
-        } else if let Some(n) = (1..=4).find(|n| t.starts_with(&format!("BUGCHECK_P{n}:"))) {
-            if let Some(v) = field(t, &format!("BUGCHECK_P{n}")) {
+            if p.bugcheck_code.is_none() {
+                p.bugcheck_code = u32::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+            }
+        } else if let Some(v) = field(t, "BUGCHECK_STR") {
+            first(&mut p.bugcheck_name, v);
+        } else if let Some(n) = (1..=4).find(|n| t.starts_with(&format!("BUGCHECK_P{n}"))) {
+            if let Some(v) = field(t, &format!("BUGCHECK_P{n}"))
+                && p.bugcheck_parameters.len() < 4
+            {
                 p.bugcheck_parameters.push(v.to_string());
             }
         } else if let Some(v) = field(t, "FAILURE_BUCKET_ID") {
+            // The explicit field wins over the KEY_VALUES echo.
             p.failure_bucket_id = Some(v.to_string());
         } else if let Some(v) = field(t, "MODULE_NAME") {
-            p.module_name = Some(v.to_string());
+            first(&mut p.module_name, v);
         } else if let Some(v) = field(t, "IMAGE_NAME") {
-            p.image_name = Some(v.to_string());
+            first(&mut p.image_name, v);
         } else if let Some(v) = field(t, "PROCESS_NAME") {
-            p.process_name = Some(v.to_string());
+            first(&mut p.process_name, v);
+        } else if let Some(v) = field(t, "SYMBOL_NAME") {
+            first(&mut p.symbol_name, v);
         } else if let Some(v) = t.strip_prefix("Probably caused by") {
-            let v = v.trim_start_matches([' ', ':']).trim();
+            let v = v.trim_start_matches([' ', ':', '\t']).trim();
             let module = v.split_whitespace().next().unwrap_or("").to_string();
             if !module.is_empty() {
-                p.probably_caused_by = Some(module);
+                first(&mut p.probably_caused_by, &module);
             }
-        } else if t == "STACK_TEXT:" {
+        } else if t.starts_with("STACK_TEXT") && t.trim_end().ends_with(':') {
             i += 1;
-            while i < lines.len() && !lines[i].trim().is_empty() && p.stack_text.len() < 40 {
-                p.stack_text.push(lines[i].trim().to_string());
+            // Tolerate one blank line right after the header.
+            if i < lines.len() && lines[i].trim().is_empty() {
+                i += 1;
+            }
+            let fresh = p.stack_text.is_empty();
+            while i < lines.len() && !lines[i].trim().is_empty() {
+                if fresh && p.stack_text.len() < 40 {
+                    p.stack_text.push(lines[i].trim().to_string());
+                }
                 i += 1;
             }
             continue;
@@ -684,6 +800,57 @@ pub fn parse_analyze_output(text: &str) -> ParsedAnalysis {
         i += 1;
     }
     p
+}
+
+/// v1.0.1 PARSER_INCOMPLETE guard: a specific (non-core) module that the
+/// RAW debugger text names in its verdict fields (`MODULE_NAME`,
+/// `IMAGE_NAME`, `SYMBOL_NAME`, `Probably caused by`, the failure bucket's
+/// `!module` part). Used only when the structured parse lost it.
+pub fn raw_module_candidate(raw: &str) -> Option<String> {
+    for line in raw.lines().map(plain_line) {
+        let t = line.trim();
+        for key in ["MODULE_NAME", "IMAGE_NAME", "SYMBOL_NAME"] {
+            if let Some(i) = t.find(key) {
+                let rest = t[i + key.len()..].trim_start_matches([' ', '\t', ':']);
+                let m = module_stem(rest);
+                if !m.is_empty() && !is_generic_module(&m) {
+                    return Some(m);
+                }
+            }
+        }
+        if let Some(i) = t.find("Probably caused by") {
+            let rest = t[i + 18..].trim_start_matches([' ', '\t', ':']);
+            let m = module_stem(rest);
+            if !m.is_empty() && !is_generic_module(&m) {
+                return Some(m);
+            }
+        }
+        if (t.contains("FAILURE_BUCKET_ID")
+            || t.contains("Failure.Bucket")
+            || t.starts_with("Value:"))
+            && let Some(m) = bucket_module(t)
+        {
+            return Some(m);
+        }
+    }
+    // Last resort: a non-core `Module+0x…` stack frame.
+    raw.lines().map(plain_line).find_map(|l| {
+        let frame = l.rsplit(" : ").next()?.trim().to_string();
+        let (name, off) = frame.split_once('+')?;
+        (off.starts_with("0x") && !name.contains('!'))
+            .then(|| module_stem(name))
+            .filter(|m| !m.is_empty() && !is_generic_module(m))
+    })
+}
+
+/// `0x139_3_CORRUPT_LIST_ENTRY_RvNetMP60!unknown_function` → `rvnetmp60`.
+fn bucket_module(text: &str) -> Option<String> {
+    let bang = text.find('!')?;
+    let head = &text[..bang];
+    let token = head.rsplit(['_', ' ', ':', '\t']).next().unwrap_or("");
+    let m = module_stem(token);
+    (!m.is_empty() && !is_generic_module(&m) && !m.chars().all(|c| c.is_ascii_hexdigit()))
+        .then_some(m)
 }
 
 /// `DRIVER_POWER_STATE_FAILURE (9f)` banner line.
@@ -710,11 +877,22 @@ impl ParsedAnalysis {
             l.contains("kernel symbols are wrong")
                 || l.contains("symbols can not be loaded because symbol path is not initialized")
                 || l.contains("ntoskrnl")
+                || l.contains("ntkrnlmp")
                 || l.contains("nt!")
+        });
+        // v1.0.1: a third-party driver without public symbols is the
+        // normal case ("symbols could not be loaded for RvNetMP60.sys"); it
+        // does not make the kernel analysis unreliable.
+        let implicated = self.implicated_module();
+        let other = self.symbol_errors.iter().any(|e| {
+            let l = e.to_ascii_lowercase();
+            !implicated
+                .as_deref()
+                .is_some_and(|m| !is_generic_module(m) && l.contains(m))
         });
         if kernel {
             SymbolStatus::Failed
-        } else if self.symbol_errors.is_empty() {
+        } else if !other {
             SymbolStatus::Ok
         } else {
             SymbolStatus::Partial
@@ -727,9 +905,11 @@ impl ParsedAnalysis {
         self.module_name
             .as_deref()
             .or(self.image_name.as_deref())
+            .or(self.symbol_name.as_deref())
             .or(self.probably_caused_by.as_deref())
             .map(module_stem)
             .filter(|m| !m.is_empty())
+            .or_else(|| self.failure_bucket_id.as_deref().and_then(bucket_module))
     }
 
     pub fn memory_corruption(&self) -> bool {
@@ -869,6 +1049,9 @@ pub fn correlate(module: &str, report: Option<&AuditReport>) -> Vec<LinkedEviden
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
     NotDetermined,
+    /// v1.0.1: the raw debugger text names a specific module but the
+    /// structured parse lost it — never reported as "cause not determined".
+    ParserIncomplete,
     Low,
     Medium,
     High,
@@ -878,6 +1061,7 @@ impl Confidence {
     pub fn code(self) -> &'static str {
         match self {
             Confidence::NotDetermined => "CAUSE NOT DETERMINED",
+            Confidence::ParserIncomplete => "PARSER_INCOMPLETE",
             Confidence::Low => "LOW",
             Confidence::Medium => "MEDIUM",
             Confidence::High => "HIGH",
@@ -960,7 +1144,13 @@ impl DumpAnalysis {
             .implicated_module()
             .map(|m| correlate(&m, report))
             .unwrap_or_default();
-        let conf = confidence(&status, &parsed, &linked);
+        let mut conf = confidence(&status, &parsed, &linked);
+        if conf == Confidence::NotDetermined
+            && status == AnalysisStatus::Completed
+            && raw_module_candidate(&raw_output).is_some()
+        {
+            conf = Confidence::ParserIncomplete;
+        }
         let code = parsed.bugcheck_code.or(bugcheck.as_ref().map(|b| b.code));
         let memory =
             status == AnalysisStatus::Completed && recommend_memory_test(code, &parsed, conf);
@@ -1016,9 +1206,63 @@ impl DumpAnalysis {
                 .image_name
                 .clone()
                 .or(self.parsed.module_name.clone())
-                .or(self.parsed.probably_caused_by.clone()),
+                .or(self
+                    .parsed
+                    .symbol_name
+                    .as_deref()
+                    .map(|s| format!("{}.sys", module_stem(s))))
+                .or(self.parsed.probably_caused_by.clone())
+                .or_else(|| self.parsed.implicated_module().map(|m| format!("{m}.sys"))),
+            // The raw text names it although the parse lost it: shown,
+            // explicitly labelled PARSER_INCOMPLETE by the caller.
+            Confidence::ParserIncomplete => raw_module_candidate(&self.raw_output),
             _ => None,
         }
+    }
+
+    /// v1.0.1: stack frames that belong to the implicated module (the
+    /// evidence that the module was executing at the failure).
+    pub fn module_frames(&self) -> Vec<String> {
+        let Some(m) = self.parsed.implicated_module() else {
+            return Vec::new();
+        };
+        self.parsed
+            .stack_text
+            .iter()
+            .filter_map(|l| l.rsplit(" : ").next())
+            .filter(|f| module_stem(f) == m)
+            .map(|f| f.trim().to_string())
+            .collect()
+    }
+
+    /// v1.0.1: the software component that owns the implicated driver.
+    /// `(name, confirmed)`: confirmed = the installed file's own version
+    /// resource / signer says so; otherwise a known module-name mapping
+    /// (shown as "by module name", never as fact).
+    pub fn software_owner(&self) -> Option<(String, bool)> {
+        let m = self.third_party_module()?;
+        if let Some(r) = self.resolution.as_ref().filter(|r| r.present) {
+            let text = format!("{} {} {}", r.product, r.company, r.signer).to_ascii_lowercase();
+            if let Some(known) = known_owner(&m)
+                && known.1.iter().any(|k| text.contains(k))
+            {
+                return Some((known.0.to_string(), true));
+            }
+            if !r.product.is_empty() && !r.product.starts_with("(QA") {
+                return Some((r.product.clone(), true));
+            }
+        }
+        known_owner(&m).map(|(n, _)| (n.to_string(), false))
+    }
+}
+
+/// Module-name → software owner, used only as a labelled hint; the keys
+/// are what the installed file's version resource / signer must contain to
+/// CONFIRM it.
+fn known_owner(stem: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match stem {
+        "rvnetmp60" | "rvnetmp" => Some(("Radmin VPN", &["radmin", "famatech"])),
+        _ => None,
     }
 }
 
@@ -1089,7 +1333,7 @@ pub fn summary_json(a: &DumpAnalysis, copied_dump: Option<&str>, analysis_file: 
         }
     };
     format!(
-        "{{\n  \"format\": \"winstatediag.crash_dump/1\",\n  \"dump_file\": {},\n  \"dump_kind\": {},\n  \"dump_size\": {},\n  \"dump_timestamp\": {},\n  \"dump_copy_in_report\": {},\n  \"raw_analysis_file\": {},\n  \"bugcheck_event_time\": {},\n  \"bugcheck_code\": {},\n  \"bugcheck_name\": {},\n  \"bugcheck_parameters\": {},\n  \"FAILURE_BUCKET_ID\": {},\n  \"MODULE_NAME\": {},\n  \"IMAGE_NAME\": {},\n  \"PROCESS_NAME\": {},\n  \"STACK_TEXT\": {},\n  \"probable_module\": {},\n  \"symbol_status\": {},\n  \"analysis_status\": {},\n  \"analysis_detail\": {},\n  \"confidence\": {},\n  \"memory_test_recommended\": {},\n  \"linked_driver_evidence\": {},\n  \"linked_event_evidence\": {},\n  \"module_metadata\": {},\n  \"driver_resolution\": {},\n  \"note\": {}\n}}\n",
+        "{{\n  \"format\": \"winstatediag.crash_dump/1\",\n  \"dump_file\": {},\n  \"dump_kind\": {},\n  \"dump_size\": {},\n  \"dump_timestamp\": {},\n  \"dump_copy_in_report\": {},\n  \"raw_analysis_file\": {},\n  \"bugcheck_event_time\": {},\n  \"bugcheck_code\": {},\n  \"bugcheck_name\": {},\n  \"bugcheck_parameters\": {},\n  \"FAILURE_BUCKET_ID\": {},\n  \"MODULE_NAME\": {},\n  \"IMAGE_NAME\": {},\n  \"PROCESS_NAME\": {},\n  \"SYMBOL_NAME\": {},\n  \"STACK_TEXT\": {},\n  \"module_stack_frames\": {},\n  \"probable_module\": {},\n  \"software_owner\": {},\n  \"software_owner_confirmed\": {},\n  \"symbol_status\": {},\n  \"analysis_status\": {},\n  \"analysis_detail\": {},\n  \"confidence\": {},\n  \"memory_test_recommended\": {},\n  \"linked_driver_evidence\": {},\n  \"linked_event_evidence\": {},\n  \"module_metadata\": {},\n  \"driver_resolution\": {},\n  \"note\": {}\n}}\n",
         json::string(&a.dump.name),
         json::string(match a.dump.kind {
             DumpKind::Mini => "minidump",
@@ -1107,8 +1351,17 @@ pub fn summary_json(a: &DumpAnalysis, copied_dump: Option<&str>, analysis_file: 
         opt(a.parsed.module_name.as_deref()),
         opt(a.parsed.image_name.as_deref()),
         opt(a.parsed.process_name.as_deref()),
+        opt(a.parsed.symbol_name.as_deref()),
         list(&stack),
+        list(
+            &a.module_frames()
+                .iter()
+                .map(|f| json::string(f))
+                .collect::<Vec<_>>()
+        ),
         opt(a.probable_module().as_deref()),
+        opt(a.software_owner().map(|(o, _)| o).as_deref()),
+        a.software_owner().is_some_and(|(_, c)| c),
         json::string(if a.status == AnalysisStatus::Completed {
             a.parsed.symbol_status().code()
         } else {
@@ -2563,5 +2816,202 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
             lmvm_args("a.dmp", "srv*c", "rvnetmp60")[5],
             "lmvm rvnetmp60; q"
         );
+    }
+
+    // ---- v1.0.1 Phase 01: crash analyzer correctness ------------------
+
+    /// Modern WinDbg (cdbX64) `!analyze -v` as GALINA-HOME produced it
+    /// (sanitized: machine identity removed): KEY_VALUES block, trailing
+    /// spaces, tabs, a symbol warning for the third-party driver, DML
+    /// link markup and a SECOND analyze echo with other values.
+    const MODERN_0X139: &str = "\
+*******************************************************************************\n\
+*                        Bugcheck Analysis                                    *\n\
+*******************************************************************************\n\
+\n\
+KERNEL_SECURITY_CHECK_FAILURE (139)\n\
+A kernel component has corrupted a critical data structure.\n\
+Arguments:\n\
+Arg1: 0000000000000003, A LIST_ENTRY has been corrupted (i.e. double remove).\n\
+\n\
+*** ERROR: Module load completed but symbols could not be loaded for RvNetMP60.sys\n\
+\n\
+KEY_VALUES_STRING: 1\n\
+\n\
+    Key  : Analysis.CPU.mSec\n\
+    Value: 1406\n\
+\n\
+    Key  : Failure.Bucket\n\
+    Value: 0x139_3_CORRUPT_LIST_ENTRY_RvNetMP60!unknown_function\n\
+\n\
+BUGCHECK_CODE:  139\n\
+\n\
+BUGCHECK_P1: 3\n\
+\n\
+BUGCHECK_P2: ffffd30c7a5e6f10\n\
+\n\
+PROCESS_NAME:  RvControlSvc.e\n\
+\n\
+STACK_TEXT:  \n\
+ffffd30c`7a5e6c08 fffff806`2a1c4ea9     : 00000000`00000139 00000000`00000003 : nt!KeBugCheckEx\n\
+ffffd30c`7a5e6c10 fffff806`2a1c53b2     : 00000000`00000000 00000000`00000000 : nt!KiBugCheckDispatch+0x69\n\
+ffffd30c`7a5e6f30 fffff806`4c7f2572     : ffffb808`11d2a1a0 ffffb808`0f4c2000 : nt!KiRaiseSecurityCheckFailure+0x33d\n\
+ffffd30c`7a5e70c8 fffff806`4c7f2f11     : 00000000`00000000 00000000`00000000 : RvNetMP60+0x2572\n\
+ffffd30c`7a5e70d0 fffff806`4c7f0b12     : 00000000`00000000 00000000`00000000 : RvNetMP60+0x2f11\n\
+\n\
+\tSYMBOL_NAME:  RvNetMP60+2572 \n\
+\n\
+MODULE_NAME: <link cmd=\"lmDvmRvNetMP60\">RvNetMP60</link>\n\
+\n\
+IMAGE_NAME:  RvNetMP60.sys\n\
+\n\
+FAILURE_BUCKET_ID:  0x139_3_CORRUPT_LIST_ENTRY_RvNetMP60!unknown_function\n\
+\n\
+Followup:     MachineOwner\n\
+---------\n\
+\n\
+MODULE_NAME: nt\n\
+IMAGE_NAME:  ntkrnlmp.exe\n";
+
+    fn modern() -> DumpAnalysis {
+        DumpAnalysis::build(
+            case_dump(),
+            None,
+            AnalysisStatus::Completed,
+            MODERN_0X139.to_string(),
+            None,
+        )
+    }
+
+    #[test]
+    fn modern_windbg_output_keeps_every_field_and_names_the_driver() {
+        let a = modern();
+        let p = &a.parsed;
+        assert_eq!(p.bugcheck_code, Some(0x139));
+        assert_eq!(p.bugcheck_parameters.first().map(String::as_str), Some("3"));
+        assert_eq!(
+            p.module_name.as_deref(),
+            Some("RvNetMP60"),
+            "DML stripped, first value kept"
+        );
+        assert_eq!(
+            p.image_name.as_deref(),
+            Some("RvNetMP60.sys"),
+            "repeated key never overrides"
+        );
+        assert_eq!(
+            p.symbol_name.as_deref(),
+            Some("RvNetMP60+2572"),
+            "tab-indented key"
+        );
+        assert_eq!(
+            p.process_name.as_deref(),
+            Some("RvControlSvc.e"),
+            "Windows' 14-char image name kept as is"
+        );
+        assert_eq!(
+            p.failure_bucket_id.as_deref(),
+            Some("0x139_3_CORRUPT_LIST_ENTRY_RvNetMP60!unknown_function")
+        );
+        assert_eq!(p.stack_text.len(), 5, "STACK_TEXT with trailing spaces");
+        assert_eq!(a.module_frames(), ["RvNetMP60+0x2572", "RvNetMP60+0x2f11"]);
+        // A missing-symbols line for the third-party driver itself is normal.
+        assert_eq!(p.symbol_status(), SymbolStatus::Ok);
+        assert_eq!(a.confidence, Confidence::Medium, "reasoned, not absolute");
+        assert_eq!(a.probable_module().as_deref(), Some("RvNetMP60.sys"));
+        assert_eq!(a.third_party_module().as_deref(), Some("rvnetmp60"));
+        assert!(!a.memory_test_recommended || p.implicated_module().is_none());
+        // The raw debugger text is preserved verbatim for the evidence.
+        assert_eq!(a.raw_output, MODERN_0X139);
+        // Owner by module name only (no installed-file confirmation here).
+        assert_eq!(a.software_owner(), Some(("Radmin VPN".to_string(), false)));
+    }
+
+    #[test]
+    fn key_values_bucket_alone_still_implicates_the_driver() {
+        let only_kv = "BUGCHECK_CODE:  139\n    Key  : Failure.Bucket\n    Value: 0x139_3_CORRUPT_LIST_ENTRY_RvNetMP60!unknown_function\n";
+        let a = DumpAnalysis::build(
+            case_dump(),
+            None,
+            AnalysisStatus::Completed,
+            only_kv.into(),
+            None,
+        );
+        assert_eq!(a.parsed.implicated_module().as_deref(), Some("rvnetmp60"));
+        assert_eq!(a.confidence, Confidence::Medium);
+        assert_eq!(a.probable_module().as_deref(), Some("rvnetmp60.sys"));
+    }
+
+    #[test]
+    fn raw_module_without_structured_fields_is_parser_incomplete_not_undetermined() {
+        // The verdict fields are missing (truncated capture) but the stack
+        // still names the driver.
+        let raw = "BUGCHECK_CODE:  139\nSome header\nffffd30c`7a5e70c8 fffff806`4c7f2f11 : 00000000`00000000 : nt!KiBugCheckDispatch+0x69\nffffd30c`7a5e70c8 fffff806`4c7f2f11 : 00000000`00000000 : RvNetMP60+0x2572\n";
+        let a = DumpAnalysis::build(
+            case_dump(),
+            None,
+            AnalysisStatus::Completed,
+            raw.into(),
+            None,
+        );
+        assert_eq!(a.parsed.implicated_module(), None);
+        assert_eq!(a.confidence, Confidence::ParserIncomplete);
+        assert_eq!(a.confidence.code(), "PARSER_INCOMPLETE");
+        assert_eq!(a.probable_module().as_deref(), Some("rvnetmp60"));
+        // ntoskrnl-only output stays "not determined" / LOW, never blamed.
+        let nt = "BUGCHECK_CODE:  139\nSTACK_TEXT:\nx : nt!KeBugCheckEx\nx : nt!KiBugCheckDispatch+0x69\n\nMODULE_NAME: nt\nIMAGE_NAME:  ntkrnlmp.exe\n";
+        let b = DumpAnalysis::build(
+            case_dump(),
+            None,
+            AnalysisStatus::Completed,
+            nt.into(),
+            None,
+        );
+        assert_eq!(b.confidence, Confidence::Low);
+        assert_eq!(b.probable_module(), None);
+    }
+
+    #[test]
+    fn incident_verdict_uses_the_dump_analysis_of_the_same_boot() {
+        let a = DumpAnalysis::build(
+            case_dump(),
+            Some(BugcheckEvent {
+                time: "2026-10-03T00:36:10".into(),
+                source: BugcheckSource::Wer1001,
+                code: 0x139,
+                params: vec![3],
+                dump_path: None,
+            }),
+            AnalysisStatus::Completed,
+            MODERN_0X139.to_string(),
+            None,
+        );
+        let inc = crate::incidents::Incident {
+            logged: "2026-10-03T00:36:40".into(),
+            boot: "2026-10-03T00:36:05".into(),
+            last_activity: "2026-10-03T00:34:00".into(),
+            sources: vec!["KP41".into(), "EL6008".into()],
+            bugcheck_code: 0x139,
+            events: Vec::new(),
+        };
+        let inv = Inventory {
+            bugchecks: vec![a.bugcheck.clone().unwrap()],
+            dumps: vec![case_dump()],
+            debugger: DebuggerStatus::NotInstalled,
+            notes: Vec::new(),
+            unexpected_shutdowns: 5,
+            incidents: vec![inc],
+            live_kernel_reports: Vec::new(),
+        };
+        let without = incident_verdicts(&inv, &[]);
+        assert!(without[0].1.headline().contains("CAUSE NOT DETERMINED"));
+        let with = incident_verdicts(&inv, std::slice::from_ref(&a));
+        let v = &with[0].1;
+        assert!(v.headline().contains("PROBABLE DRIVER RvNetMP60.sys / Radmin VPN (by module name) (MEDIUM, dump analysis)"), "{}", v.headline());
+        let json = crate::incidents::to_json(&with, inv.unexpected_shutdowns, &[]);
+        assert!(json.contains("\"module\": \"RvNetMP60.sys\""), "{json}");
+        assert!(json.contains("\"window_days\": 30"), "{json}");
+        assert!(json.contains("\"counting_rule\""), "{json}");
+        assert!(json.contains("\"unexpected_shutdowns\": 5"), "{json}");
     }
 }

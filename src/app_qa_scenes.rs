@@ -501,17 +501,17 @@ BUGCHECK_CODE:  139
 
 BUGCHECK_P1: 3
 
-PROCESS_NAME:  RvControlSvc.exe
+PROCESS_NAME:  RvControlSvc.e
 
 STACK_TEXT:
 ffffd30c`7a5e6c08 fffff806`2a1c4ea9     : 00000000`00000139 00000000`00000003 : nt!KeBugCheckEx
 ffffd30c`7a5e6c10 fffff806`2a1c53b2     : 00000000`00000000 00000000`00000000 : nt!KiBugCheckDispatch+0x69
 ffffd30c`7a5e6d50 fffff806`2a1c2f3d     : ffffb808`11d2a1a0 00000000`00000000 : nt!KiFastFailDispatch+0xb2
 ffffd30c`7a5e6f30 fffff806`4c7f1a2e     : ffffb808`11d2a1a0 ffffb808`0f4c2000 : nt!KiRaiseSecurityCheckFailure+0x33d
-ffffd30c`7a5e70c8 fffff806`4c7f2f11     : 00000000`00000000 00000000`00000000 : RvNetMP60+0x1a2e
+ffffd30c`7a5e70c8 fffff806`4c7f2f11     : 00000000`00000000 00000000`00000000 : RvNetMP60+0x2572
 ffffd30c`7a5e70d0 fffff806`4c7f0b12     : 00000000`00000000 00000000`00000000 : RvNetMP60+0x2f11
 
-SYMBOL_NAME:  RvNetMP60+1a2e
+SYMBOL_NAME:  RvNetMP60+2572
 
 MODULE_NAME: RvNetMP60
 
@@ -550,16 +550,16 @@ fn qa_analysis() -> crash_dump::DumpAnalysis {
             present: true,
             file: "C:\\Windows\\System32\\drivers\\RvNetMP60.sys".into(),
             file_version: "6.0.0.12".into(),
-            company: "(QA fixture) network VPN driver vendor".into(),
-            product: "Virtual network adapter".into(),
+            company: "Famatech Corp.".into(),
+            product: "Radmin VPN".into(),
             signature_status: "Valid".into(),
-            signer: "CN=(QA fixture) vendor".into(),
+            signer: "CN=Famatech Corp.".into(),
             service_name: "RvNetMP60".into(),
             service_display: "Virtual network miniport".into(),
             service_state: "Running".into(),
             start_mode: "Manual".into(),
             inf: "oem42.inf".into(),
-            provider: "(QA fixture)".into(),
+            provider: "Famatech".into(),
             devices: vec![crash_dump::ResolvedDevice {
                 name: "Virtual Network Adapter".into(),
                 status: "OK".into(),
@@ -620,9 +620,37 @@ mod case_0x139_regression {
         let inv = qa_inventory();
         let r = crate::crash_report::build(&inv, std::slice::from_ref(&a), true);
         assert_eq!(r.level, crate::crash_report::Level::Problem);
-        assert!(r.cause[0].contains("RvNetMP60.sys"), "{:?}", r.cause);
-        assert!(r.cause[0].contains("служба RvNetMP60"), "{:?}", r.cause);
-        assert!(r.checks[0].contains("RvNetMP60.sys"), "{:?}", r.checks);
+        assert!(
+            r.cause[0].contains("RvNetMP60.sys / Radmin VPN"),
+            "{:?}",
+            r.cause
+        );
+        assert!(r.cause[0].contains("MEDIUM"), "{:?}", r.cause);
+        assert!(
+            r.cause.iter().any(|c| c.contains("Служба RvNetMP60")),
+            "{:?}",
+            r.cause
+        );
+        assert!(
+            r.why.iter().any(|w| w == "SYMBOL_NAME: RvNetMP60+2572"),
+            "{:?}",
+            r.why
+        );
+        assert!(
+            r.why.iter().any(|w| w == "PROCESS_NAME: RvControlSvc.e"),
+            "{:?}",
+            r.why
+        );
+        assert!(
+            r.why.iter().any(|w| w.contains("исторический")),
+            "{:?}",
+            r.why
+        );
+        assert!(
+            r.checks[0].contains("RvNetMP60.sys (Radmin VPN)"),
+            "{:?}",
+            r.checks
+        );
         assert_eq!(r.incidents.len(), 1);
         assert_eq!(r.incidents[0].code, "0x00000139");
         assert_eq!(r.incidents[0].dump, "100326-9500-01.dmp");

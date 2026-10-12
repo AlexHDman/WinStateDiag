@@ -5836,7 +5836,7 @@ impl WinStateDiagApp {
         let Some(Ok(inv)) = &self.crash.inventory else {
             return;
         };
-        let verdicts = crash_dump::incident_verdicts(inv);
+        let verdicts = crash_dump::incident_verdicts(inv, &self.crash.analyses);
         let json = incidents::to_json(
             &verdicts,
             inv.unexpected_shutdowns.max(inv.incidents.len()),
@@ -5914,6 +5914,9 @@ impl WinStateDiagApp {
         self.crash.analyses = analyses;
         if !files.is_empty() {
             self.contribute_evidence(d.module_crash, files);
+            // v1.0.1: Incidents.json is re-issued with the dump cause of
+            // the same boot (it was written before the analysis existed).
+            self.contribute_incidents();
         }
     }
 
@@ -6464,7 +6467,7 @@ impl WinStateDiagApp {
             }
         }
         if let Some(Ok(inv)) = &self.crash.inventory
-            && let Some((_, v)) = crash_dump::incident_verdicts(inv).first()
+            && let Some((_, v)) = crash_dump::incident_verdicts(inv, &self.crash.analyses).first()
         {
             rows.push(InfoRow::new(
                 d.crash_row_incident,
@@ -6991,7 +6994,7 @@ impl WinStateDiagApp {
             _ => None,
         };
         let hang = inv.is_some_and(|inv| {
-            crash_dump::incident_verdicts(inv)
+            crash_dump::incident_verdicts(inv, &self.crash.analyses)
                 .iter()
                 .any(|(_, v)| v.hang_confirmed)
         });
@@ -7371,7 +7374,7 @@ impl WinStateDiagApp {
                         if let Some(Ok(inv)) = &self.crash.inventory {
                             // v0.4.5 freeze / hang incident timelines.
                             details::section_title(ui, d.crash_incidents_title);
-                            let verdicts = crash_dump::incident_verdicts(inv);
+                            let verdicts = crash_dump::incident_verdicts(inv, &self.crash.analyses);
                             if verdicts.is_empty() {
                                 ui.label(RichText::new(d.crash_incident_none).color(c::TEXT_MUTED));
                             }
@@ -7530,7 +7533,7 @@ impl WinStateDiagApp {
                     b.source
                 ));
             }
-            for (inc, v) in crash_dump::incident_verdicts(inv) {
+            for (inc, v) in crash_dump::incident_verdicts(inv, &self.crash.analyses) {
                 o.push_str(&format!(
                     "{} · {}\r\n",
                     crash_dump::incident_line(&inc),
@@ -11419,8 +11422,9 @@ mod v041_tests {
         app.crash.inventory = Some(Ok(inv));
         let ev = app.stage_evidence_lines(6);
         assert!(
-            ev.iter()
-                .any(|l| l.starts_with("Unexpected shutdowns: 1 · BugCheck / BSOD: 0 · Dumps: 0")),
+            ev.iter().any(|l| l.starts_with(
+                "Last 30 days: unexpected shutdowns: 1 · BugCheck / BSOD: 0 · Dumps (all files): 0"
+            )),
             "{ev:?}"
         );
         assert!(

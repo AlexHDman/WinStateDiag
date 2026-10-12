@@ -2427,7 +2427,14 @@ $continue = Invoke-Step -Number 7 -Title 'Неожиданные выключе�
         }
     }
 
-    $incidentTimes = @($incidentTimes | Sort-Object -Unique)
+    # v1.0.1: one incident per boot — events within 15 minutes of the
+    # previous counted one are the same shutdown (same rule as the crash
+    # inventory / Incidents.json / crash Details).
+    $clustered = @()
+    foreach ($t in @($incidentTimes | Sort-Object)) {
+        if ($clustered.Count -eq 0 -or ($t - $clustered[-1]).TotalMinutes -gt 15.0) { $clustered += $t }
+    }
+    $incidentTimes = $clustered
     $incidentCount = $incidentTimes.Count
     $lastIncident = $null
 
@@ -2435,17 +2442,31 @@ $continue = Invoke-Step -Number 7 -Title 'Неожиданные выключе�
         $lastIncident = $incidentTimes | Sort-Object -Descending | Select-Object -First 1
     }
 
+    # v1.0.1 BugCheck = WER 1001, plus Kernel-Power 41 with a non-zero
+    # BugcheckCode that has no WER 1001 within 15 minutes (deduplicated).
+    $kpCoded = @($kp41 | Where-Object { [int64]('0' + [string](@($_.Properties)[0].Value)) -ne 0 })
+    foreach ($k in $kpCoded) {
+        $dup = $false
+        foreach ($b in $bugchecks) { if ([Math]::Abs(($b.TimeCreated - $k.TimeCreated).TotalMinutes) -le 15.0) { $dup = $true; break } }
+        if (-not $dup) { $bugchecks += $k }
+    }
+    # All dump files present (not windowed): minidumps + MEMORY.DMP.
+    $allDumps = @(Get-ChildItem (Join-Path $env:SystemRoot 'Minidump\*.dmp') -ErrorAction SilentlyContinue)
+    $memoryDmp = Join-Path $env:SystemRoot 'MEMORY.DMP'
+    if (Test-Path -LiteralPath $memoryDmp) { $allDumps += Get-Item -LiteralPath $memoryDmp -ErrorAction SilentlyContinue }
+    $dumpCount = $allDumps.Count
     $dumps = @(
-        Get-ChildItem (Join-Path $env:SystemRoot 'Minidump\*.dmp') -ErrorAction SilentlyContinue |
+        $allDumps |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 10 Name, Length, LastWriteTime
     )
+    Write-Log 'Правило подсчёта: 30 дней; одно выключение = одна загрузка (Kernel-Power 41 и EventLog 6008 в пределах 15 минут); BugCheck = WER 1001 или Kernel-Power 41 с кодом, без повторов в пределах 15 минут; дампы = все файлы (не по окну).'
 
     Write-Log ("Kernel-Power 41 events        : {0}" -f $kp41.Count)
     Write-Log ("EventLog 6008 events          : {0}" -f $ev6008.Count)
     Write-Log ("Unexpected shutdown incidents : {0}" -f $incidentCount)
     Write-Log ("Confirmed BugCheck events     : {0}" -f $bugchecks.Count)
-    Write-Log ("Minidump files                : {0}" -f $dumps.Count)
+    Write-Log ("Dump files (minidump + MEMORY.DMP): {0}" -f $dumpCount)
 
     if ($null -ne $lastIncident) {
         Write-Log ("Last unexpected shutdown      : {0:yyyy-MM-dd HH:mm:ss}" -f $lastIncident)
@@ -2470,8 +2491,8 @@ $continue = Invoke-Step -Number 7 -Title 'Неожиданные выключе�
         Write-Log 'Minidump-файлы не найдены.'
     }
 
-    if ($bugchecks.Count -gt 0 -or $dumps.Count -gt 0) {
-        $msg = "Подтверждённые признаки BSOD: BugCheck={0}, minidump={1}; неожиданных выключений={2}." -f $bugchecks.Count, $dumps.Count, $incidentCount
+    if ($bugchecks.Count -gt 0 -or $dumpCount -gt 0) {
+        $msg = "За 30 дней: неожиданных выключений={2}, BugCheck={0}; файлов дампов={1}." -f $bugchecks.Count, $dumpCount, $incidentCount
         Add-Attention $msg
         Set-CheckStatus -Key 'Stability / BSOD' -Status 'ATTENTION' -Detail $msg
     } elseif ($incidentCount -gt 0) {
@@ -2481,7 +2502,7 @@ $continue = Invoke-Step -Number 7 -Title 'Неожиданные выключе�
         Set-CheckStatus -Key 'Stability / BSOD' -Status 'ATTENTION' -Detail $msg
     } else {
         Write-Log 'За 30 дней неожиданных выключений / подтверждённых BugCheck не обнаружено.'
-        Set-CheckStatus -Key 'Stability / BSOD' -Status 'OK' -Detail 'Unexpected shutdown incidents=0; BugCheck=0; minidump=0.'
+        Set-CheckStatus -Key 'Stability / BSOD' -Status 'OK' -Detail ('Unexpected shutdown incidents=0; BugCheck=0; dump files={0}.' -f $dumpCount)
     }
 }
 if (-not $continue) { break Diagnostics }

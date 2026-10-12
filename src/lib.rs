@@ -362,7 +362,7 @@ fn incident_probe(out: Option<PathBuf>) -> i32 {
     }
     let code = match crash_dump::collect_inventory("powershell.exe") {
         Ok(inv) => {
-            let verdicts = crash_dump::incident_verdicts(&inv);
+            let verdicts = crash_dump::incident_verdicts(&inv, &[]);
             summary.push_str(&format!("COUNTS={}\r\n", crash_dump::counts_line(&inv)));
             for b in &inv.bugchecks {
                 summary.push_str(&format!("BUGCHECK=0x{:08X} {}\r\n", b.code, b.time));
