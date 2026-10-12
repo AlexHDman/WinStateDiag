@@ -233,24 +233,37 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
         actions.push(Action::ShowExpcDetails);
     }
     let x0 = rect.left() + 16.0;
-    let cols = [
-        x0,
-        x0 + 34.0,
-        x0 + 246.0,
-        x0 + 356.0,
-        x0 + 456.0,
-        x0 + 606.0,
-    ];
+    // v1.0 polish: "Выполнение" is wider (real percent + bar); "Результат"
+    // is a compact coloured indicator (text in its tooltip), so "Находка"
+    // gains the freed width.
+    let cols = stage_table_columns(x0);
     let head_b = rect.top() + 58.0;
-    for (x, h) in cols.iter().zip([
-        "№",
-        d.stages_col_stage,
-        d.stages_col_exec,
-        d.stages_col_result,
-        d.stages_col_finding,
-        d.stages_col_time,
-    ]) {
-        paint::text(&p, *x, head_b, Align::Min, h, t::CAPTION, c::TEXT_MUTED);
+    for (k, (x, h)) in cols
+        .iter()
+        .zip([
+            "№",
+            d.stages_col_stage,
+            d.stages_col_exec,
+            d.stages_col_result,
+            d.stages_col_finding,
+            d.stages_col_time,
+        ])
+        .enumerate()
+    {
+        if k == 3 {
+            // Centred over the indicator column.
+            paint::text(
+                &p,
+                (cols[3] + cols[4]) / 2.0 - 4.0,
+                head_b,
+                Align::Center,
+                h,
+                t::CAPTION,
+                c::TEXT_MUTED,
+            );
+        } else {
+            paint::text(&p, *x, head_b, Align::Min, h, t::CAPTION, c::TEXT_MUTED);
+        }
     }
     p.line_segment(
         [
@@ -318,33 +331,65 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
             _ => (row.right_text.clone(), c::TEXT_MUTED),
         };
         if row.state == RowState::Running {
+            // Real progress only: a determinate bar when the step reports a
+            // percent, otherwise an indeterminate sweep (never a fake %).
             let bar = Rect::from_min_size(
                 egui::pos2(cols[2], row_rect.center().y + 9.0),
-                vec2(110.0, 4.0),
+                vec2(cols[3] - cols[2] - 16.0, 4.0),
             );
-            paint::progress_bar(&p, bar, paint::BAR_STAGE, row.fraction, c::BLUE_STAGE, None);
+            paint::progress_bar(
+                &p,
+                bar,
+                paint::BAR_STAGE,
+                row.fraction,
+                c::BLUE_STAGE,
+                (row.fraction.is_none() && vm.animate).then_some(vm.time),
+            );
         }
         paint::text_clipped(
             &p,
             cols[2],
-            b - 2.0,
+            if row.state == RowState::Running {
+                b - 2.0
+            } else {
+                b
+            },
             cols[3] - cols[2] - 10.0,
             &exec,
             t::CAPTION,
             exec_col,
         );
-        if let Some(res) = row.result {
-            paint::text_clipped(
-                &p,
-                cols[3],
-                b,
-                cols[4] - cols[3] - 8.0,
-                &row.result_text,
-                t::CAPTION,
-                stage_state_tone(res),
-            );
-        } else {
-            paint::text(&p, cols[3], b, Align::Min, "—", t::CAPTION, c::TEXT_MUTED);
+        // Result: compact coloured indicator; the state text (and the
+        // short finding) live in its tooltip. Execution completion stays
+        // in the "Выполнение" column — the two are never merged.
+        let ind_center = egui::pos2((cols[3] + cols[4]) / 2.0 - 4.0, row_rect.center().y);
+        match row.result {
+            Some(res) => {
+                draw_result_indicator(&p, ind_center, 18.0, res);
+                let hover = Rect::from_center_size(ind_center, vec2(26.0, 26.0));
+                let tip = if row.short_finding.is_empty() {
+                    row.result_text.clone()
+                } else {
+                    format!("{} — {}", row.result_text, row.short_finding)
+                };
+                ui.interact(
+                    hover,
+                    egui::Id::new(("stage_result_indicator", i)),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(tip);
+            }
+            None => {
+                paint::text(
+                    &p,
+                    ind_center.x,
+                    b,
+                    Align::Center,
+                    "—",
+                    t::CAPTION,
+                    c::TEXT_MUTED,
+                );
+            }
         }
         paint::text_clipped(
             &p,
@@ -397,6 +442,63 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
             // v0.4.5: the row opens ONLY its own stage; the header button
             // keeps the global summary.
             actions.push(Action::ShowStageDetails(row.number.saturating_sub(1)));
+        }
+    }
+}
+
+/// v1.0 polish: x positions of the six stage-table columns (№, stage,
+/// execution, result indicator, finding, time) from the table's left x.
+pub fn stage_table_columns(x0: f32) -> [f32; 6] {
+    [
+        x0,
+        x0 + 34.0,
+        x0 + 240.0,
+        x0 + 350.0,
+        x0 + 440.0,
+        x0 + 606.0,
+    ]
+}
+
+/// v1.0 polish: the compact result indicator of one stage row — a filled
+/// disc in the result colour with a glyph (✓ OK / completed, ! attention,
+/// × problem, i info, – skipped / not determined).
+pub fn draw_result_indicator(p: &egui::Painter, center: Pos2, diameter: f32, s: StageState) {
+    let col = stage_state_tone(s);
+    let r = diameter / 2.0;
+    match s {
+        StageState::Ok => paint::icon_check_circle(p, center, diameter, col),
+        StageState::Completed => paint::icon_check_ring(p, center, diameter, col),
+        StageState::Problem => {
+            p.circle_filled(center, r, col);
+            let k = r * 0.38;
+            let st = Stroke::new(2.2, c::BG_CARD);
+            p.line_segment([center + vec2(-k, -k), center + vec2(k, k)], st);
+            p.line_segment([center + vec2(-k, k), center + vec2(k, -k)], st);
+        }
+        StageState::Attention => {
+            p.circle_filled(center, r, col);
+            let w = (diameter * 0.12).max(2.0);
+            p.line_segment(
+                [center + vec2(0.0, -r * 0.5), center + vec2(0.0, r * 0.12)],
+                Stroke::new(w, c::BG_CARD),
+            );
+            p.circle_filled(center + vec2(0.0, r * 0.46), w * 0.62, c::BG_CARD);
+        }
+        StageState::Info => {
+            p.circle_filled(center, r, col);
+            let w = (diameter * 0.12).max(2.0);
+            p.circle_filled(center + vec2(0.0, -r * 0.46), w * 0.62, c::BG_CARD);
+            p.line_segment(
+                [center + vec2(0.0, -r * 0.12), center + vec2(0.0, r * 0.52)],
+                Stroke::new(w, c::BG_CARD),
+            );
+        }
+        _ => {
+            paint::circle_outline(p, center, r, 1.8, col);
+            p.line_segment(
+                [center + vec2(-r * 0.4, 0.0), center + vec2(r * 0.4, 0.0)],
+                Stroke::new(1.8, col),
+            );
         }
     }
 }

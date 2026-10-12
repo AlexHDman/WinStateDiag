@@ -13,6 +13,11 @@ pub struct ReferenceMode {
     /// diagnostics-active, hardware, sensor-details, stage-details,
     /// disk-details, bsod-running.
     pub scene: String,
+    /// v1.0 polish QA: `--lang ru|en` (None = the saved preference).
+    pub lang: Option<String>,
+    /// v1.0 polish QA: `--qa-scale <f>` renders at pixels_per_point = f
+    /// (DPI 125 % / 150 % checks) in the same physical canvas.
+    pub scale: f32,
     frames: u32,
     stable_frames: u32,
     requested: bool,
@@ -38,9 +43,22 @@ impl ReferenceMode {
             .and_then(|i| args.get(i + 1))
             .cloned()
             .unwrap_or_else(|| "diagnostics".into());
+        let value_of = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+        };
+        let lang = value_of("--lang").map(|l| l.to_ascii_lowercase());
+        let scale = value_of("--qa-scale")
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|f| (0.75..=3.0).contains(f))
+            .unwrap_or(1.0);
         Some(Self {
             capture_path,
             scene,
+            lang,
+            scale,
             frames: 0,
             stable_frames: 0,
             requested: false,
@@ -55,7 +73,7 @@ impl ReferenceMode {
     pub fn drive(&mut self, ctx: &egui::Context) {
         self.frames += 1;
         let native = ctx.native_pixels_per_point().unwrap_or(1.0);
-        let zoom = 1.0 / native;
+        let zoom = self.scale / native;
         if (ctx.zoom_factor() - zoom).abs() > 1e-4 {
             ctx.set_zoom_factor(zoom);
         }
@@ -68,9 +86,9 @@ impl ReferenceMode {
             self.size_sent = true;
         }
         let rect = ctx.content_rect();
-        let ok = (ctx.pixels_per_point() - 1.0).abs() < 1e-3
-            && (rect.width() - CANVAS_W).abs() < 0.5
-            && (rect.height() - CANVAS_H).abs() < 0.5;
+        let ok = (ctx.pixels_per_point() - self.scale).abs() < 1e-3
+            && (rect.width() - CANVAS_W / self.scale).abs() < 0.5
+            && (rect.height() - CANVAS_H / self.scale).abs() < 0.5;
         self.stable_frames = if ok { self.stable_frames + 1 } else { 0 };
         let give_up = self.frames > 120;
         if self.capture_path.is_some() && !self.requested && (self.stable_frames >= 4 || give_up) {

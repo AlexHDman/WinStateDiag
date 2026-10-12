@@ -464,10 +464,15 @@ fn sensor_details_window_has_reference_providers_and_export() {
         }
     }
     let d = &i18n::RU;
+    // v1.0 polish: the large T°C / Volt / Watt summary + "Эталон" panel come
+    // first; the detailed tables (sources, Min/Max, confidence) follow and
+    // the lower sections are reached by scrolling (checked in the export).
     for t in [
+        d.sensors_col_name,
+        "T°C",
+        "Volt",
+        "Watt",
         d.sensors_sec_temperature,
-        d.sensors_sec_voltage,
-        d.sensors_sec_power,
         d.sensors_ref_title,
         d.sensors_col_min,
         d.sensors_col_max,
@@ -475,9 +480,10 @@ fn sensor_details_window_has_reference_providers_and_export() {
         d.details_save_as,
         d.journal_viewer_close,
     ] {
-        assert!(all.iter().any(|x| x == t), "{t}");
+        assert!(all.iter().any(|x| x == t), "{t} in {all:?}");
     }
     let text = app.sensors_details_text(&app.sensors_with_storage().unwrap());
+    assert!(text.contains(d.sensors_sec_voltage) && text.contains(d.sensors_sec_power));
     assert!(text.contains("11.40–12.60 V") && text.contains(d.sensors_session_note));
     assert!(text.contains(d.sensors_sec_fans) && text.contains(d.sensors_sec_providers));
     assert!(

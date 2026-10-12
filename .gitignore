@@ -55,3 +55,7 @@ __pycache__/
 # Release gate evidence (logs, manifests with producer commit, probe
 # outputs, superseded EXE backups) - local, never committed.
 /release-evidence/
+
+# v1.0 approved GUI visual references (local design input for the polish
+# phase; kept unmodified on disk, not shipped and not in git).
+/assets/UI_details/

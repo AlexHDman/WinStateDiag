@@ -664,3 +664,144 @@ mod case_0x139_regression {
         );
     }
 }
+
+/// v1.0 GUI polish (approved references): Disk Details tables, Crash
+/// Analyzer sections and the stage-table geometry, rendered from the QA
+/// fixtures with the real window code.
+#[cfg(test)]
+mod polish_tests {
+    use super::*;
+
+    fn qa_app(tag: &str) -> WinStateDiagApp {
+        let exe = std::env::temp_dir()
+            .join(format!("wsd-polish-{tag}-{}", std::process::id()))
+            .join("WinStateDiag");
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+        std::fs::create_dir_all(&exe).unwrap();
+        let mut app = WinStateDiagApp::default();
+        app.reports_root = exe.join("Reports");
+        app.language_pref_dir = exe.clone();
+        app.language = Language::Ru;
+        app.package = Arc::new(Mutex::new(SessionPackage::new(exe.join("Reports"), None)));
+        app
+    }
+
+    fn texts(app: &mut WinStateDiagApp, draw: fn(&mut WinStateDiagApp, &egui::Context)) -> String {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::install(&ctx);
+        let mut acc = String::new();
+        for _ in 0..6 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1400.0, 1200.0))),
+                    ..Default::default()
+                },
+                |ui| draw(app, ui.ctx()),
+            );
+            out.textures_delta.clear();
+            fn walk(shape: &egui::Shape, acc: &mut String) {
+                match shape {
+                    egui::Shape::Text(t) => {
+                        acc.push_str(t.galley.text());
+                        acc.push('\n');
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
+                    _ => {}
+                }
+            }
+            acc.clear();
+            for c in &out.shapes {
+                walk(&c.shape, &mut acc);
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn disk_details_show_disk_performance_and_controller_tables() {
+        let mut app = qa_app("disk");
+        app.seed_qa_scene("disk-details");
+        let shown = texts(&mut app, |a, c| a.raw_passes_window(c));
+        let d = i18n::t(Language::Ru);
+        for t in [
+            d.disk_det_identity,
+            d.disk_det_subtitle,
+            d.disk_det_performance,
+            d.nvme_health_title,
+            d.journal_viewer_copy,
+            d.details_save_as,
+            d.journal_viewer_close,
+        ] {
+            assert!(shown.contains(t), "{t} in {shown}");
+        }
+        for h in d.disk_det_perf_header {
+            assert!(shown.contains(h), "{h}");
+        }
+        // Real fixture values (Test 1 / Test 2), never invented ones.
+        assert!(shown.contains("12268"), "Test 1 read in MB/s: {shown}");
+        assert!(
+            shown.contains("UNSTABLE") && shown.contains("ACCEPT"),
+            "{shown}"
+        );
+        assert!(shown.contains("PhysicalDrive3"));
+        assert!(
+            !shown.contains("(пример)") && !shown.contains("S7PNJ0X"),
+            "no reference values"
+        );
+        let rows = app.disk_performance_rows(&qa_summary(1.0, 1.0, 1.0, 1.0));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].cells[0], d.test2_title);
+    }
+
+    #[test]
+    fn crash_analyzer_has_all_sections_and_collapsed_windbg_data() {
+        let mut app = qa_app("crash");
+        app.seed_qa_scene("crash-analyzer");
+        let shown = texts(&mut app, |a, c| a.crash_details_window(c));
+        let d = i18n::t(Language::Ru);
+        let mut last = 0;
+        for t in [
+            d.crash_sec_state,
+            d.crash_sec_found,
+            d.crash_sec_incidents,
+            d.crash_sec_cause,
+            d.crash_sec_why,
+            d.crash_sec_check,
+        ] {
+            let at = shown.find(t).unwrap_or_else(|| panic!("{t} in {shown}"));
+            assert!(at >= last, "section order: {t}");
+            last = at;
+        }
+        // The expandable WinDbg section follows the summary (it may be
+        // scrolled out of view with taller system fonts).
+        if let Some(at) = shown.find(d.crash_sec_dumps) {
+            assert!(at >= last, "WinDbg data after the summary");
+        }
+        assert!(
+            !shown.contains("STACK_TEXT"),
+            "WinDbg technical data stays collapsed by default"
+        );
+        assert!(
+            shown.contains("SYMBOL_NAME: RvNetMP60+2572"),
+            "why lines shown"
+        );
+    }
+
+    #[test]
+    fn stage_table_columns_leave_room_for_percent_and_finding() {
+        let x0 = 0.0;
+        let c = crate::ui::pages::stage_table_columns(x0);
+        assert!(c.windows(2).all(|w| w[0] < w[1]));
+        assert!(c[3] - c[2] >= 110.0, "execution column holds bar + percent");
+        assert!(
+            c[4] - c[3] <= 90.0,
+            "result is a compact indicator (+ header)"
+        );
+        assert!(c[5] - c[4] >= 160.0, "finding gains the freed width");
+        let card_w = crate::ui::tokens::layout::STAGE_TABLE_CARD[2];
+        assert!(
+            16.0 + c[5] + 70.0 <= card_w - 92.0,
+            "time column clear of the Details button"
+        );
+    }
+}

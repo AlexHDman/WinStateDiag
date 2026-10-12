@@ -566,7 +566,7 @@ pub fn counter_chip(
 }
 
 pub fn section_title(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).color(c::TEXT_TITLE).strong().size(15.0));
+    ui.label(RichText::new(text).color(c::TEXT_TITLE).strong().size(17.0));
 }
 
 /// Primary action (blue, larger, still compact).

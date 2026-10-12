@@ -314,6 +314,7 @@ pub(crate) fn detail_window<R>(
             let Some(add) = add.take() else {
                 return (None, false);
             };
+            details_text_scale(ui.style_mut());
             if class == egui::ViewportClass::EmbeddedWindow {
                 return (Some(add(ui)), false);
             }
@@ -332,6 +333,255 @@ pub(crate) fn detail_window<R>(
         *open = false;
     }
     out
+}
+
+/// v1.0 polish: Details windows read larger than the dashboard defaults
+/// (body 15, small 13, monospace 13.5, buttons 15) — engineering windows
+/// meant for reading, not glancing. Only the Details UI scope is changed.
+pub(crate) fn details_text_scale(style: &mut egui::Style) {
+    use egui::{FontFamily, FontId, TextStyle};
+    for (ts, size, family) in [
+        (TextStyle::Body, 15.0, FontFamily::Proportional),
+        (TextStyle::Button, 15.0, FontFamily::Proportional),
+        (TextStyle::Small, 13.0, FontFamily::Proportional),
+        (TextStyle::Monospace, 13.5, FontFamily::Monospace),
+        (TextStyle::Heading, 21.0, FontFamily::Proportional),
+    ] {
+        style.text_styles.insert(ts, FontId::new(size, family));
+    }
+    style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+}
+
+/// v1.0 polish: Sensor Details summary — "Наименование | T°C | Volt | Watt"
+/// in large type (real values only; missing = "Нет данных", not meaningful
+/// = "—") and the "Эталон" panel with the references the app really has
+/// (ATX bands, drive-reported thresholds, "динамический", "без фикс.
+/// эталона"). Nothing is invented for display.
+pub(crate) fn sensor_summary_block(ui: &mut egui::Ui, d: &i18n::Dict, svm: &SensorsVm) {
+    use crate::ui::vm::SensorCell;
+    let cell = |ui: &mut egui::Ui, v: &SensorCell| {
+        let (text, col) = match v {
+            SensorCell::Value { text, tone } => (text.clone(), crate::ui::pages::tone_color(*tone)),
+            SensorCell::NoData => (d.sensors_no_data.to_string(), c::TEXT_MUTED),
+            SensorCell::NotApplicable => ("—".to_string(), c::TEXT_MUTED),
+        };
+        ui.label(RichText::new(text).size(17.0).strong().color(col));
+    };
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(d.sensors_title)
+                .size(22.0)
+                .strong()
+                .color(c::TEXT_TITLE),
+        );
+        ui.label(
+            RichText::new(d.sensors_header_units)
+                .size(17.0)
+                .color(c::TEXT_TITLE.gamma_multiply(0.7)),
+        );
+    });
+    ui.add_space(6.0);
+    let total = ui.available_width();
+    let ref_w = (total * 0.30).clamp(230.0, 360.0);
+    // Two framed panels: each frame adds 2 × 12 margin + 2 × 1 stroke.
+    let left_w = (total - ref_w - 2.0 * 26.0 - 12.0).max(300.0);
+    ui.horizontal_top(|ui| {
+        egui::Frame::new()
+            .fill(c::BG_CARD_INNER)
+            .stroke(egui::Stroke::new(1.0, c::BORDER_INNER))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(left_w);
+                if svm.matrix.is_empty() {
+                    ui.label(
+                        RichText::new(d.sensors_no_data)
+                            .size(16.0)
+                            .color(c::TEXT_MUTED),
+                    );
+                    return;
+                }
+                egui::Grid::new("wsd_sensor_summary_matrix")
+                    .num_columns(4)
+                    .striped(true)
+                    .min_col_width((left_w - 3.0 * 22.0) / 5.0)
+                    .spacing(vec2(22.0, 7.0))
+                    .show(ui, |ui| {
+                        for h in [d.sensors_col_name, "T°C", "Volt", "Watt"] {
+                            ui.label(RichText::new(h).size(15.0).color(c::TEXT_MUTED));
+                        }
+                        ui.end_row();
+                        for row in &svm.matrix {
+                            ui.label(RichText::new(&row.label).size(17.0).color(c::TEXT_PRIMARY));
+                            cell(ui, &row.temp);
+                            cell(ui, &row.volt);
+                            cell(ui, &row.watt);
+                            ui.end_row();
+                        }
+                    });
+            });
+        egui::Frame::new()
+            .fill(c::BG_CARD_INNER)
+            .stroke(egui::Stroke::new(1.0, c::TEXT_TITLE.gamma_multiply(0.45)))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ref_w);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(d.sensors_ref_title)
+                            .size(17.0)
+                            .strong()
+                            .color(c::TEXT_TITLE),
+                    );
+                    ui.separator();
+                    if svm.refs.is_empty() {
+                        ui.label(RichText::new(d.sensors_no_data).color(c::TEXT_MUTED));
+                    }
+                    egui::Grid::new("wsd_sensor_summary_refs")
+                        .num_columns(2)
+                        .min_col_width(ref_w * 0.42)
+                        .spacing(vec2(14.0, 6.0))
+                        .show(ui, |ui| {
+                            for r in &svm.refs {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&r.label).size(15.0).color(c::TEXT_SECONDARY),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&r.range).size(15.0).color(c::TEXT_PRIMARY),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(d.sensors_note).small().color(c::TEXT_MUTED),
+                        )
+                        .wrap(),
+                    );
+                });
+            });
+    });
+    ui.add_space(8.0);
+}
+
+/// v1.0 polish: one row of the Disk Details performance table.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PerfRow {
+    pub cells: [String; 7],
+    /// Status colour; `None` = the test did not run.
+    pub tone: Option<Tone>,
+}
+
+/// v1.0 polish: a framed Details section with a large cyan heading.
+pub(crate) fn disk_section_frame(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(c::BG_CARD_INNER)
+        .stroke(egui::Stroke::new(1.0, c::BORDER_INNER))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(title)
+                    .size(18.0)
+                    .strong()
+                    .color(c::TEXT_TITLE),
+            );
+            ui.add_space(4.0);
+            add(ui);
+        });
+    ui.add_space(8.0);
+}
+
+/// v1.0 polish: label / value rows split into two side-by-side tables
+/// (first half left, second half right); wrapped values, no clipping.
+pub(crate) fn two_column_tables(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + Copy + std::fmt::Debug,
+    rows: &[(String, String)],
+) {
+    let keyed: Vec<&(String, String)> = rows.iter().filter(|(k, _)| !k.is_empty()).collect();
+    let notes: Vec<&(String, String)> = rows.iter().filter(|(k, _)| k.is_empty()).collect();
+    let half = keyed.len().div_ceil(2);
+    let width = ((ui.available_width() - 16.0) / 2.0).max(220.0);
+    ui.horizontal_top(|ui| {
+        for (side, part) in [&keyed[..half], &keyed[half..]].iter().enumerate() {
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                egui::Grid::new((id, side))
+                    .num_columns(2)
+                    .striped(true)
+                    .min_col_width(width * 0.38)
+                    .max_col_width(width * 0.62)
+                    .spacing(vec2(14.0, 6.0))
+                    .show(ui, |ui| {
+                        for (k, v) in part.iter() {
+                            ui.add(
+                                egui::Label::new(RichText::new(k).color(c::TEXT_SECONDARY)).wrap(),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new(v).color(c::TEXT_PRIMARY)).wrap(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+    });
+    for (_, v) in notes {
+        ui.add(egui::Label::new(RichText::new(v).small().color(c::TEXT_MUTED)).wrap());
+    }
+}
+
+/// v1.0 polish: Test 1 / Test 2 performance table.
+pub(crate) fn disk_performance_table(ui: &mut egui::Ui, d: &i18n::Dict, rows: &[PerfRow]) {
+    ui.label(
+        RichText::new(d.disk_det_performance_note)
+            .small()
+            .color(c::TEXT_MUTED),
+    );
+    egui::Grid::new("wsd_disk_perf_table")
+        .num_columns(7)
+        .striped(true)
+        .spacing(vec2(18.0, 7.0))
+        .show(ui, |ui| {
+            for h in d.disk_det_perf_header {
+                ui.label(RichText::new(h).strong().color(c::TEXT_TITLE));
+            }
+            ui.end_row();
+            for r in rows {
+                for (k, v) in r.cells.iter().enumerate() {
+                    let col = match (k, r.tone) {
+                        (6, Some(t)) => crate::ui::pages::tone_color(t),
+                        (6, None) | (1..=5, None) => c::TEXT_MUTED,
+                        (0, _) => c::TEXT_PRIMARY,
+                        _ => c::TEXT_PRIMARY,
+                    };
+                    let text = RichText::new(v).color(col);
+                    let text = if k == 6 && r.tone.is_some() {
+                        text.strong()
+                    } else {
+                        text
+                    };
+                    // Short cells never wrap (a wrapped "ТЕСТ 1 — первый
+                    // замер" broke per letter); a long reason may.
+                    if k == 6 && r.tone.is_none() {
+                        ui.add(egui::Label::new(text).wrap());
+                    } else {
+                        ui.add(egui::Label::new(text).extend());
+                    }
+                }
+                ui.end_row();
+            }
+        });
 }
 
 /// v1.0 standard action of a Details window.
@@ -2037,6 +2287,12 @@ impl Default for WinStateDiagApp {
             reference: ReferenceMode::from_args(),
             window_icons: Default::default(),
         };
+        // v1.0 polish QA: `--visual-reference --lang en|ru`.
+        match app.reference.as_ref().and_then(|r| r.lang.as_deref()) {
+            Some("en") => app.language = Language::En,
+            Some("ru") => app.language = Language::Ru,
+            _ => {}
+        }
         // Unit tests never start the (read-only) PowerShell collector.
         if app.reference.is_none() && !cfg!(test) {
             app.driver_audit = start_driver_audit();
@@ -4989,21 +5245,23 @@ impl WinStateDiagApp {
         let folder_ok = self.final_report().is_ok();
         let assessment = self.selected_assessment();
         let first = assessment.map(|a| a.first.clone());
+        let perf = self.disk_performance_rows(&result);
         let mut open = true;
         let mut act: Option<DetailsAct> = None;
         detail_window(
             ctx,
             "wsd_disk_details",
             &title,
-            [980.0, 820.0],
+            [1060.0, 860.0],
             &mut open,
             |ui| {
                 ui.label(
                     RichText::new(&title)
                         .strong()
-                        .size(17.0)
+                        .size(22.0)
                         .color(c::TEXT_TITLE),
                 );
+                ui.label(RichText::new(d.disk_det_subtitle).color(c::TEXT_SECONDARY));
                 ui.add_space(4.0);
                 let footer = if status.is_some() { 76.0 } else { 50.0 };
                 egui::ScrollArea::vertical()
@@ -5011,30 +5269,51 @@ impl WinStateDiagApp {
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - footer).max(120.0))
                     .show(ui, |ui| {
+                        let mut perf_done = false;
                         for (n, (head, rows)) in sections.iter().enumerate() {
-                            details::section_title(ui, head);
-                            egui::Grid::new(("wsd_disk_sec", n))
-                                .num_columns(2)
-                                .striped(true)
-                                .spacing(vec2(16.0, 4.0))
-                                .show(ui, |ui| {
-                                    for (k, v) in rows {
-                                        if k.is_empty() {
-                                            ui.label("");
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(v).color(c::TEXT_SECONDARY),
-                                                )
-                                                .wrap(),
-                                            );
-                                        } else {
-                                            ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
-                                            ui.add(egui::Label::new(v).wrap());
-                                        }
-                                        ui.end_row();
-                                    }
+                            // v1.0 polish: identity and controller data as
+                            // two side-by-side tables; Test 1 / Test 2 as one
+                            // performance table. Same facts as Copy / Save.
+                            let is_test =
+                                head.starts_with(d.test1_title) || head.starts_with(d.test2_title);
+                            if is_test {
+                                if !perf_done {
+                                    perf_done = true;
+                                    disk_section_frame(ui, d.disk_det_performance, |ui| {
+                                        disk_performance_table(ui, d, &perf);
+                                    });
+                                }
+                                continue;
+                            }
+                            if n == 0 || head == d.nvme_health_title {
+                                disk_section_frame(ui, head, |ui| {
+                                    two_column_tables(ui, ("wsd_disk_2col", n), rows);
                                 });
-                            ui.add_space(6.0);
+                                continue;
+                            }
+                            disk_section_frame(ui, head, |ui| {
+                                egui::Grid::new(("wsd_disk_sec", n))
+                                    .num_columns(2)
+                                    .striped(true)
+                                    .spacing(vec2(16.0, 4.0))
+                                    .show(ui, |ui| {
+                                        for (k, v) in rows {
+                                            if k.is_empty() {
+                                                ui.label("");
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(v).color(c::TEXT_SECONDARY),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            } else {
+                                                ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
+                                                ui.add(egui::Label::new(v).wrap());
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
                         }
                         // Raw passes of both runs (kept for engineers).
                         egui::CollapsingHeader::new(d.ssd_raw_passes_title)
@@ -5072,6 +5351,69 @@ impl WinStateDiagApp {
             self.disk_export_status = None;
         }
         self.raw_passes_open = open;
+    }
+
+    /// v1.0 polish: the performance table rows (Test 1, Test 2) — label,
+    /// Read, Write, read / write spread, duration, status and its tone.
+    /// Test 2 that did not run reads "—" with the real reason.
+    fn disk_performance_rows(&self, current: &StorageDiagnosticSummary) -> Vec<PerfRow> {
+        let d = i18n::t(self.language);
+        let ru = self.language == Language::Ru;
+        let mb = |mib: f64| format!("{:.0}", mib * 1.048576);
+        let row = |label: String, r: &StorageDiagnosticSummary, dur: Option<f64>| {
+            let level = stability_level(r.read_variation_percent)
+                .max(stability_level(r.write_variation_percent));
+            PerfRow {
+                cells: [
+                    label,
+                    mb(r.summary_read_mib_s),
+                    mb(r.summary_write_mib_s),
+                    format!("{:.2} %", r.read_variation_percent),
+                    format!("{:.2} %", r.write_variation_percent),
+                    dur.map(|s| format!("{s:.1}")).unwrap_or_else(|| "—".into()),
+                    stability_text(level).to_string(),
+                ],
+                tone: Some(stability_tone(level)),
+            }
+        };
+        let assessment = self.selected_assessment();
+        let mut out = Vec::new();
+        match assessment {
+            Some(a) => {
+                out.push(row(
+                    format!("{} — {}", d.test1_title, d.disk_det_initial),
+                    &a.first,
+                    Some(a.first_duration),
+                ));
+                match &a.second {
+                    Some(r2) => out.push(row(d.test2_title.to_string(), r2, a.second_duration)),
+                    None => {
+                        let why = match &a.retest {
+                            storage_health::RetestOutcome::NotNeeded => d.test2_none.to_string(),
+                            other => storage_health::Finding::RetestNotRun(other.clone()).text(ru),
+                        };
+                        out.push(PerfRow {
+                            cells: [
+                                d.test2_title.to_string(),
+                                "—".into(),
+                                "—".into(),
+                                "—".into(),
+                                "—".into(),
+                                "—".into(),
+                                why,
+                            ],
+                            tone: None,
+                        });
+                    }
+                }
+            }
+            None => out.push(row(
+                format!("{} — {}", d.test1_title, d.disk_det_initial),
+                current,
+                None,
+            )),
+        }
+        out
     }
 
     fn disk_details_title(&self) -> String {
@@ -7284,6 +7626,18 @@ impl WinStateDiagApp {
                                         .wrap(),
                                 );
                             }
+                            if !r.why.is_empty() {
+                                ui.add_space(6.0);
+                                details::section_title(ui, d.crash_sec_why);
+                                for l in &r.why {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!("• {l}")).color(c::TEXT_BODY),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            }
                             ui.add_space(6.0);
                             details::section_title(ui, d.crash_sec_check);
                             for l in &r.checks {
@@ -7295,96 +7649,116 @@ impl WinStateDiagApp {
                                 );
                             }
                             ui.separator();
-                            if !self.crash.analyses.is_empty() {
-                                details::section_title(ui, d.crash_sec_dumps);
-                            }
                         }
-                        for (n, a) in self.crash.analyses.iter().enumerate() {
-                            details::section_title(
-                                ui,
-                                &format!(
-                                    "{} — {} — {}",
-                                    a.dump.name,
-                                    a.status.code(),
-                                    a.confidence.code()
-                                ),
-                            );
-                            egui::Grid::new(("wsd_crash_kv", n))
-                                .num_columns(2)
-                                .spacing(vec2(14.0, 4.0))
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for (k, v) in crash_analysis_rows(a, d) {
-                                        ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
-                                        ui.add(egui::Label::new(v).wrap());
-                                        ui.end_row();
+                        // v1.0 polish: the WinDbg technical data (per dump:
+                        // fields, STACK_TEXT, lmvm, resolution, raw output)
+                        // is one expandable section, closed by default.
+                        if !self.crash.analyses.is_empty() {
+                            egui::CollapsingHeader::new(
+                                RichText::new(d.crash_sec_dumps)
+                                    .size(17.0)
+                                    .strong()
+                                    .color(c::TEXT_TITLE),
+                            )
+                            .id_salt("wsd_crash_windbg_technical")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for (n, a) in self.crash.analyses.iter().enumerate() {
+                                    details::section_title(
+                                        ui,
+                                        &format!(
+                                            "{} — {} — {}",
+                                            a.dump.name,
+                                            a.status.code(),
+                                            a.confidence.code()
+                                        ),
+                                    );
+                                    egui::Grid::new(("wsd_crash_kv", n))
+                                        .num_columns(2)
+                                        .spacing(vec2(14.0, 4.0))
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            for (k, v) in crash_analysis_rows(a, d) {
+                                                ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
+                                                ui.add(egui::Label::new(v).wrap());
+                                                ui.end_row();
+                                            }
+                                        });
+                                    if !a.parsed.stack_text.is_empty() {
+                                        ui.add_space(4.0);
+                                        ui.label(RichText::new("STACK_TEXT").color(c::TEXT_TITLE));
+                                        for line in &a.parsed.stack_text {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(line)
+                                                        .monospace()
+                                                        .size(11.5)
+                                                        .color(c::TEXT_BODY),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
                                     }
-                                });
-                            if !a.parsed.stack_text.is_empty() {
-                                ui.add_space(4.0);
-                                ui.label(RichText::new("STACK_TEXT").color(c::TEXT_TITLE));
-                                for line in &a.parsed.stack_text {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(line)
-                                                .monospace()
-                                                .size(11.5)
-                                                .color(c::TEXT_BODY),
-                                        )
-                                        .wrap(),
-                                    );
+                                    if let Some(m) = &a.module_info {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(format!("lmvm {}", m.module))
+                                                .color(c::TEXT_TITLE),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&m.raw).monospace().size(11.5),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                    if let Some(r) = &a.resolution {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(d.crash_resolution_title)
+                                                .color(c::TEXT_TITLE),
+                                        );
+                                        for l in crash_dump::resolution_lines(r, ru) {
+                                            ui.label(RichText::new(l).color(c::TEXT_BODY));
+                                        }
+                                    }
+                                    if !a.linked.is_empty() {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(d.crash_row_driver).color(c::TEXT_TITLE),
+                                        );
+                                        for l in &a.linked {
+                                            ui.label(format!(
+                                                "→ [{}] {} — {} ×{} {}",
+                                                l.status.code(),
+                                                l.device,
+                                                l.kind.code(),
+                                                l.count.max(1),
+                                                l.text
+                                            ));
+                                        }
+                                    }
+                                    if a.memory_test_recommended {
+                                        ui.label(
+                                            RichText::new(d.crash_memory_hint)
+                                                .color(c::YELLOW_WARNING),
+                                        );
+                                    }
+                                    egui::CollapsingHeader::new(d.crash_raw_title)
+                                        .id_salt(("wsd_crash_raw", n))
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&a.raw_output)
+                                                        .monospace()
+                                                        .size(11.0),
+                                                )
+                                                .wrap(),
+                                            );
+                                        });
+                                    ui.separator();
                                 }
-                            }
-                            if let Some(m) = &a.module_info {
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(format!("lmvm {}", m.module))
-                                        .color(c::TEXT_TITLE),
-                                );
-                                ui.add(
-                                    egui::Label::new(RichText::new(&m.raw).monospace().size(11.5))
-                                        .wrap(),
-                                );
-                            }
-                            if let Some(r) = &a.resolution {
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(d.crash_resolution_title).color(c::TEXT_TITLE),
-                                );
-                                for l in crash_dump::resolution_lines(r, ru) {
-                                    ui.label(RichText::new(l).color(c::TEXT_BODY));
-                                }
-                            }
-                            if !a.linked.is_empty() {
-                                ui.add_space(4.0);
-                                ui.label(RichText::new(d.crash_row_driver).color(c::TEXT_TITLE));
-                                for l in &a.linked {
-                                    ui.label(format!(
-                                        "→ [{}] {} — {} ×{} {}",
-                                        l.status.code(),
-                                        l.device,
-                                        l.kind.code(),
-                                        l.count.max(1),
-                                        l.text
-                                    ));
-                                }
-                            }
-                            if a.memory_test_recommended {
-                                ui.label(
-                                    RichText::new(d.crash_memory_hint).color(c::YELLOW_WARNING),
-                                );
-                            }
-                            egui::CollapsingHeader::new(d.crash_raw_title)
-                                .id_salt(("wsd_crash_raw", n))
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&a.raw_output).monospace().size(11.0),
-                                        )
-                                        .wrap(),
-                                    );
-                                });
-                            ui.separator();
+                            });
                         }
                         if let Some(Ok(inv)) = &self.crash.inventory {
                             // v0.4.5 freeze / hang incident timelines.
@@ -7634,7 +8008,8 @@ impl WinStateDiagApp {
         let mut close = false;
         let mut action: Option<ExportAction> = None;
         let export_status = self.sensors_export_status.as_ref().map(|s| s.text(d));
-        let dashboard_status = self.sensors_vm().status_line;
+        let svm = self.sensors_vm();
+        let dashboard_status = svm.status_line.clone();
         let head = |ui: &mut egui::Ui, text: &str| {
             ui.add_space(8.0);
             ui.label(RichText::new(text).size(15.0).strong().color(c::TEXT_TITLE));
@@ -7709,6 +8084,17 @@ impl WinStateDiagApp {
                     .color(c::TEXT_SECONDARY),
                 );
                 let footer = if export_status.is_some() { 70.0 } else { 46.0 };
+                // v1.0 polish: the large T°C / Volt / Watt summary table
+                // (same rows as the dashboard, "Нет данных" kept) with the
+                // real reference panel beside it, in its own scroll region
+                // (never more than ~55 % of the window, never clipped); the
+                // detailed tables with sources, timestamps and confidence
+                // scroll below it.
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_sensors_summary_scroll")
+                    .auto_shrink([false, true])
+                    .max_height(((ui.available_height() - footer) * 0.55).max(120.0))
+                    .show(ui, |ui| sensor_summary_block(ui, d, &svm));
                 egui::ScrollArea::vertical()
                     .id_salt("wsd_sensors_scroll")
                     .auto_shrink([false, false])

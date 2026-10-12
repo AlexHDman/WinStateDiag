@@ -4102,3 +4102,40 @@ mod vss_stage_tests {
         assert!(block.contains("пользовательский лимит хранилища"));
     }
 }
+
+/// v1.0 GUI polish: the Hardware Passport viewer uses the dark
+/// WinStateDiag palette (no white / light-grey surfaces left) and the QA
+/// screenshot mode is read-only (renders, saves nothing, closes).
+#[cfg(test)]
+mod hardware_viewer_theme_tests {
+    use super::HARDWARE_DIAGNOSTIC_PS1;
+
+    #[test]
+    fn viewer_is_dark_and_qa_capture_writes_no_reports() {
+        let s = String::from_utf8_lossy(HARDWARE_DIAGNOSTIC_PS1).replace("\r\n", "\n");
+        let gui = &s[s.find("function New-HardwareReadOnlyBox").unwrap()..];
+        let gui = &gui[..gui.find("Write-Host 'EXPC Hardware Diagnostics'").unwrap()];
+        assert!(!gui.contains("[Drawing.Color]::White"), "no white surfaces");
+        assert!(
+            !gui.contains("FromArgb(244,247,251)"),
+            "no light page colour"
+        );
+        assert!(gui.contains("$script:HwPalette") || s.contains("$script:HwPalette"));
+        assert!(
+            s.contains("Title=@(94,247,255)"),
+            "cyan titles of the WSD palette"
+        );
+        let qa = &s[s
+            .find(
+                "if(-not [string]::IsNullOrWhiteSpace($QaScreenshotPath)){\n        # v1.0 QA only",
+            )
+            .unwrap()..];
+        let qa = &qa[..qa.find("return\n").unwrap()];
+        assert!(!qa.contains("Save-HardwareReport") && !qa.contains("WSD_HW_SAVED"));
+        assert!(qa.contains("DrawToBitmap"));
+        // The overall message is derived from OverallState only.
+        assert!(s.contains("function Get-HardwareOverallMessage"));
+        // Report export (HTML / TXT / JSON) unchanged by the theme.
+        assert!(s.contains("background:#f5f7fa;color:#172033"));
+    }
+}

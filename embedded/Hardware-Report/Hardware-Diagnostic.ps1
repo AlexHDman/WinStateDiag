@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.0
 [CmdletBinding()]
-param([switch]$NoGui, [switch]$ExportAll, [switch]$GuiSmoke, [string]$GuiScreenshotPath='', [switch]$WsdViewer, [string]$ReportFolder='')
+param([switch]$NoGui, [switch]$ExportAll, [switch]$GuiSmoke, [string]$GuiScreenshotPath='', [switch]$WsdViewer, [string]$ReportFolder='', [string]$QaScreenshotPath='', [string]$QaPage='Overview')
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -148,25 +148,56 @@ function Save-HardwareReport {
     return Write-NewHardwareTextFile -Path $path -Text $content
 }
 
+# v1.0 polish: the dark WinStateDiag palette (graphite / navy, cyan
+# titles, restrained violet and gold accents) — same colour system as the
+# WinStateDiag window. Presentation only: the passport data is unchanged.
+$script:HwPalette=@{
+    Root=@(0,12,24);Nav=@(4,17,30);NavActive=@(1,32,65);Card=@(7,25,40);CardInner=@(10,27,45);Field=@(15,38,59)
+    Border=@(38,72,100);BorderInner=@(19,42,63);Title=@(94,247,255);Subtitle=@(53,230,245);Primary=@(244,247,250)
+    Body=@(200,214,227);Secondary=@(163,187,210);Muted=@(139,167,196);Slogan=@(102,136,168);Violet=@(166,120,255)
+    Gold=@(227,189,45);Green=@(31,242,116);Yellow=@(240,200,58);Red=@(240,74,76);Button=@(14,58,96);ButtonBorder=@(61,123,176)
+}
+function Get-HwColor {
+    param([string]$Name)
+    $c=$script:HwPalette[$Name]
+    return [Drawing.Color]::FromArgb($c[0],$c[1],$c[2])
+}
+
+function Set-HardwareGridTheme {
+    param([Windows.Forms.DataGridView]$Grid)
+    $Grid.BackgroundColor=Get-HwColor 'CardInner';$Grid.GridColor=Get-HwColor 'BorderInner';$Grid.BorderStyle='None';$Grid.EnableHeadersVisualStyles=$false
+    $Grid.ColumnHeadersDefaultCellStyle.BackColor=Get-HwColor 'Card';$Grid.ColumnHeadersDefaultCellStyle.ForeColor=Get-HwColor 'Title';$Grid.ColumnHeadersDefaultCellStyle.Font=New-Object Drawing.Font('Segoe UI Semibold',10.5)
+    $Grid.ColumnHeadersDefaultCellStyle.SelectionBackColor=Get-HwColor 'Card';$Grid.ColumnHeadersBorderStyle='Single';$Grid.ColumnHeadersHeight=34
+    $Grid.DefaultCellStyle.BackColor=Get-HwColor 'CardInner';$Grid.DefaultCellStyle.ForeColor=Get-HwColor 'Body';$Grid.DefaultCellStyle.Font=New-Object Drawing.Font('Segoe UI',10.5)
+    $Grid.DefaultCellStyle.SelectionBackColor=Get-HwColor 'NavActive';$Grid.DefaultCellStyle.SelectionForeColor=Get-HwColor 'Primary'
+    $Grid.AlternatingRowsDefaultCellStyle.BackColor=Get-HwColor 'Card';$Grid.RowTemplate.Height=30;$Grid.AutoSizeColumnsMode='AllCells'
+}
+
+function Add-HardwareCardBorder {
+    param([Windows.Forms.Control]$Control,[string]$ColorName='Border')
+    $pen=New-Object Drawing.Pen((Get-HwColor $ColorName),1)
+    $Control.Add_Paint(({param($sender,$e)$e.Graphics.DrawRectangle($pen,0,0,$sender.Width-1,$sender.Height-1)}.GetNewClosure()))
+}
+
 function New-HardwareReadOnlyBox {
     param([bool]$Multiline=$false)
     $box=New-Object Windows.Forms.TextBox
-    $box.ReadOnly=$true;$box.BorderStyle='FixedSingle';$box.BackColor=[Drawing.Color]::White;$box.ShortcutsEnabled=$true
+    $box.ReadOnly=$true;$box.BorderStyle='FixedSingle';$box.BackColor=Get-HwColor 'Field';$box.ForeColor=Get-HwColor 'Primary';$box.ShortcutsEnabled=$true
     if($Multiline){$box.Multiline=$true;$box.ScrollBars='Both';$box.WordWrap=$false;$box.Font=New-Object Drawing.Font('Consolas',10)}
     return $box
 }
 
 function New-HardwarePropertyPage {
     param([string]$Title,[object[]]$Fields)
-    $page=New-Object Windows.Forms.Panel;$page.Size=New-Object Drawing.Size(1100,650);$page.Dock='Fill';$page.BackColor=[Drawing.Color]::FromArgb(244,247,251);$page.AutoScroll=$true
-    $heading=New-Object Windows.Forms.Label;$heading.Text=$Title;$heading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$heading.ForeColor=[Drawing.Color]::FromArgb(24,36,51);$heading.AutoSize=$true;$heading.Location=New-Object Drawing.Point(24,20);$page.Controls.Add($heading)
+    $page=New-Object Windows.Forms.Panel;$page.Size=New-Object Drawing.Size(1100,650);$page.Dock='Fill';$page.BackColor=Get-HwColor 'Card';$page.AutoScroll=$true
+    $heading=New-Object Windows.Forms.Label;$heading.Text=$Title;$heading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$heading.ForeColor=Get-HwColor 'Title';$heading.AutoSize=$true;$heading.Location=New-Object Drawing.Point(24,20);$page.Controls.Add($heading)
     $table=New-Object Windows.Forms.TableLayoutPanel;$table.Location=New-Object Drawing.Point(24,70);$table.Width=950;$table.AutoSize=$true;$table.ColumnCount=2;$table.RowCount=$Fields.Count;$table.Anchor='Top,Left,Right'
-    [void]$table.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Absolute',220)))
+    [void]$table.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Absolute',300)))
     [void]$table.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent',100)))
     $values=@{};$row=0
     foreach($field in $Fields){
-        $label=New-Object Windows.Forms.Label;$label.Text=$field.Label;$label.Font=New-Object Drawing.Font('Segoe UI',10);$label.ForeColor=[Drawing.Color]::FromArgb(70,82,98);$label.Dock='Fill';$label.TextAlign='MiddleLeft';$label.Margin=New-Object Windows.Forms.Padding(0,6,8,6)
-        $box=New-HardwareReadOnlyBox;$box.Dock='Fill';$box.Font=New-Object Drawing.Font('Segoe UI',10);$box.Margin=New-Object Windows.Forms.Padding(0,5,0,5)
+        $label=New-Object Windows.Forms.Label;$label.Text=$field.Label;$label.Font=New-Object Drawing.Font('Segoe UI',11);$label.ForeColor=Get-HwColor 'Secondary';$label.Dock='Fill';$label.TextAlign='MiddleLeft';$label.Margin=New-Object Windows.Forms.Padding(0,6,8,6)
+        $box=New-HardwareReadOnlyBox;$box.Dock='Fill';$box.Font=New-Object Drawing.Font('Segoe UI',11);$box.Margin=New-Object Windows.Forms.Padding(0,5,0,5)
         $table.Controls.Add($label,0,$row);$table.Controls.Add($box,1,$row);$values[$field.Key]=$box;$row++
     }
     $page.Controls.Add($table)
@@ -175,11 +206,12 @@ function New-HardwarePropertyPage {
 
 function New-HardwareGridPage {
     param([string]$Title,[object[]]$Columns)
-    $page=New-Object Windows.Forms.Panel;$page.Size=New-Object Drawing.Size(1100,650);$page.Dock='Fill';$page.BackColor=[Drawing.Color]::FromArgb(244,247,251)
-    $heading=New-Object Windows.Forms.Label;$heading.Text=$Title;$heading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$heading.ForeColor=[Drawing.Color]::FromArgb(24,36,51);$heading.AutoSize=$true;$heading.Location=New-Object Drawing.Point(24,20);$page.Controls.Add($heading)
-    $grid=New-Object Windows.Forms.DataGridView;$grid.Location=New-Object Drawing.Point(24,70);$grid.Size=New-Object Drawing.Size(1020,490);$grid.Anchor='Top,Bottom,Left,Right';$grid.ReadOnly=$true;$grid.AllowUserToAddRows=$false;$grid.AllowUserToDeleteRows=$false;$grid.AllowUserToResizeRows=$false;$grid.RowHeadersVisible=$false;$grid.SelectionMode='CellSelect';$grid.MultiSelect=$true;$grid.ClipboardCopyMode='EnableAlwaysIncludeHeaderText';$grid.AutoSizeColumnsMode='DisplayedCells';$grid.BackgroundColor=[Drawing.Color]::White;$grid.BorderStyle='FixedSingle'
+    $page=New-Object Windows.Forms.Panel;$page.Size=New-Object Drawing.Size(1100,650);$page.Dock='Fill';$page.BackColor=Get-HwColor 'Card'
+    $heading=New-Object Windows.Forms.Label;$heading.Text=$Title;$heading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$heading.ForeColor=Get-HwColor 'Title';$heading.AutoSize=$true;$heading.Location=New-Object Drawing.Point(24,20);$page.Controls.Add($heading)
+    $grid=New-Object Windows.Forms.DataGridView;$grid.Location=New-Object Drawing.Point(24,70);$grid.Size=New-Object Drawing.Size(1020,490);$grid.Anchor='Top,Bottom,Left,Right';$grid.ReadOnly=$true;$grid.AllowUserToAddRows=$false;$grid.AllowUserToDeleteRows=$false;$grid.AllowUserToResizeRows=$false;$grid.RowHeadersVisible=$false;$grid.SelectionMode='CellSelect';$grid.MultiSelect=$true;$grid.ClipboardCopyMode='EnableAlwaysIncludeHeaderText';$grid.AutoSizeColumnsMode='DisplayedCells'
     foreach($column in $Columns){[void]$grid.Columns.Add($column.Key,$column.Label)}
-    $footer=New-HardwareReadOnlyBox;$footer.Multiline=$true;$footer.Location=New-Object Drawing.Point(24,570);$footer.Size=New-Object Drawing.Size(1020,65);$footer.Anchor='Bottom,Left,Right';$footer.ScrollBars='Vertical';$footer.WordWrap=$true;$footer.Font=New-Object Drawing.Font('Segoe UI',9)
+    Set-HardwareGridTheme $grid
+    $footer=New-HardwareReadOnlyBox;$footer.Multiline=$true;$footer.Location=New-Object Drawing.Point(24,570);$footer.Size=New-Object Drawing.Size(1020,65);$footer.Anchor='Bottom,Left,Right';$footer.ScrollBars='Vertical';$footer.WordWrap=$true;$footer.Font=New-Object Drawing.Font('Segoe UI',10);$footer.ForeColor=Get-HwColor 'Secondary';$footer.BorderStyle='None'
     $page.Controls.Add($grid);$page.Controls.Add($footer)
     return [PSCustomObject]@{Panel=$page;Grid=$grid;Footer=$footer}
 }
@@ -191,12 +223,13 @@ function Set-HardwareGridRows {
 }
 
 function New-HardwareOverviewPage {
-    $page=New-Object Windows.Forms.Panel;$page.Size=New-Object Drawing.Size(1100,650);$page.Dock='Fill';$page.BackColor=[Drawing.Color]::FromArgb(244,247,251);$page.AutoScroll=$true
-    $heading=New-Object Windows.Forms.Label;$heading.Text='HARDWARE PASSPORT';$heading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$heading.ForeColor=[Drawing.Color]::FromArgb(24,36,51);$heading.AutoSize=$true;$heading.Location=New-Object Drawing.Point(24,16);$page.Controls.Add($heading)
-    $subtitle=New-Object Windows.Forms.Label;$subtitle.Text='Краткая конфигурация компьютера';$subtitle.Font=New-Object Drawing.Font('Segoe UI',9);$subtitle.ForeColor=[Drawing.Color]::FromArgb(92,105,122);$subtitle.AutoSize=$true;$subtitle.Location=New-Object Drawing.Point(27,51);$page.Controls.Add($subtitle)
-    $layout=New-Object Windows.Forms.TableLayoutPanel;$layout.Location=New-Object Drawing.Point(24,78);$layout.Size=New-Object Drawing.Size(1020,548);$layout.Anchor='Top,Bottom,Left,Right';$layout.ColumnCount=2;$layout.RowCount=5;$layout.BackColor=$page.BackColor
+    $page=New-Object Windows.Forms.Panel;$page.Size=New-Object Drawing.Size(1100,650);$page.Dock='Fill';$page.BackColor=Get-HwColor 'Card';$page.AutoScroll=$true
+    # v1.0 polish: the title / subtitle live in the window header (one
+    # "Hardware Passport" heading); the overview is the card grid.
+    $layout=New-Object Windows.Forms.TableLayoutPanel;$layout.Location=New-Object Drawing.Point(24,10);$layout.Size=New-Object Drawing.Size(1020,612);$layout.Anchor='Top,Bottom,Left,Right';$layout.ColumnCount=2;$layout.RowCount=5;$layout.BackColor=$page.BackColor
     [void]$layout.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent',50)));[void]$layout.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent',50)))
-    foreach($height in @(96,104,112,168,58)){[void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',$height)))}
+    foreach($height in @(110,110,110,152,84)){[void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',$height)))}
+    $badges=@{Device='PC';System='OS';Cpu='CPU';Ram='RAM';Gpu='GPU';Board='MB';Storage='SSD';Bios='FW';Overall='OK'}
     $values=@{};$cards=@{}
     $specs=@(
         [PSCustomObject]@{Key='Device';Title='Устройство';Column=0;Row=0;Span=1},[PSCustomObject]@{Key='System';Title='Система';Column=1;Row=0;Span=1},
@@ -206,14 +239,20 @@ function New-HardwareOverviewPage {
         [PSCustomObject]@{Key='Overall';Title='ОБЩИЙ СТАТУС';Column=0;Row=4;Span=2}
     )
     foreach($spec in $specs){
-        $card=New-Object Windows.Forms.Panel;$card.Dock='Fill';$card.Margin=New-Object Windows.Forms.Padding(0,0,12,12);$card.BackColor=[Drawing.Color]::White;$card.BorderStyle='FixedSingle'
+        $card=New-Object Windows.Forms.Panel;$card.Dock='Fill';$card.Margin=New-Object Windows.Forms.Padding(0,0,12,12);$card.BackColor=Get-HwColor 'CardInner';$card.BorderStyle='None';$card.Padding=New-Object Windows.Forms.Padding(1)
         if($spec.Column -eq 1){$card.Margin=New-Object Windows.Forms.Padding(0,0,0,12)}
         if($spec.Span -eq 2){$card.Margin=New-Object Windows.Forms.Padding(0,0,0,0)}
-        $cardLayout=New-Object Windows.Forms.TableLayoutPanel;$cardLayout.Dock='Fill';$cardLayout.ColumnCount=1;$cardLayout.RowCount=2;$cardLayout.Padding=New-Object Windows.Forms.Padding(12,6,12,7)
-        [void]$cardLayout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',25)));[void]$cardLayout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent',100)))
-        $label=New-Object Windows.Forms.Label;$label.Text=$spec.Title;$label.Dock='Fill';$label.Font=New-Object Drawing.Font('Segoe UI Semibold',9);$label.ForeColor=[Drawing.Color]::FromArgb(31,119,210);$label.TextAlign='MiddleLeft'
-        $box=New-HardwareReadOnlyBox $true;$box.Dock='Fill';$box.BorderStyle='None';$box.BackColor=[Drawing.Color]::White;$box.Font=New-Object Drawing.Font('Segoe UI',10);$box.WordWrap=$true;$box.ScrollBars=$(if($spec.Key -in @('Gpu','Storage')){'Vertical'}else{'None'});$box.AccessibleName=$spec.Title
-        $cardLayout.Controls.Add($label,0,0);$cardLayout.Controls.Add($box,0,1);$card.Controls.Add($cardLayout);$layout.Controls.Add($card,$spec.Column,$spec.Row)
+        Add-HardwareCardBorder $card $(if($spec.Key -eq 'Overall'){'ButtonBorder'}else{'Border'})
+        $cardLayout=New-Object Windows.Forms.TableLayoutPanel;$cardLayout.Dock='Fill';$cardLayout.ColumnCount=2;$cardLayout.RowCount=2;$cardLayout.Padding=New-Object Windows.Forms.Padding(14,6,14,4);$cardLayout.BackColor=$card.BackColor
+        [void]$cardLayout.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Absolute',70)));[void]$cardLayout.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent',100)))
+        [void]$cardLayout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',30)));[void]$cardLayout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent',100)))
+        # Text badge instead of a font-dependent glyph (renders on every
+        # supported Windows version).
+        $badge=New-Object Windows.Forms.Label;$badge.Text=$badges[$spec.Key];$badge.Font=New-Object Drawing.Font('Segoe UI Semibold',11);$badge.ForeColor=Get-HwColor 'Title';$badge.BackColor=Get-HwColor 'Card';$badge.TextAlign='MiddleCenter';$badge.Size=New-Object Drawing.Size(52,40);$badge.Margin=New-Object Windows.Forms.Padding(0,6,8,0);$badge.Anchor='Top,Left'
+        Add-HardwareCardBorder $badge 'ButtonBorder'
+        $label=New-Object Windows.Forms.Label;$label.Text=$spec.Title;$label.Dock='Fill';$label.Font=New-Object Drawing.Font('Segoe UI Semibold',13);$label.ForeColor=Get-HwColor 'Title';$label.TextAlign='MiddleLeft';$label.BackColor=$card.BackColor
+        $box=New-HardwareReadOnlyBox $true;$box.Dock='Fill';$box.BorderStyle='None';$box.BackColor=$card.BackColor;$box.ForeColor=Get-HwColor 'Body';$box.Font=New-Object Drawing.Font('Segoe UI',11);$box.WordWrap=$true;$box.ScrollBars=$(if($spec.Key -in @('Gpu','Storage')){'Vertical'}else{'None'});$box.AccessibleName=$spec.Title
+        $cardLayout.Controls.Add($badge,0,0);$cardLayout.SetRowSpan($badge,2);$cardLayout.Controls.Add($label,1,0);$cardLayout.Controls.Add($box,1,1);$card.Controls.Add($cardLayout);$layout.Controls.Add($card,$spec.Column,$spec.Row)
         if($spec.Span -gt 1){$layout.SetColumnSpan($card,$spec.Span)}
         $values[$spec.Key]=$box;$cards[$spec.Key]=$card
     }
@@ -238,7 +277,19 @@ function Get-HardwareOverviewValues {
         Board="$($Passport.Motherboard.Manufacturer) $($Passport.Motherboard.Product)"
         Storage=$(if($disks.Count){$disks -join [Environment]::NewLine}else{'Unavailable'})
         Bios="$($Passport.Bios.Version)`r`n$($Passport.Bios.FirmwareType) — $($Passport.Bios.ReleaseDate)"
-        Overall=[string]$Passport.OverallState
+        Overall=('{0}   —   {1}' -f [string]$Passport.OverallState,(Get-HardwareOverallMessage ([string]$Passport.OverallState)))
+    }
+}
+
+# v1.0 polish: one honest sentence per overall state of the passport
+# (OverallState comes from Get-HardwareOverallState; nothing is added).
+function Get-HardwareOverallMessage {
+    param([string]$State)
+    switch($State){
+        'OK'{return 'Аппаратный паспорт: проблем не обнаружено.'}
+        'WARNING'{return 'Есть замечания — см. разделы паспорта.'}
+        'CRITICAL'{return 'Обнаружены критические состояния — см. разделы паспорта.'}
+        default{return 'Недостаточно данных для общего вывода.'}
     }
 }
 
@@ -255,9 +306,13 @@ function Update-HardwareGui {
     param([object]$State)
     $p=$State.Passport
     $overview=Get-HardwareOverviewValues $p
-    foreach($key in $overview.Keys){$State.OverviewValues[$key].Text=[string]$overview[$key]}
-    $State.OverviewValues.Overall.Font=New-Object Drawing.Font('Segoe UI Semibold',13)
-    $State.OverviewValues.Overall.ForeColor=$(switch($p.OverallState){'OK'{[Drawing.Color]::FromArgb(44,155,94)}'WARNING'{[Drawing.Color]::FromArgb(205,132,25)}'CRITICAL'{[Drawing.Color]::FromArgb(205,55,55)}default{[Drawing.Color]::FromArgb(92,105,122)}})
+    foreach($key in $overview.Keys){$State.OverviewValues[$key].Text=[string]$overview[$key];$State.OverviewValues[$key].SelectionStart=0;$State.OverviewValues[$key].SelectionLength=0}
+    # v1.0 polish: list cards scroll only when their lines do not fit.
+    $State.OverviewValues.Storage.Font=New-Object Drawing.Font('Segoe UI',10);$State.OverviewValues.Storage.WordWrap=$false
+    $State.OverviewValues.Storage.ScrollBars=$(if(@($p.Storage.Disks).Count -gt 6){'Vertical'}else{'None'})
+    $State.OverviewValues.Gpu.ScrollBars=$(if(@($p.Gpu.Controllers).Count -gt 2){'Vertical'}else{'None'})
+    $State.OverviewValues.Overall.Font=New-Object Drawing.Font('Segoe UI Semibold',14)
+    $State.OverviewValues.Overall.ForeColor=$(switch($p.OverallState){'OK'{Get-HwColor 'Green'}'WARNING'{Get-HwColor 'Yellow'}'CRITICAL'{Get-HwColor 'Red'}default{Get-HwColor 'Secondary'}})
     $cpu=@{Model=$p.Cpu.Models-join '; ';Manufacturer=$p.Cpu.Manufacturers-join '; ';Cores=$p.Cpu.PhysicalCores;Logical=$p.Cpu.LogicalProcessors;Socket=$p.Cpu.Sockets-join '; ';MaxClock="$($p.Cpu.MaxClockMHz) MHz";CurrentClock="$($p.Cpu.CurrentClockMHz) MHz";MaxBoost='Not reliably reported by Windows';Architecture=$p.Cpu.Architecture;Cache="L2 $($p.Cpu.L2CacheKB) KB; L3 $($p.Cpu.L3CacheKB) KB"}
     foreach($key in $cpu.Keys){$State.CpuValues[$key].Text=[string]$cpu[$key]}
     Set-HardwareGridRows $State.RamGrid @($p.Ram.Modules|ForEach-Object{,@($_.DeviceLocator,$_.Manufacturer,$_.PartNumber,$_.Capacity,(Format-HardwareMemoryRate $_.RatedSpeedMHz),(Format-HardwareMemoryRate $_.ConfiguredClockMHz),$_.Serial,$_.State)})
@@ -275,26 +330,31 @@ function Update-HardwareGui {
     $batteryValues=@{Detected=$p.Battery.Detected;Summary=$p.Battery.Summary;Charge=$(if($b){"$($b.ChargePercent)%"}else{'Not applicable'});Status=$(if($b){$b.StatusCode}else{'Not applicable'});Design=$(if($b){$b.DesignCapacity}else{'Unavailable'});Full=$(if($b){$b.FullChargeCapacity}else{'Unavailable'})}
     foreach($key in $batteryValues.Keys){$State.BatteryValues[$key].Text=[string]$batteryValues[$key]}
     $State.RawJson.Text=$p|ConvertTo-Json -Depth 10
-    $State.StatusLabel.Text=$p.OverallState;$State.StatusLabel.ForeColor=$(switch($p.OverallState){'OK'{[Drawing.Color]::FromArgb(61,180,112)}'WARNING'{[Drawing.Color]::FromArgb(240,175,60)}'CRITICAL'{[Drawing.Color]::FromArgb(220,70,70)}default{[Drawing.Color]::Silver}})
+    $State.StatusLabel.Text=$p.OverallState;$State.StatusLabel.ForeColor=$(switch($p.OverallState){'OK'{Get-HwColor 'Green'}'WARNING'{Get-HwColor 'Yellow'}'CRITICAL'{Get-HwColor 'Red'}default{Get-HwColor 'Secondary'}})
     $generated=[datetime]$p.GeneratedAt;$State.FooterLabel.Text=('Дата: {0:dd.MM.yy}    Время: {0:HH:mm}    Last refresh: {1:HH:mm}    EXPC WinDiagProbe    Design by EXPC' -f $generated,(Get-Date))
     if($State.WsdViewer){$State.PathLabel.Text="Папка отчёта: $($State.ReportFolder)"}else{$State.PathLabel.Text="Reports: $($State.Directory) | Current basename: $($State.BaseName)"}
 }
 
 function Show-HardwareDiagnosticsGui {
-    param([object]$Passport,[string]$BaseName,[string]$Directory,[switch]$SmokeTest,[string]$ScreenshotPath='',[switch]$WsdViewer,[string]$ReportFolder='')
+    param([object]$Passport,[string]$BaseName,[string]$Directory,[switch]$SmokeTest,[string]$ScreenshotPath='',[switch]$WsdViewer,[string]$ReportFolder='',[string]$QaScreenshotPath='',[string]$QaPage='Overview')
     Add-Type -AssemblyName System.Windows.Forms;Add-Type -AssemblyName System.Drawing
     [Windows.Forms.Application]::EnableVisualStyles()
-    $form=New-Object Windows.Forms.Form;$form.Text='EXPC WinDiagProbe — Hardware Diagnostics';$form.Size=New-Object Drawing.Size(1350,850);$form.MinimumSize=New-Object Drawing.Size(1100,700);$form.StartPosition='CenterScreen';$form.BackColor=[Drawing.Color]::FromArgb(244,247,251);$form.KeyPreview=$true
-    $nav=New-Object Windows.Forms.Panel;$nav.Dock='Left';$nav.Width=245;$nav.BackColor=[Drawing.Color]::FromArgb(24,36,51)
-    $brand=New-Object Windows.Forms.Label;$brand.Text="EXPC`r`nWinDiagProbe`r`nHardware Diagnostics";$brand.Font=New-Object Drawing.Font('Segoe UI Semibold',14);$brand.ForeColor=[Drawing.Color]::White;$brand.SetBounds(20,20,220,82);$nav.Controls.Add($brand)
+    $form=New-Object Windows.Forms.Form;$form.Text='EXPC WinDiagProbe — Hardware Diagnostics';$form.Size=New-Object Drawing.Size(1350,850);$form.MinimumSize=New-Object Drawing.Size(1100,700);$form.StartPosition='CenterScreen';$form.BackColor=Get-HwColor 'Root';$form.KeyPreview=$true
+    $nav=New-Object Windows.Forms.Panel;$nav.Dock='Left';$nav.Width=245;$nav.BackColor=Get-HwColor 'Nav'
+    $brand=New-Object Windows.Forms.Label;$brand.Text="EXPC`r`nWinDiagProbe";$brand.Font=New-Object Drawing.Font('Segoe UI Semibold',16);$brand.ForeColor=Get-HwColor 'Primary';$brand.SetBounds(22,18,215,62);$nav.Controls.Add($brand)
+    $brandSub=New-Object Windows.Forms.Label;$brandSub.Text='Hardware Diagnostics';$brandSub.Font=New-Object Drawing.Font('Segoe UI',11);$brandSub.ForeColor=Get-HwColor 'Secondary';$brandSub.SetBounds(22,80,215,24);$nav.Controls.Add($brandSub)
+    $brandBar=New-Object Windows.Forms.Panel;$brandBar.BackColor=Get-HwColor 'Title';$brandBar.SetBounds(10,22,3,78);$nav.Controls.Add($brandBar)
     $statusPanel=New-Object Windows.Forms.Panel;$statusPanel.Dock='Bottom';$statusPanel.Height=90
-    $statusTitle=New-Object Windows.Forms.Label;$statusTitle.Text='Общий статус';$statusTitle.ForeColor=[Drawing.Color]::LightGray;$statusTitle.SetBounds(20,12,200,22)
+    $statusTitle=New-Object Windows.Forms.Label;$statusTitle.Text='Общий статус';$statusTitle.ForeColor=Get-HwColor 'Secondary';$statusTitle.Font=New-Object Drawing.Font('Segoe UI',10);$statusTitle.SetBounds(20,12,200,22)
     $status=New-Object Windows.Forms.Label;$status.Font=New-Object Drawing.Font('Segoe UI Semibold',16);$status.SetBounds(20,38,200,35);$statusPanel.Controls.Add($statusTitle);$statusPanel.Controls.Add($status);$nav.Controls.Add($statusPanel)
-    $workspace=New-Object Windows.Forms.Panel;$workspace.Dock='Fill';$workspace.BackColor=[Drawing.Color]::FromArgb(244,247,251)
-    $header=New-Object Windows.Forms.Panel;$header.Dock='Top';$header.Height=58;$header.BackColor=[Drawing.Color]::White
-    $headerText=New-Object Windows.Forms.Label;$headerText.Text='Hardware Passport';$headerText.Font=New-Object Drawing.Font('Segoe UI Semibold',17);$headerText.ForeColor=[Drawing.Color]::FromArgb(24,36,51);$headerText.AutoSize=$true;$headerText.Location=New-Object Drawing.Point(22,14);$header.Controls.Add($headerText)
-    $actions=New-Object Windows.Forms.Panel;$actions.Dock='Bottom';$actions.Height=70;$actions.BackColor=[Drawing.Color]::White;$actions.AutoScroll=$true
-    $footer=New-Object Windows.Forms.Label;$footer.Dock='Bottom';$footer.Height=24;$footer.TextAlign='MiddleLeft';$footer.ForeColor=[Drawing.Color]::DimGray;$footer.Padding=New-Object Windows.Forms.Padding(12,0,0,0)
+    $workspace=New-Object Windows.Forms.Panel;$workspace.Dock='Fill';$workspace.BackColor=Get-HwColor 'Card'
+    $header=New-Object Windows.Forms.Panel;$header.Dock='Top';$header.Height=92;$header.BackColor=Get-HwColor 'Card'
+    $headerText=New-Object Windows.Forms.Label;$headerText.Text='Hardware Passport';$headerText.Font=New-Object Drawing.Font('Segoe UI Semibold',24);$headerText.ForeColor=Get-HwColor 'Title';$headerText.AutoSize=$true;$headerText.Location=New-Object Drawing.Point(22,10);$header.Controls.Add($headerText)
+    $headerSub=New-Object Windows.Forms.Label;$headerSub.Text='Краткая конфигурация компьютера';$headerSub.Font=New-Object Drawing.Font('Segoe UI',12);$headerSub.ForeColor=Get-HwColor 'Subtitle';$headerSub.AutoSize=$true;$headerSub.Location=New-Object Drawing.Point(25,56);$header.Controls.Add($headerSub)
+    $headerTag=New-Object Windows.Forms.Label;$headerTag.Text="С И С Т Е М А   •   Д И А Г Н О С Т И К А   •   К О Н Т Р О Л Ь`r`nE X P C   W I N S T A T E D I A G";$headerTag.Font=New-Object Drawing.Font('Segoe UI',8);$headerTag.ForeColor=Get-HwColor 'Slogan';$headerTag.TextAlign='TopRight';$headerTag.Size=New-Object Drawing.Size(460,40);$headerTag.Anchor='Top,Right';$headerTag.Location=New-Object Drawing.Point(($header.Width-480),18);$header.Controls.Add($headerTag)
+    $header.Add_Resize(({$headerTag.Left=[Math]::Max(380,$header.Width-480)}.GetNewClosure()))
+    $actions=New-Object Windows.Forms.Panel;$actions.Dock='Bottom';$actions.Height=74;$actions.BackColor=Get-HwColor 'Card';$actions.AutoScroll=$true
+    $footer=New-Object Windows.Forms.Label;$footer.Dock='Bottom';$footer.Height=26;$footer.TextAlign='MiddleLeft';$footer.ForeColor=Get-HwColor 'Muted';$footer.Font=New-Object Drawing.Font('Segoe UI',9.5);$footer.Padding=New-Object Windows.Forms.Padding(24,0,0,0)
     $content=New-Object Windows.Forms.Panel;$content.Dock='Fill';$content.Padding=New-Object Windows.Forms.Padding(0)
     $workspace.Controls.Add($content);$workspace.Controls.Add($footer);$workspace.Controls.Add($actions);$workspace.Controls.Add($header);$form.Controls.Add($workspace);$form.Controls.Add($nav)
 
@@ -306,20 +366,20 @@ function Show-HardwareDiagnosticsGui {
     $network=New-HardwareGridPage 'Сеть' @([PSCustomObject]@{Key='Adapter';Label='Adapter'},[PSCustomObject]@{Key='Type';Label='Type'},[PSCustomObject]@{Key='Manufacturer';Label='Manufacturer'},[PSCustomObject]@{Key='MAC';Label='MAC'},[PSCustomObject]@{Key='State';Label='Connection state'})
     $bios=New-HardwarePropertyPage 'BIOS / Плата' @([PSCustomObject]@{Key='BoardManufacturer';Label='Board manufacturer'},[PSCustomObject]@{Key='BoardProduct';Label='Board product'},[PSCustomObject]@{Key='BoardVersion';Label='Board version'},[PSCustomObject]@{Key='BoardSerial';Label='Board serial'},[PSCustomObject]@{Key='BiosManufacturer';Label='BIOS manufacturer'},[PSCustomObject]@{Key='BiosVersion';Label='BIOS version'},[PSCustomObject]@{Key='ReleaseDate';Label='Release date'},[PSCustomObject]@{Key='FirmwareType';Label='UEFI / Legacy'},[PSCustomObject]@{Key='SecureBoot';Label='Secure Boot'})
     $battery=New-HardwarePropertyPage 'Батарея' @([PSCustomObject]@{Key='Detected';Label='Battery detected'},[PSCustomObject]@{Key='Summary';Label='Summary'},[PSCustomObject]@{Key='Charge';Label='Charge'},[PSCustomObject]@{Key='Status';Label='Status'},[PSCustomObject]@{Key='Design';Label='Design capacity'},[PSCustomObject]@{Key='Full';Label='Full charge capacity'})
-    $rawPage=New-Object Windows.Forms.Panel;$rawPage.Size=New-Object Drawing.Size(1100,650);$rawPage.Dock='Fill';$rawPage.BackColor=[Drawing.Color]::FromArgb(244,247,251)
-    $rawHeading=New-Object Windows.Forms.Label;$rawHeading.Text='Raw JSON';$rawHeading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$rawHeading.AutoSize=$true;$rawHeading.Location=New-Object Drawing.Point(24,20)
+    $rawPage=New-Object Windows.Forms.Panel;$rawPage.Size=New-Object Drawing.Size(1100,650);$rawPage.Dock='Fill';$rawPage.BackColor=Get-HwColor 'Card'
+    $rawHeading=New-Object Windows.Forms.Label;$rawHeading.Text='Raw JSON';$rawHeading.Font=New-Object Drawing.Font('Segoe UI Semibold',20);$rawHeading.ForeColor=Get-HwColor 'Title';$rawHeading.AutoSize=$true;$rawHeading.Location=New-Object Drawing.Point(24,20)
     $raw=New-HardwareReadOnlyBox $true;$raw.Location=New-Object Drawing.Point(24,70);$raw.Size=New-Object Drawing.Size(1020,565);$raw.Anchor='Top,Bottom,Left,Right';$rawPage.Controls.Add($rawHeading);$rawPage.Controls.Add($raw)
     $pages=[ordered]@{Overview=$overview.Panel;Cpu=$cpu.Panel;Ram=$ram.Panel;Storage=$storage.Panel;Gpu=$gpu.Panel;Network=$network.Panel;Bios=$bios.Panel;Battery=$battery.Panel;Raw=$rawPage}
     foreach($page in $pages.Values){$page.Visible=$false;$content.Controls.Add($page)}
     $navButtons=@{};$navItems=@([PSCustomObject]@{Key='Overview';Label='Обзор'},[PSCustomObject]@{Key='Cpu';Label='Процессор'},[PSCustomObject]@{Key='Ram';Label='Память (RAM)'},[PSCustomObject]@{Key='Storage';Label='Накопители'},[PSCustomObject]@{Key='Gpu';Label='Видеоадаптеры'},[PSCustomObject]@{Key='Network';Label='Сеть'},[PSCustomObject]@{Key='Bios';Label='BIOS / Плата'},[PSCustomObject]@{Key='Battery';Label='Батарея'},[PSCustomObject]@{Key='Raw';Label='Raw JSON'})
-    $top=118
-    foreach($item in $navItems){$key=$item.Key;$button=New-Object Windows.Forms.Button;$button.Text=$item.Label;$button.FlatStyle='Flat';$button.FlatAppearance.BorderSize=0;$button.TextAlign='MiddleLeft';$button.Padding=New-Object Windows.Forms.Padding(14,0,0,0);$button.Font=New-Object Drawing.Font('Segoe UI',10);$button.ForeColor=[Drawing.Color]::White;$button.BackColor=$nav.BackColor;$button.SetBounds(0,$top,245,43);$nav.Controls.Add($button);$navButtons[$key]=$button;$top+=44}
+    $top=124
+    foreach($item in $navItems){$key=$item.Key;$button=New-Object Windows.Forms.Button;$button.Text=$item.Label;$button.FlatStyle='Flat';$button.FlatAppearance.BorderSize=0;$button.TextAlign='MiddleLeft';$button.Padding=New-Object Windows.Forms.Padding(14,0,0,0);$button.Font=New-Object Drawing.Font('Segoe UI',11);$button.ForeColor=Get-HwColor 'Body';$button.BackColor=$nav.BackColor;$button.FlatAppearance.MouseOverBackColor=Get-HwColor 'Field';$button.SetBounds(10,$top,228,43);$nav.Controls.Add($button);$navButtons[$key]=$button;$top+=44}
     $state=[PSCustomObject]@{Passport=$Passport;BaseName=$BaseName;Directory=$Directory;Pages=$pages;NavButtons=$navButtons;OverviewValues=$overview.Values;CpuValues=$cpu.Values;RamGrid=$ram.Grid;RamFooter=$ram.Footer;StorageGrid=$storage.Grid;StorageFooter=$storage.Footer;GpuGrid=$gpu.Grid;GpuFooter=$gpu.Footer;NetworkGrid=$network.Grid;NetworkFooter=$network.Footer;BiosValues=$bios.Values;BatteryValues=$battery.Values;RawJson=$raw;StatusLabel=$status;FooterLabel=$footer;PathLabel=$null;CurrentPage='Overview';WsdViewer=[bool]$WsdViewer;ReportFolder=$ReportFolder}
-    $showPage={param($key)foreach($name in $state.Pages.Keys){$state.Pages[$name].Visible=($name -eq $key);$state.NavButtons[$name].BackColor=$(if($name -eq $key){[Drawing.Color]::FromArgb(31,119,210)}else{[Drawing.Color]::FromArgb(24,36,51)})};$state.Pages[$key].BringToFront();$state.CurrentPage=$key}.GetNewClosure()
+    $showPage={param($key)foreach($name in $state.Pages.Keys){$state.Pages[$name].Visible=($name -eq $key);$state.NavButtons[$name].BackColor=$(if($name -eq $key){Get-HwColor 'NavActive'}else{Get-HwColor 'Nav'});$state.NavButtons[$name].ForeColor=$(if($name -eq $key){Get-HwColor 'Title'}else{Get-HwColor 'Body'})};$state.Pages[$key].BringToFront();$state.CurrentPage=$key}.GetNewClosure()
     foreach($key in @($navButtons.Keys)){$localKey=$key;$navButtons[$key].Add_Click(({&$showPage $localKey}.GetNewClosure()))}
     if($WsdViewer){$buttonSpecs=@([PSCustomObject]@{Text='Обновить (F5)';Width=125},[PSCustomObject]@{Text='Копировать сводку';Width=145},[PSCustomObject]@{Text='Открыть папку отчёта';Width=170},[PSCustomObject]@{Text='Закрыть';Width=100})}else{$buttonSpecs=@([PSCustomObject]@{Text='Обновить (F5)';Width=125},[PSCustomObject]@{Text='Копировать сводку';Width=145},[PSCustomObject]@{Text='Копировать всё';Width=125},[PSCustomObject]@{Text='Сохранить TXT';Width=120},[PSCustomObject]@{Text='Сохранить JSON';Width=125},[PSCustomObject]@{Text='Экспорт HTML';Width=120},[PSCustomObject]@{Text='Открыть папку отчётов';Width=175})};$actionButtons=@();$left=12
-    foreach($spec in $buttonSpecs){$b=New-Object Windows.Forms.Button;$b.Text=$spec.Text;$b.Width=$spec.Width;$b.Height=34;$b.Left=$left;$b.Top=8;$b.FlatStyle='Flat';$b.BackColor=[Drawing.Color]::FromArgb(31,119,210);$b.ForeColor=[Drawing.Color]::White;$b.FlatAppearance.BorderSize=0;$actions.Controls.Add($b);$actionButtons+=$b;$left+=$b.Width+8}
-    $pathLabel=New-Object Windows.Forms.Label;$pathLabel.SetBounds(14,45,1050,20);$pathLabel.AutoEllipsis=$true;$pathLabel.Anchor='Bottom,Left,Right';$actions.Controls.Add($pathLabel);$state.PathLabel=$pathLabel
+    foreach($spec in $buttonSpecs){$b=New-Object Windows.Forms.Button;$b.Text=$spec.Text;$b.Width=$spec.Width;$b.Height=36;$b.Left=$left+12;$b.Top=8;$b.FlatStyle='Flat';$b.BackColor=Get-HwColor 'Button';$b.ForeColor=Get-HwColor 'Primary';$b.Font=New-Object Drawing.Font('Segoe UI',10.5);$b.FlatAppearance.BorderSize=1;$b.FlatAppearance.BorderColor=Get-HwColor 'ButtonBorder';$b.FlatAppearance.MouseOverBackColor=Get-HwColor 'NavActive';$actions.Controls.Add($b);$actionButtons+=$b;$left+=$b.Width+8}
+    $pathLabel=New-Object Windows.Forms.Label;$pathLabel.SetBounds(24,50,1050,20);$pathLabel.AutoEllipsis=$true;$pathLabel.Anchor='Bottom,Left,Right';$pathLabel.ForeColor=Get-HwColor 'Muted';$pathLabel.Font=New-Object Drawing.Font('Segoe UI',9.5);$actions.Controls.Add($pathLabel);$state.PathLabel=$pathLabel
     $refresh={try{$form.Cursor='WaitCursor';$pathLabel.Text='Collecting hardware passport...';[Windows.Forms.Application]::DoEvents();$state.Passport=New-HardwarePassport;$allocation=Get-UniqueWinDiagReportBaseName Hardware (Get-Date) $state.Directory @('.txt','.json','.html');$state.BaseName=$allocation.BaseName;Update-HardwareGui $state}catch{$pathLabel.Text='Error: '+$_.Exception.Message}finally{$form.Cursor='Default'}}.GetNewClosure()
     $copySummary={try{[Windows.Forms.Clipboard]::SetText((New-HardwareOverviewSummary $state.Passport));$pathLabel.Text='Copied: overview summary'}catch{$pathLabel.Text='Clipboard error: '+$_.Exception.Message}}.GetNewClosure()
     $copyAll={try{[Windows.Forms.Clipboard]::SetText((@(New-HardwareReportLines $state.Passport)-join [Environment]::NewLine));$pathLabel.Text='Copied: full hardware report'}catch{$pathLabel.Text='Clipboard error: '+$_.Exception.Message}}.GetNewClosure()
@@ -335,6 +395,17 @@ function Show-HardwareDiagnosticsGui {
     $form.Add_KeyDown(({if($_.KeyCode -eq [Windows.Forms.Keys]::F5){&$refreshAction;$_.Handled=$true}}.GetNewClosure()))
     if($WsdViewer){$form.Add_Shown(({$form.TopMost=$true;$form.Activate();$form.TopMost=$false}.GetNewClosure()))}
     Update-HardwareGui $state;&$showPage 'Overview'
+    # No text box starts focused / selected (reads like a highlight).
+    $form.Add_Shown(({$form.ActiveControl=$state.NavButtons['Overview']}.GetNewClosure()))
+    if(-not [string]::IsNullOrWhiteSpace($QaScreenshotPath)){
+        # v1.0 QA only: render one page of the viewer to a PNG and close —
+        # read-only, no report files written, no interaction.
+        if($state.Pages.Contains($QaPage)){&$showPage $QaPage}
+        $form.Show();$form.ActiveControl=$state.NavButtons['Overview'];[Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 400;[Windows.Forms.Application]::DoEvents()
+        $bitmap=New-Object Drawing.Bitmap($form.Width,$form.Height)
+        try{$form.DrawToBitmap($bitmap,(New-Object Drawing.Rectangle(0,0,$bitmap.Width,$bitmap.Height)));$bitmap.Save($QaScreenshotPath,[Drawing.Imaging.ImageFormat]::Png)}finally{$bitmap.Dispose();$form.Close();$form.Dispose()}
+        return
+    }
     if($SmokeTest){
         $originalClipboard=$null
         try{$originalClipboard=[Windows.Forms.Clipboard]::GetDataObject()}catch{}
@@ -384,7 +455,10 @@ try {
     Write-Host ("Overall hardware state: {0}" -f $passport.OverallState) -ForegroundColor $(switch ($passport.OverallState) { 'OK' {'Green'} 'WARNING' {'Yellow'} 'CRITICAL' {'Red'} default {'Cyan'} })
     Write-Host 'Reports:' -ForegroundColor Cyan
     Write-Host $OutputDirectory
-    if($GuiSmoke){
+    if(-not [string]::IsNullOrWhiteSpace($QaScreenshotPath)){
+        Show-HardwareDiagnosticsGui -Passport $passport -BaseName $baseName -Directory $OutputDirectory -WsdViewer -ReportFolder $ReportFolder -QaScreenshotPath $QaScreenshotPath -QaPage $QaPage
+        Write-Output ('HARDWARE_QA_SCREENSHOT|'+$QaScreenshotPath)
+    } elseif($GuiSmoke){
         $smoke=Show-HardwareDiagnosticsGui -Passport $passport -BaseName $baseName -Directory $OutputDirectory -SmokeTest -ScreenshotPath $GuiScreenshotPath
         $required=$smoke.Pages.Count -eq 9 -and $smoke.Buttons.Count -eq 7 -and $smoke.OverviewCopyable -and $smoke.OverviewPopulated -and $smoke.CpuPopulated -and $smoke.RamGrid -and $smoke.RamRows -gt 0 -and $smoke.StorageGrid -and $smoke.StorageRows -gt 0 -and $smoke.GpuRows -gt 0 -and $smoke.NetworkRows -gt 0 -and $smoke.BiosPopulated -and $smoke.BatterySafe -and $smoke.GridsCopyable -and $smoke.RawJsonReadOnly -and $smoke.RawJsonPopulated -and $smoke.SummaryCopied -and $smoke.AllCopied -and $smoke.RefreshWorked -and $smoke.ExportsExist -and $smoke.OpenFolderReady -and $smoke.OpenFolderWorked -and $smoke.ScreenshotExists
         if(-not $required){
