@@ -578,6 +578,7 @@ fn qa_vss_aggregates() -> Vec<events::Aggregate> {
         time: t.into(),
         message: m.into(),
         data: Vec::new(),
+        ..Default::default()
     };
     let mut evs = Vec::new();
     for d in 1..=11 {

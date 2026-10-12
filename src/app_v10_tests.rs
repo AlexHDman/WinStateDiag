@@ -318,6 +318,7 @@ fn row_details_show_only_that_stages_evidence() {
         time: "2026-10-01T03:00:00".into(),
         message: m.into(),
         data: vec![("param1".into(), "app.exe".into())],
+        ..Default::default()
     };
     let aggs = events::aggregate(
         &[

@@ -156,6 +156,9 @@ fn evidence_probe(dir: Option<PathBuf>, module: Option<String>) -> i32 {
             for a in aggs.iter().take(25) {
                 summary.push_str(&format!("AGG {}\r\n", events::aggregate_line(a)));
             }
+            for g in events::actionable(&aggs) {
+                summary.push_str(&format!("ACT [{}] {}\r\n", g.class.code(), g.title));
+            }
         }
         Err(e) => summary.push_str(&format!("EVENTS_ERROR {e}\r\n")),
     }
