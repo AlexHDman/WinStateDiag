@@ -17,6 +17,8 @@
 #   gate_summary.txt. Superseded EXEs of the same version are backed up to
 #   release-evidence\v<version>\superseded\ before being replaced.
 # Older dist\ releases are hashed before / after and must be unchanged.
+# Only one gate runs at a time (release-evidence\gate.lock); every step's
+# exit code is logged, and each app probe / render has a timeout (FAIL).
 #
 # Usage (elevated; the .cmd wrapper requests elevation):
 #   scripts\release\release_gate.cmd <expected-head-sha>
@@ -38,10 +40,33 @@ $script:Failed = $null
 $script:Log = $null
 $script:LogBuffer = New-Object System.Collections.Generic.List[string]
 
+# Appends one line, sharing the file and retrying for ~10 s: a scanner or
+# log viewer holding gate.log for a moment must not kill the gate (a plain
+# Add-Content sharing violation did, with no FAIL recorded).
+function Append-Line([string]$path, [string]$line) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($line + "`r`n")
+    for ($i = 1; ; $i++) {
+        try {
+            $fs = [IO.File]::Open($path, [IO.FileMode]::Append, [IO.FileAccess]::Write,
+                [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+            return
+        } catch [IO.IOException] {
+            if ($i -ge 50) { throw }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+}
+# Never throws: a line that cannot reach gate.log goes to gate.log.unwritten.
 function Log([string]$line) {
+    if ($line.StartsWith('== ')) { $line += "  [$((Get-Date).ToString('HH:mm:ss'))]" }
     Write-Host $line
-    if ($script:Log) { Add-Content -LiteralPath $script:Log -Value $line -Encoding UTF8 }
-    else { $script:LogBuffer.Add($line) }
+    if (-not $script:Log) { $script:LogBuffer.Add($line); return }
+    try { Append-Line $script:Log $line }
+    catch {
+        try { Append-Line ($script:Log + '.unwritten') "$line   <<< gate.log write failed: $_" }
+        catch { Write-Host "LOG WRITE FAILED: $_" -ForegroundColor Red }
+    }
 }
 function Fail([string]$step, [string]$why) {
     throw "GATE_STEP_FAILED|$step|$why"
@@ -55,6 +80,7 @@ function Native([string]$line) {
 }
 function Native-Log([string]$line, [string]$step) {
     $rc = Native ($line + ' >> "' + $script:Log + '" 2>&1')
+    Log "EXIT $step=$rc"
     if ($rc -ne 0) { Fail $step "exit $rc" }
 }
 function Git([string]$a) {
@@ -63,8 +89,20 @@ function Git([string]$a) {
     if ($LASTEXITCODE -ne 0) { Fail 'GIT' ("git $a failed: " + ($out -join ' ')) }
     return $out
 }
-function Run-Exe([string]$exe, [string[]]$a) {
-    $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru
+# Runs one app probe / render with a timeout; on timeout its process tree is
+# ended and the step FAILS. The exit code of every run is logged.
+function Run-Exe([string]$exe, [string[]]$a, [string]$step, [int]$timeoutSec, [switch]$Hidden) {
+    $t0 = Get-Date
+    $style = if ($Hidden) { 'Hidden' } else { 'Normal' }
+    $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -WindowStyle $style
+    $null = $p.Handle  # keeps ExitCode readable after exit (PowerShell 5.1)
+    if (-not $p.WaitForExit($timeoutSec * 1000)) {
+        $null = cmd /c "taskkill /F /T /PID $($p.Id) 2>&1"
+        Log "EXIT $step=TIMEOUT after ${timeoutSec}s (process tree $($p.Id) ended)"
+        Fail "${step}_TIMEOUT" "$($a[0]) did not exit within ${timeoutSec}s"
+    }
+    $p.WaitForExit()
+    Log "EXIT $step=$($p.ExitCode) ($([int]((Get-Date) - $t0).TotalSeconds)s)"
     return $p.ExitCode
 }
 function Sha([string]$path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash }
@@ -84,6 +122,12 @@ $evidence = $null
 try {
     # ---------------------------------------------------------------- 1
     Log "== 1. PROVENANCE"
+    # One gate at a time: the lock is held (exclusive handle) until exit.
+    $lockPath = Join-Path $root 'release-evidence\gate.lock'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lockPath) | Out-Null
+    try { $script:Lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { Fail '0_GATE_ALREADY_RUNNING' "another release gate holds $lockPath" }
+    Log "GATE_LOCK=$lockPath (PID $PID)"
     if ($ExpectedHead -notmatch '^[0-9a-f]{40}$') { Fail '1_PROVENANCE' 'ExpectedHead must be a full 40-hex lowercase SHA' }
     $head = ((Git 'rev-parse HEAD') -join '').Trim()
     $short = $head.Substring(0, 12)
@@ -95,7 +139,7 @@ try {
     $evidence = Join-Path $root "release-evidence\v$version\gate_${stamp}_$short"
     New-Item -ItemType Directory -Force -Path $evidence | Out-Null
     $script:Log = Join-Path $evidence 'gate.log'
-    $script:LogBuffer | ForEach-Object { Add-Content -LiteralPath $script:Log -Value $_ -Encoding UTF8 }
+    $script:LogBuffer | ForEach-Object { Append-Line $script:Log $_ }
 
     Log "GATE_STARTED=$($started.ToString('yyyy-MM-dd HH:mm:ss'))"
     Log "GATE_SCRIPT=$PSCommandPath"
@@ -162,6 +206,7 @@ try {
         Native-Log 'cargo check --all-targets --color never' '4_CHECK'
         Log "CHECK=PASS"
         $testExit = Native ('cargo test --color never > "' + $testOutput + '" 2>&1')
+        Log "EXIT 4_TEST=$testExit"
         $results = @(Select-String -LiteralPath $testOutput -Pattern '^test result' | ForEach-Object { $_.Line })
         $results | ForEach-Object { Log $_ }
         $passed = 0; $failedTests = 0
@@ -196,7 +241,7 @@ try {
     # ---------------------------------------------------------------- 7
     Log "== 7. SENSOR PROBE"
     $sensors = Join-Path $evidence 'sensors.json'
-    if ((Run-Exe $exe @('--sensor-probe', "`"$sensors`"")) -ne 0) { Fail '7_SENSOR_PROBE' 'exit code' }
+    if ((Run-Exe $exe @('--sensor-probe', "`"$sensors`"") '7_SENSOR_PROBE' 300 -Hidden) -ne 0) { Fail '7_SENSOR_PROBE' 'exit code' }
     $j = Get-Content -Raw -LiteralPath $sensors | ConvertFrom-Json
     Log "SENSOR_STATUS=$($j.status) SENSOR_COUNT=$($j.sensor_count)"
     $j.providers | ForEach-Object { Log "PROVIDER $($_.provider) = $($_.status) | $($_.detail)" }
@@ -207,11 +252,11 @@ try {
     # ---------------------------------------------------------------- 8
     Log "== 8. INCIDENT + EVENT PROBE"
     $inc = Join-Path $evidence 'incidents.json'
-    if ((Run-Exe $exe @('--incident-probe', "`"$inc`"")) -ne 0) { Fail '8_INCIDENT_PROBE' 'exit code' }
+    if ((Run-Exe $exe @('--incident-probe', "`"$inc`"") '8_INCIDENT_PROBE' 900 -Hidden) -ne 0) { Fail '8_INCIDENT_PROBE' 'exit code' }
     $incTxt = Join-Path $evidence 'incidents.txt'
     Get-Content -LiteralPath $incTxt | ForEach-Object { Log $_ }
     $evDir = Join-Path $evidence 'events'
-    if ((Run-Exe $exe @('--evidence-probe', "`"$evDir`"")) -ne 0) { Fail '8_EVENT_PROBE' 'exit code' }
+    if ((Run-Exe $exe @('--evidence-probe', "`"$evDir`"") '8_EVENT_PROBE' 900 -Hidden) -ne 0) { Fail '8_EVENT_PROBE' 'exit code' }
     Get-Content -LiteralPath (Join-Path $evDir 'evidence_probe.txt') -TotalCount 40 -ErrorAction SilentlyContinue | ForEach-Object { Log $_ }
     $ev = Get-Content -Raw -LiteralPath (Join-Path $evDir 'Event_Evidence_probe.json') | ConvertFrom-Json
     Log "EVENT_SCOPE=$([bool]$ev.scope) ACTIONABLE_GROUPS=$(@($ev.actionable_groups).Count) COLLECTED_AT=$($ev.collected_at)"
@@ -221,7 +266,7 @@ try {
     # ---------------------------------------------------------------- 9
     Log "== 9. SMART PROBE"
     $smart = Join-Path $evidence 'smart.json'
-    $smartExit = Run-Exe $exe @('--smart-probe', "`"$smart`"")
+    $smartExit = Run-Exe $exe @('--smart-probe', "`"$smart`"") '9_SMART_PROBE' 600 -Hidden
     Get-Content -LiteralPath (Join-Path $evidence 'smart.txt') -ErrorAction SilentlyContinue | ForEach-Object { Log $_ }
     if ($smartExit -ne 0) { Fail '9_SMART_CONSISTENCY' "exit $smartExit" }
 
@@ -237,7 +282,7 @@ try {
     # ---------------------------------------------------------------- 11
     Log "== 11. CONSISTENCY (target)"
     $ct = Join-Path $evidence 'consistency_target.txt'
-    $ctExit = Run-Exe $exe @('--consistency-probe', "`"$ct`"")
+    $ctExit = Run-Exe $exe @('--consistency-probe', "`"$ct`"") '11_CONSISTENCY' 600 -Hidden
     Get-Content -LiteralPath $ct -ErrorAction SilentlyContinue | ForEach-Object { Log $_ }
     if ($ctExit -ne 0) { Fail '11_CONSISTENCY' "exit $ctExit" }
 
@@ -269,7 +314,7 @@ try {
     Log "FILE_VERSION=$($vi.FileVersion) PRODUCT_VERSION=$($vi.ProductVersion)"
     if ($vi.FileVersion -ne $version -or $vi.ProductVersion -ne $version) { Fail '14_FILE_VERSION' "$($vi.FileVersion)/$($vi.ProductVersion)" }
     $cd = Join-Path $evidence 'consistency_dist.txt'
-    $cdExit = Run-Exe $distExe @('--consistency-probe', "`"$cd`"")
+    $cdExit = Run-Exe $distExe @('--consistency-probe', "`"$cd`"") '14_DIST_CONSISTENCY' 600 -Hidden
     $cdText = Get-Content -Raw -Encoding UTF8 -LiteralPath $cd
     Get-Content -LiteralPath $cd | ForEach-Object { Log $_ }
     if ($cdExit -ne 0) { Fail '14_DIST_CONSISTENCY' "exit $cdExit" }
@@ -281,6 +326,7 @@ try {
     Log "== 15. MANIFEST / ELEVATION LEVELS"
     $mc = Join-Path $evidence 'manifest_check.txt'
     $mcExit = Native ('powershell -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $PSScriptRoot 'check_manifest.ps1') + '" -Root "' + $root + '" -TestOutput "' + $testOutput + '" -Dist "' + $distExe + '" > "' + $mc + '" 2>&1')
+    Log "EXIT 15_CHECK_MANIFEST=$mcExit"
     Get-Content -LiteralPath $mc | ForEach-Object { Log $_ }
     if (-not (Select-String -LiteralPath $mc -SimpleMatch 'DIST_EXECUTION_LEVEL=requireAdministrator' -Quiet)) { Fail '15_DIST_MANIFEST' 'dist is not requireAdministrator' }
     if ($mcExit -ne 0) { Fail '15_TEST_ELEVATION' "exit $mcExit" }
@@ -301,7 +347,7 @@ try {
     foreach ($s in $scenes.Keys) {
         $png = Join-Path $root "docs\visual\v${version}_$($scenes[$s]).png"
         if (Test-Path -LiteralPath $png) { Remove-Item -LiteralPath $png -Force }
-        [void](Run-Exe $distExe @('--visual-reference', '--scene', $s, '--capture', "`"$png`""))
+        [void](Run-Exe $distExe @('--visual-reference', '--scene', $s, '--capture', "`"$png`"") "17_RENDER_$($scenes[$s])" 180)
         if (-not (Test-Path -LiteralPath $png)) { Fail '17_RENDER' $scenes[$s] }
         Log "RENDER $($scenes[$s])=OK"
     }
@@ -332,16 +378,25 @@ try {
 catch {
     $msg = "$_"
     if ($msg -match '^GATE_STEP_FAILED\|([^|]+)\|(.*)$') { $script:Failed = $Matches[1]; $why = $Matches[2] }
-    else { $script:Failed = 'UNEXPECTED_ERROR'; $why = $msg }
+    else { $script:Failed = 'UNEXPECTED_ERROR'; $why = "$msg @ line $($_.InvocationInfo.ScriptLineNumber)" }
     if (-not $script:Log) {
-        $fallback = Join-Path $root "release-evidence\gate_${stamp}_preflight"
-        New-Item -ItemType Directory -Force -Path $fallback | Out-Null
-        $script:Log = Join-Path $fallback 'gate.log'
-        $script:LogBuffer | ForEach-Object { Add-Content -LiteralPath $script:Log -Value $_ -Encoding UTF8 }
+        try {
+            $fallback = Join-Path $root "release-evidence\gate_${stamp}_preflight"
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            $script:Log = Join-Path $fallback 'gate.log'
+            $script:LogBuffer | ForEach-Object { Append-Line $script:Log $_ }
+        } catch { Write-Host "PREFLIGHT LOG FAILED: $_" -ForegroundColor Red }
     }
     Log "FAILED_STEP=$($script:Failed)"
     Log "FAILED_REASON=$why"
     Log "GATE_RESULT=FAIL"
+    if ($script:Log) {
+        try {
+            @("GATE_COMMIT=$head", "FAILED_STEP=$($script:Failed)", "FAILED_REASON=$why",
+              "FINISHED=$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))", "GATE_RESULT=FAIL") |
+                Out-File -Encoding utf8 (Join-Path (Split-Path -Parent $script:Log) 'gate_summary.txt')
+        } catch { Write-Host "SUMMARY WRITE FAILED: $_" -ForegroundColor Red }
+    }
     Write-Host "GATE FAILED at $($script:Failed). Log: $($script:Log)" -ForegroundColor Red
     exit 1
 }
