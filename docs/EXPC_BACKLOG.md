@@ -14,3 +14,4 @@ Planned / observed only; nothing here is done unless `docs/EXPC_CHECKPOINT.md` s
 | P3 | EN UI: Driver Audit evidence linked from a crash dump is Russian text («дамп BSOD … указывает модуль …») | `crash_dump` → Driver Audit link reason (pre-v1.1); seen in the v1.1 driver-details EN render |
 | P3 | Live GUI acceptance of v1.1 (MSI desktop, real 125 / 150 % DPI, resize of the Passport 2.0 window, ⟳ / ReHash flows on a NO HASH machine) | offscreen QA only so far (protocol §6: NIGHT GUI GATE / user-scheduled) |
 | P3 | Hardware-Report WinForms viewer code stays in the embedded script (not shown since v1.1) | `embedded/Hardware-Report/Hardware-Diagnostic.ps1` `-WsdViewer` reply `SKIP`; remove in a later cleanup |
+| P3 | Test gap: the Passport 2.0 minimum-size test (420×300) renders the footer only, not the full window composition (body + footer-height feedback) | PR #4 Codex round 4 (P2, test coverage only; no functional defect found). Add a full-window render test |
