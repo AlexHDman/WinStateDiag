@@ -6,6 +6,412 @@
 use super::*;
 use crate::deep_checks::json;
 
+/// Exercises the native immediate-viewport callback with egui's real
+/// multi-pass runner, without creating an OS window or using a GPU.
+struct NativeDetailsHarness {
+    ctx: egui::Context,
+    state: std::rc::Rc<std::cell::RefCell<NativeDetailsState>>,
+}
+
+#[derive(Default)]
+struct NativeDetailsState {
+    input: egui::RawInput,
+    output: Option<egui::FullOutput>,
+    callbacks: usize,
+    force_discard: bool,
+}
+
+impl NativeDetailsHarness {
+    fn new() -> Self {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::install(&ctx);
+        ctx.set_embed_viewports(false);
+        let state = std::rc::Rc::new(std::cell::RefCell::new(NativeDetailsState::default()));
+        let shared = state.clone();
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let (mut input, force_discard) = {
+                let mut state = shared.borrow_mut();
+                (std::mem::take(&mut state.input), state.force_discard)
+            };
+            input.viewport_id = viewport.ids.this;
+            input.viewports.insert(
+                viewport.ids.this,
+                egui::ViewportInfo {
+                    parent: Some(viewport.ids.parent),
+                    inner_rect: input.screen_rect,
+                    ..Default::default()
+                },
+            );
+            let mut callbacks = 0;
+            let mut output = ctx.run_ui(input, |ui| {
+                callbacks += 1;
+                (viewport.viewport_ui_cb)(ui);
+                if force_discard && ui.ctx().current_pass_index() == 0 {
+                    ui.ctx().request_discard("Details regression: second pass");
+                }
+            });
+            output.textures_delta.clear();
+            let mut state = shared.borrow_mut();
+            state.callbacks = callbacks;
+            state.output = Some(output);
+        });
+        Self { ctx, state }
+    }
+
+    fn render(
+        &self,
+        size: egui::Vec2,
+        force_discard: bool,
+        events: Vec<egui::Event>,
+        mut draw: impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        {
+            let mut state = self.state.borrow_mut();
+            state.input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            };
+            state.force_discard = force_discard;
+            state.output = None;
+        }
+        let mut parent = self
+            .ctx
+            .run_ui(egui::RawInput::default(), |ui| draw(ui.ctx()));
+        parent.textures_delta.clear();
+        let mut output = self.state.borrow_mut().output.take().unwrap();
+        // Actions such as Copy are applied by the parent after the child
+        // callback returns. Inspect both outputs; no OS clipboard is used.
+        output
+            .platform_output
+            .commands
+            .extend(parent.platform_output.commands);
+        output
+    }
+}
+
+impl Drop for NativeDetailsHarness {
+    fn drop(&mut self) {
+        // The renderer is thread-local. Release the captured test state;
+        // later tests on this worker use embedded viewports by default.
+        egui::Context::set_immediate_viewport_renderer(|_, _| {
+            panic!("native Details test renderer is not installed")
+        });
+    }
+}
+
+fn native_texts(output: &egui::FullOutput) -> Vec<(String, Rect)> {
+    output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(t) => Some((
+                t.galley.text().to_string(),
+                clipped.shape.visual_bounding_rect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn detail_window_native_callback_renders_every_pass() {
+    let harness = NativeDetailsHarness::new();
+    let mut open = true;
+    for frame in 0..12 {
+        let mut result = None;
+        let output = harness.render(vec2(640.0, 520.0), true, vec![], |ctx| {
+            result = detail_window(
+                ctx,
+                "multipass",
+                "Details",
+                [640.0, 520.0],
+                &mut open,
+                |ui| {
+                    egui::Grid::new("multipass_grid").show(ui, |ui| {
+                        ui.label("persistent detail value");
+                        ui.end_row();
+                    });
+                    42
+                },
+            );
+        });
+        assert_eq!(harness.state.borrow().callbacks, 2, "frame {frame}");
+        assert_eq!(result, Some(42), "final callback result, frame {frame}");
+        assert!(
+            native_texts(&output)
+                .iter()
+                .any(|(t, _)| t == "persistent detail value"),
+            "final pass lost the content, frame {frame}"
+        );
+        assert!(open);
+    }
+}
+
+#[test]
+fn passport_native_repeated_render_preserves_every_card_and_copy() {
+    for lang in [Language::Ru, Language::En] {
+        let mut app = WinStateDiagApp::default();
+        app.language = lang;
+        app.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.into());
+        app.passport2_open = true;
+        let view = app.passport2_view().unwrap();
+        let d = i18n::t(lang);
+        let summary = crate::passport2::summary_text(&view, d);
+        assert_eq!(view.cards.len(), 8);
+        let harness = NativeDetailsHarness::new();
+        let size = vec2(1060.0, 2400.0);
+        let mut copy_pos = egui::Pos2::ZERO;
+        for frame in 0..16 {
+            // Natural Grid sizing passes first, then deliberately repeat
+            // every frame to ensure contents survive the final pass.
+            let output = harness.render(size, frame >= 4, vec![], |ctx| app.passport2_window(ctx));
+            let texts = native_texts(&output);
+            if frame >= 2 {
+                for card in &view.cards {
+                    for expected in std::iter::once(&card.title)
+                        .chain(card.rows.iter().map(|r| &r.value).filter(|v| !v.is_empty()))
+                    {
+                        assert!(
+                            texts.iter().any(|(t, _)| t == expected),
+                            "{lang:?}, frame {frame}, missing {expected}"
+                        );
+                        assert!(summary.contains(expected), "copy lacks {expected}");
+                    }
+                }
+                for button in [d.pp_refresh, d.pp_copy, d.pp_save, d.pp_close] {
+                    assert!(texts.iter().any(|(t, _)| t == button), "missing {button}");
+                }
+                copy_pos = texts
+                    .iter()
+                    .find(|(t, _)| t == d.pp_copy)
+                    .unwrap()
+                    .1
+                    .center();
+            }
+            assert_eq!(app.passport2_view().unwrap(), view);
+        }
+        harness.render(size, true, pointer_button(copy_pos, true), |ctx| {
+            app.passport2_window(ctx)
+        });
+        let copied = harness.render(size, true, pointer_button(copy_pos, false), |ctx| {
+            app.passport2_window(ctx)
+        });
+        let copies: Vec<_> = copied
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                egui::OutputCommand::CopyText(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies, vec![&summary], "one exact summary per click");
+        assert!(matches!(app.passport2_status, Some(ExportStatus::Copied)));
+        assert_eq!(app.passport2_view().unwrap(), view);
+        let close_pos = native_texts(&copied)
+            .iter()
+            .find(|(t, _)| t == d.pp_close)
+            .unwrap()
+            .1
+            .center();
+        harness.render(size, true, pointer_button(close_pos, true), |ctx| {
+            app.passport2_window(ctx)
+        });
+        harness.render(size, true, pointer_button(close_pos, false), |ctx| {
+            app.passport2_window(ctx)
+        });
+        assert!(!app.passport2_open, "Close survives a discarded pass");
+    }
+}
+
+fn pointer_button(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn passport_native_scroll_and_resize_keep_content_and_footer() {
+    let mut app = WinStateDiagApp::default();
+    app.language = Language::Ru;
+    app.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.into());
+    app.passport2_open = true;
+    let original = app.passport2_view().unwrap();
+    let summary = crate::passport2::summary_text(&original, &i18n::RU);
+    let harness = NativeDetailsHarness::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cpu_y = Vec::new();
+    for size in [vec2(640.0, 520.0), vec2(1060.0, 860.0), vec2(420.0, 300.0)] {
+        for frame in 0..24 {
+            let events = if frame >= 4 {
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(100.0, 55.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, if frame < 14 { -180.0 } else { 180.0 }),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                vec![]
+            };
+            let output = harness.render(size, true, events, |ctx| app.passport2_window(ctx));
+            let texts = native_texts(&output);
+            if frame >= 2 {
+                for button in [
+                    i18n::RU.pp_refresh,
+                    i18n::RU.pp_copy,
+                    i18n::RU.pp_save,
+                    i18n::RU.pp_close,
+                ] {
+                    let bounds = texts
+                        .iter()
+                        .find(|(t, _)| t == button)
+                        .unwrap_or_else(|| panic!("{size:?} frame {frame}: missing {button}"))
+                        .1;
+                    assert!(
+                        bounds.min.x >= 0.0
+                            && bounds.max.x <= size.x + 0.5
+                            && bounds.min.y >= 0.0
+                            && bounds.max.y <= size.y + 0.5,
+                        "{button}: {bounds:?} outside {size:?}"
+                    );
+                }
+            }
+            for clipped in &output.shapes {
+                if let egui::Shape::Text(t) = &clipped.shape {
+                    let bounds = clipped.shape.visual_bounding_rect();
+                    if clipped.clip_rect.intersects(bounds) {
+                        seen.insert(t.galley.text().to_string());
+                        if size.x == 640.0 && t.galley.text() == i18n::RU.pp_cpu {
+                            cpu_y.push(bounds.min.y);
+                        }
+                    }
+                }
+            }
+            assert_eq!(app.passport2_view().unwrap(), original);
+            assert_eq!(
+                crate::passport2::summary_text(&app.passport2_view().unwrap(), &i18n::RU),
+                summary
+            );
+        }
+    }
+    assert!(
+        cpu_y.windows(2).any(|ys| (ys[0] - ys[1]).abs() > 5.0),
+        "wheel input must actually scroll the body: {cpu_y:?}"
+    );
+    for card in &original.cards {
+        assert!(
+            seen.contains(&card.title),
+            "never visible while scrolling: {}",
+            card.title
+        );
+    }
+    // Return to a tall viewport after scrolling/resizing: every card's
+    // actual values must still render, not merely remain in the model.
+    let mut last = Vec::new();
+    for _ in 0..12 {
+        last = native_texts(&harness.render(vec2(1060.0, 2400.0), true, vec![], |ctx| {
+            app.passport2_window(ctx)
+        }));
+    }
+    for card in &original.cards {
+        for expected in std::iter::once(&card.title)
+            .chain(card.rows.iter().map(|r| &r.value).filter(|v| !v.is_empty()))
+        {
+            assert!(
+                last.iter().any(|(t, _)| t == expected),
+                "lost after resize: {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn other_details_native_windows_survive_repeated_layout_passes() {
+    let windows: [(&str, fn(&mut WinStateDiagApp, &egui::Context)); 8] = [
+        ("crypto-details", WinStateDiagApp::crypto_details_window),
+        ("driver-details", WinStateDiagApp::drivers_window),
+        ("disk-details", WinStateDiagApp::raw_passes_window),
+        ("crash-analyzer", WinStateDiagApp::crash_details_window),
+        ("sensor-details", WinStateDiagApp::sensors_details_window),
+        ("stage-details", WinStateDiagApp::stage_details_window),
+        ("expc", WinStateDiagApp::expc_details_window),
+        ("gpo", WinStateDiagApp::gpo_details_window),
+    ];
+    for (scene, draw) in windows {
+        let mut app = WinStateDiagApp::default();
+        app.language = Language::Ru;
+        app.seed_qa_scene(if scene == "expc" {
+            "stage-details"
+        } else {
+            scene
+        });
+        app.expc_details_open = true;
+        app.gpo_details_open = true;
+        let harness = NativeDetailsHarness::new();
+        let size = vec2(1400.0, 2400.0);
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            expected =
+                native_texts(&harness.render(size, false, vec![], |ctx| draw(&mut app, ctx)));
+        }
+        assert!(
+            expected
+                .iter()
+                .any(|(t, _)| t == i18n::RU.journal_viewer_close),
+            "{scene}: missing Close"
+        );
+        assert!(expected.len() > 1, "{scene}: no baseline contents");
+        for frame in 0..12 {
+            let output = harness.render(size, true, vec![], |ctx| draw(&mut app, ctx));
+            assert_eq!(harness.state.borrow().callbacks, 2);
+            let actual = native_texts(&output);
+            for (text, _) in &expected {
+                assert!(
+                    actual.iter().any(|(t, _)| t == text),
+                    "{scene}, frame {frame}, lost {text}"
+                );
+            }
+        }
+        let close_pos = expected
+            .iter()
+            .find(|(t, _)| t == i18n::RU.journal_viewer_close)
+            .unwrap()
+            .1
+            .center();
+        harness.render(size, true, pointer_button(close_pos, true), |ctx| {
+            draw(&mut app, ctx)
+        });
+        harness.render(size, true, pointer_button(close_pos, false), |ctx| {
+            draw(&mut app, ctx)
+        });
+        let still_open = match scene {
+            "crypto-details" => app.crypto_details_open,
+            "driver-details" => app.drivers_open,
+            "disk-details" => app.raw_passes_open,
+            "crash-analyzer" => app.crash_details_open,
+            "sensor-details" => app.sensors_details_open,
+            "stage-details" => app.stage_details.is_some(),
+            "expc" => app.expc_details_open,
+            "gpo" => app.gpo_details_open,
+            _ => unreachable!(),
+        };
+        assert!(
+            !still_open,
+            "{scene}: Close was lost during a repeated layout pass"
+        );
+    }
+}
+
 fn app_in(tag: &str) -> (WinStateDiagApp, PathBuf) {
     let exe = std::env::temp_dir()
         .join(format!("wsd-v11-{tag}-{}", std::process::id()))

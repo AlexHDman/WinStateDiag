@@ -302,9 +302,8 @@ pub(crate) fn detail_window<R>(
     title: &str,
     size: [f32; 2],
     open: &mut bool,
-    add: impl FnOnce(&mut egui::Ui) -> R,
+    mut add: impl FnMut(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    let mut add = Some(add);
     let builder = egui::ViewportBuilder::default()
         .with_title(title)
         .with_inner_size(size)
@@ -312,9 +311,9 @@ pub(crate) fn detail_window<R>(
         .with_resizable(true);
     let (out, close) =
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(key), builder, |ui, class| {
-            let Some(add) = add.take() else {
-                return (None, false);
-            };
+            // Native viewports may run multiple layout passes (e.g. a
+            // newly shown Grid requests discard). Render every pass:
+            // consuming a FnOnce here leaves the final pass empty.
             details_text_scale(ui.style_mut());
             if class == egui::ViewportClass::EmbeddedWindow {
                 return (Some(add(ui)), false);
@@ -5258,20 +5257,23 @@ impl WinStateDiagApp {
                 match &self.driver_audit {
                     DriverAuditState::Idle => {
                         ui.label(d.driver_not_run);
-                        rerun = ui.button(d.driver_popup_run).clicked();
+                        rerun |= ui.button(d.driver_popup_run).clicked();
                         history_act =
-                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report);
+                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report)
+                                .or(history_act);
                     }
                     DriverAuditState::Running(_) => {
                         ui.label(d.driver_popup_running);
                         history_act =
-                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report);
+                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report)
+                                .or(history_act);
                     }
                     DriverAuditState::Failed(msg) => {
                         ui.colored_label(c::RED_ERROR, msg);
-                        rerun = ui.button(d.driver_popup_retry).clicked();
+                        rerun |= ui.button(d.driver_popup_retry).clicked();
                         history_act =
-                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report);
+                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report)
+                                .or(history_act);
                     }
                     DriverAuditState::Done(base) => {
                         let report: &AuditReport = view.as_deref().unwrap_or(base);
@@ -5279,8 +5281,8 @@ impl WinStateDiagApp {
                         // (no date/time); the rule text lives in the Info tip.
                         let (header_rerun, header_export) =
                             driver_summary_header(ui, d, report, export_status.as_ref());
-                        rerun = header_rerun;
-                        export = header_export;
+                        rerun |= header_rerun;
+                        export = header_export.or(export);
                         ui.add_space(4.0);
                         ui.separator();
                         egui::ScrollArea::vertical()
@@ -5442,7 +5444,8 @@ impl WinStateDiagApp {
                                     &history,
                                     confirm_clear,
                                     has_report,
-                                );
+                                )
+                                .or(history_act);
                             });
                         // v1.0 standard action bar (this module's text only).
                         ui.separator();
@@ -6172,7 +6175,7 @@ impl WinStateDiagApp {
                 if let Some((t, col)) = &status {
                     ui.add(egui::Label::new(RichText::new(t).color(*col)).wrap());
                 }
-                act = details_action_bar(ui, d, true, Some(folder_ok));
+                act = details_action_bar(ui, d, true, Some(folder_ok)).or(act);
             },
         );
         match act {
@@ -8883,7 +8886,7 @@ impl WinStateDiagApp {
                 if let Some((t, col)) = &status {
                     ui.add(egui::Label::new(RichText::new(t).color(*col)).wrap());
                 }
-                act = details_action_bar(ui, d, !text.trim().is_empty(), Some(folder_ok));
+                act = details_action_bar(ui, d, !text.trim().is_empty(), Some(folder_ok)).or(act);
             },
         );
         match act {
@@ -9504,7 +9507,7 @@ impl WinStateDiagApp {
                 if let Some((t, col)) = &status {
                     ui.add(egui::Label::new(RichText::new(t).color(*col)).wrap());
                 }
-                act = details_action_bar(ui, d, !text.is_empty(), None);
+                act = details_action_bar(ui, d, !text.is_empty(), None).or(act);
             },
         );
         match act {
