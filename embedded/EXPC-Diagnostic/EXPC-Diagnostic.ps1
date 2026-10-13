@@ -1180,18 +1180,31 @@ function Get-ApplicationProcessIdentity {
     } elseif ($provider -eq 'Windows Error Reporting' -and $id -eq 1001) {
         # Bucket, EventType, EventName, Response, CabId, P1 .. P10.
         $eventName = & $at 2
-        if ($eventName -match '^(?i)(APPCRASH|BEX|BEX64|MoAppCrash|AppHang\w*|MoAppHang\w*|CLR20r3|APPCRASHEX)$') {
-            $app = & $at 5
-            if ($eventName -match '^(?i)CLR20r3$') { $module = & $at 8; $exception = & $at 13 }
-            elseif ($eventName -match '^(?i)(?:AppHang|MoAppHang)') { $exception = 'hang' }
-            else { $module = & $at 8; $exception = Format-ExceptionCode (& $at 11) }
-            if ($app) { $source = 'WER' }
-        } elseif (-not [string]::IsNullOrWhiteSpace($eventName)) {
-            # A WER report that is not about a user process (e.g.
-            # LiveKernelEvent, WindowsUpdateFailure): grouped by its kind.
+        # Schema-specific parameter maps (P1 = index 5 … P10 = index 14):
+        #   APPCRASH / MoAppCrash / APPCRASHEX: P1 app, P4 module, P7 exception
+        #   BEX / BEX64 / MoBEX:               P1 app, P4 module, P8 exception (P7 = offset)
+        #   CLR20r3:                           P1 app, P4 assembly, P9 exception type
+        #   AppHang* / MoAppHang*:             P1 app (a hang, no exception)
+        if ($eventName -match '^(?i)(APPCRASH|APPCRASHEX|MoAppCrash)$') {
+            $app = & $at 5; $module = & $at 8; $exception = Format-ExceptionCode (& $at 11)
+        } elseif ($eventName -match '^(?i)(BEX|BEX64|MoBEX)$') {
+            $app = & $at 5; $module = & $at 8; $exception = Format-ExceptionCode (& $at 12)
+        } elseif ($eventName -match '^(?i)CLR20r3$') {
+            $app = & $at 5; $module = & $at 8; $exception = & $at 13
+        } elseif ($eventName -match '^(?i)(AppHang\w*|MoAppHang\w*)$') {
+            $app = & $at 5; $exception = 'hang'
+        } elseif ($eventName -match '^(?i)(LiveKernelEvent|BlueScreen|WindowsUpdateFailure\d*|WindowsWcpOtherFailure\d*|StoreAgent\w+|PnPDriverImportError|PnPDeviceProblemCode|AppxDeploymentFailureBlue)$') {
+            # Known WER kinds that are not about a user process: grouped by
+            # their kind.
             $app = 'WER:' + $eventName
-            $source = 'WER'
+        } else {
+            # An unknown schema: only a P1 that is clearly an executable
+            # names the process; otherwise the event keeps its own identity
+            # (UNRESOLVED#RecordId below) — never merged by event name.
+            $p1 = & $at 5
+            if ($p1 -match '(?i)\.exe$') { $app = $p1 }
         }
+        if ($app) { $source = 'WER' }
     } elseif ($provider -eq '.NET Runtime' -and $id -eq 1026) {
         $text = (($v -join "`n") + "`n" + $Message)
         $m = [regex]::Match($text, '(?im)^\s*(?:Application|Приложение):\s*(\S+)')
@@ -1208,7 +1221,7 @@ function Get-ApplicationProcessIdentity {
             if ($m.Success) { $app = $m.Groups[1].Value.Trim(); $source = 'Message' }
         }
         if (-not $app) {
-            $m = [regex]::Match($Message, '(?im)^\s*P1:\s*(\S+)')
+            $m = [regex]::Match($Message, '(?im)^\s*P1:\s*(\S+\.exe)\s*$')
             if ($m.Success) { $app = $m.Groups[1].Value.Trim(); $source = 'Message' }
         }
     }

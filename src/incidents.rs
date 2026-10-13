@@ -73,7 +73,9 @@ impl LiveKernelReport {
     /// root is named `<KIND>-<date>-<time>.dmp`.
     pub fn kind(&self) -> String {
         let path = self.path.replace('/', "\\");
-        let lower = path.to_lowercase();
+        // ASCII-only folding keeps byte offsets valid for slicing `path`
+        // (Unicode lowercasing can change the length of a non-ASCII path).
+        let lower = path.to_ascii_lowercase();
         if let Some(i) = lower.find("\\livekernelreports\\") {
             let rel = &path[i + "\\livekernelreports\\".len()..];
             let parts: Vec<&str> = rel.split('\\').filter(|p| !p.is_empty()).collect();
@@ -947,6 +949,15 @@ pub(crate) mod tests {
         assert_eq!(r[0].kind(), "WATCHDOG");
         assert_eq!(r[1].kind(), "WATCHDOG", "subfolder `old` is still WATCHDOG");
         assert_eq!(r[2].kind(), "USBHUB3", "root file: kind from the name");
+        // A non-ASCII path whose Unicode lowercase changes length.
+        let odd = LiveKernelReport {
+            name: "x.dmp".into(),
+            folder: "NDIS".into(),
+            size: 1,
+            time: "2026-10-01T10:00:00".into(),
+            path: "C:\\\u{130}\u{130}\\LiveKernelReports\\NDIS\\x.dmp".into(),
+        };
+        assert_eq!(odd.kind(), "NDIS");
         assert_eq!(same_name_objects(&r[0], &r), 2);
         assert_eq!(same_name_objects(&r[2], &r), 1);
         // Grouping by kind: one WATCHDOG group with BOTH objects.

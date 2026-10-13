@@ -1750,6 +1750,9 @@ enum CryptoEvent {
 #[derive(Default)]
 struct CrashState {
     inventory: Option<Result<crash_dump::Inventory, String>>,
+    /// v1.0 evidence fix: the SessionId whose scan collected `inventory`
+    /// (a later analysis of the cached listing never re-labels it).
+    inventory_session: Option<String>,
     analyses: Vec<crash_dump::DumpAnalysis>,
     busy: CrashBusy,
     /// v1.0 live stage of the running analysis.
@@ -6538,6 +6541,10 @@ impl WinStateDiagApp {
             }
             CrashMsg::Inventory(inv) => {
                 self.crash.inventory = Some(inv);
+                // The scan reports into the package it claimed at start.
+                self.crash.inventory_session = report_package::lock(&self.package_of("crash"))
+                    .session()
+                    .map(|s| s.session_id.clone());
                 // v1.0 installer: winget said "installed" → the re-scan
                 // confirms the analyzer (or reports what is still missing).
                 if self.crash.install == InstallState::Verifying {
@@ -6582,14 +6589,13 @@ impl WinStateDiagApp {
             return;
         };
         let verdicts = crash_dump::incident_verdicts(inv, &self.crash.analyses);
-        let session = report_package::lock(&self.package_of("crash"))
-            .session()
-            .map(|s| s.session_id.clone());
+        // The session that OBSERVED the listing (its scan), not the session
+        // a later analysis of the cached inventory reports into.
         let json = incidents::to_json_in_session(
             &verdicts,
             inv.unexpected_shutdowns.max(inv.incidents.len()),
             &inv.live_kernel_reports,
-            session.as_deref(),
+            self.crash.inventory_session.as_deref(),
         );
         let d = i18n::t(self.language);
         if let Some((_, v)) = verdicts.first() {

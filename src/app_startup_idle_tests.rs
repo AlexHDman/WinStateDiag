@@ -889,3 +889,46 @@ fn session_journal_line_is_localized() {
         let _ = std::fs::remove_dir_all(exe.parent().unwrap());
     }
 }
+
+/// v1.0 evidence fix (PR #3 review): a crash inventory scanned in session
+/// A and analyzed after a new session B opened keeps A as the session that
+/// observed its LiveKernelReports listing.
+#[test]
+fn cached_crash_inventory_keeps_its_observing_session() {
+    let (mut app, exe) = app_in("lkr-session");
+    app.client_name = "Client A".into();
+    app.begin_operation(false);
+    app.claim_package("crash");
+    let a = session(&app).expect("session A").session_id;
+    let inv = crash_dump::Inventory {
+        bugchecks: Vec::new(),
+        dumps: Vec::new(),
+        debugger: crash_dump::DebuggerStatus::NotInstalled,
+        notes: Vec::new(),
+        unexpected_shutdowns: 0,
+        incidents: Vec::new(),
+        live_kernel_reports: vec![incidents::LiveKernelReport {
+            name: "WATCHDOG-20261004-2057.dmp".into(),
+            folder: "WATCHDOG".into(),
+            size: 524288,
+            time: "2026-10-04T20:57:30".into(),
+            path: r"C:\Windows\LiveKernelReports\WATCHDOG\WATCHDOG-20261004-2057.dmp".into(),
+        }],
+    };
+    app.accept_crash_msg(CrashMsg::Inventory(Ok(inv)));
+    // Another client: a new session B; the analysis claims it.
+    app.client_name = "Client B".into();
+    app.begin_operation(false);
+    app.claim_package("crash");
+    let b = session(&app).expect("session B").session_id;
+    assert_ne!(a, b);
+    app.contribute_incidents();
+    let entries = report_package::read_zip(&zip_of(&app)).unwrap();
+    let e = entries
+        .iter()
+        .find(|e| e.name.starts_with(incidents::EVIDENCE_PREFIX))
+        .expect("Incidents evidence");
+    let v = json::parse(std::str::from_utf8(&e.bytes).unwrap()).unwrap();
+    assert_eq!(str_of(&v, "observed_in_session"), a);
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
