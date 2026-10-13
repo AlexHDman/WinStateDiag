@@ -210,7 +210,8 @@ fn expc_violet_focus_only_while_a_stage_really_runs() {
 
 #[test]
 fn every_details_window_is_a_large_resizable_viewport_with_the_action_bar() {
-    let src = include_str!("app.rs");
+    // Sources may be checked out with CRLF (core.autocrlf): slice on LF.
+    let src = &include_str!("app.rs").replace("\r\n", "\n");
     // The shared helper: real OS viewport, resizable, min size.
     let helper = &src[src.find("pub(crate) fn detail_window<R>(").unwrap()..];
     let helper = &helper[..helper.find("\n}\n").unwrap()];
