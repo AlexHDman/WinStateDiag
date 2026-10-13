@@ -9,13 +9,19 @@
 //! COMPLETED session of the same physical disk and the session being
 //! completed now:
 //!
-//! * `FIRST_COMPLETED` — no earlier completed session for this disk;
+//! * `FIRST_COMPLETED` — no earlier completed session for this disk
+//!                       (`baseline: NO_BASELINE`);
 //! * `STABLE`          — the counter did not change;
 //! * `DELTA`           — the counter grew (a fact with the exact numbers,
 //!                       never a failure verdict by itself);
 //! * `COUNTER_RESET`   — the counter went down (firmware reset / different
 //!                       drive behind the same identity) — no delta claimed;
 //! * `UNKNOWN`         — a value is missing on either side.
+//!
+//! STABLE / DELTA / COUNTER_RESET are comparisons: each carries the id of
+//! the COMPLETED session it was measured against. A comparison without
+//! that id is never reported — it becomes FIRST_COMPLETED / NO_BASELINE
+//! (`ErrorLogDelta::with_baseline_guard`).
 //!
 //! Stored as `Reports\WinStateDiag_StorageHistory.json` (UTF-8, local
 //! only, no serial numbers — the physical identity the evidence already
@@ -71,6 +77,7 @@ pub enum ErrorLogDelta {
     FirstCompleted,
     Stable {
         value: u64,
+        previous_session: String,
     },
     Delta {
         previous: u64,
@@ -80,6 +87,7 @@ pub enum ErrorLogDelta {
     CounterReset {
         previous: u64,
         current: u64,
+        previous_session: String,
     },
     Unknown,
     /// The history file could not be read / parsed: no baseline is
@@ -99,28 +107,66 @@ impl ErrorLogDelta {
         }
     }
 
-    /// The COMPLETED session the delta was measured against.
+    /// The COMPLETED session the comparison was measured against (every
+    /// comparison carries one; a blank id counts as none).
     pub fn previous_session(&self) -> Option<&str> {
         match self {
-            ErrorLogDelta::Delta {
+            ErrorLogDelta::Stable {
                 previous_session, ..
-            } => Some(previous_session),
+            }
+            | ErrorLogDelta::Delta {
+                previous_session, ..
+            }
+            | ErrorLogDelta::CounterReset {
+                previous_session, ..
+            } => Some(previous_session.as_str()).filter(|s| !s.trim().is_empty()),
             _ => None,
+        }
+    }
+
+    /// STABLE / DELTA / COUNTER_RESET compare against a baseline.
+    pub fn is_comparison(&self) -> bool {
+        matches!(
+            self,
+            ErrorLogDelta::Stable { .. }
+                | ErrorLogDelta::Delta { .. }
+                | ErrorLogDelta::CounterReset { .. }
+        )
+    }
+
+    /// v1.0 evidence fix: a comparison without a previous COMPLETED
+    /// session is not a comparison — it is reported as FIRST_COMPLETED
+    /// (`baseline: NO_BASELINE`), never as STABLE.
+    pub fn with_baseline_guard(self) -> ErrorLogDelta {
+        if self.is_comparison() && self.previous_session().is_none() {
+            ErrorLogDelta::FirstCompleted
+        } else {
+            self
+        }
+    }
+
+    /// `COMPLETED_SESSION` when a baseline anchors the result,
+    /// `NO_BASELINE` for FIRST_COMPLETED, `NOT_COMPARED` otherwise.
+    pub fn baseline_code(&self) -> &'static str {
+        match self {
+            ErrorLogDelta::FirstCompleted => "NO_BASELINE",
+            d if d.previous_session().is_some() => "COMPLETED_SESSION",
+            _ => "NOT_COMPARED",
         }
     }
 
     pub fn text(&self, ru: bool) -> String {
         match (self, ru) {
             (ErrorLogDelta::FirstCompleted, true) => {
-                "Журнал ошибок NVMe: первая завершённая сессия для этого диска — сравнивать не с чем".into()
+                "Журнал ошибок NVMe: NO BASELINE — первая завершённая сессия для этого диска, сравнивать не с чем".into()
             }
             (ErrorLogDelta::FirstCompleted, false) => {
-                "NVMe error log: first completed session for this disk — nothing to compare".into()
+                "NVMe error log: NO BASELINE — first completed session for this disk, nothing to compare".into()
             }
-            (ErrorLogDelta::Stable { value }, true) => {
+            (ErrorLogDelta::Stable { value, .. }, true) => {
                 format!("Журнал ошибок NVMe: без изменений с прошлой завершённой сессии ({value})")
             }
-            (ErrorLogDelta::Stable { value }, false) => {
+            (ErrorLogDelta::Stable { value, .. }, false) => {
                 format!("NVMe error log: unchanged since the last completed session ({value})")
             }
             (ErrorLogDelta::Delta { previous, current, .. }, true) => format!(
@@ -131,10 +177,10 @@ impl ErrorLogDelta {
                 "NVMe error log: +{} since the last completed session ({previous} → {current}) — a fact, not a failure",
                 current - previous
             ),
-            (ErrorLogDelta::CounterReset { previous, current }, true) => format!(
+            (ErrorLogDelta::CounterReset { previous, current, .. }, true) => format!(
                 "Журнал ошибок NVMe: счётчик уменьшился ({previous} → {current}) — сброс, прирост не оценивается"
             ),
-            (ErrorLogDelta::CounterReset { previous, current }, false) => format!(
+            (ErrorLogDelta::CounterReset { previous, current, .. }, false) => format!(
                 "NVMe error log: counter decreased ({previous} → {current}) — reset, no delta claimed"
             ),
             (ErrorLogDelta::Unknown, true) => "Журнал ошибок NVMe: сравнение невозможно (нет значения)".into(),
@@ -172,19 +218,25 @@ pub fn delta(previous: Option<&SessionRecord>, current: Option<u64>) -> ErrorLog
     let Some(prev) = previous else {
         return ErrorLogDelta::FirstCompleted;
     };
+    let previous_session = prev.session_id.clone();
     match (prev.error_log_entries, current) {
-        (Some(p), Some(c)) if c == p => ErrorLogDelta::Stable { value: c },
+        (Some(p), Some(c)) if c == p => ErrorLogDelta::Stable {
+            value: c,
+            previous_session,
+        },
         (Some(p), Some(c)) if c > p => ErrorLogDelta::Delta {
             previous: p,
             current: c,
-            previous_session: prev.session_id.clone(),
+            previous_session,
         },
         (Some(p), Some(c)) => ErrorLogDelta::CounterReset {
             previous: p,
             current: c,
+            previous_session,
         },
         _ => ErrorLogDelta::Unknown,
     }
+    .with_baseline_guard()
 }
 
 /// v1.0: the delta of the session being completed now against the latest
@@ -461,10 +513,78 @@ mod tests {
             Some(7816),
         )];
         let prev = latest_completed(&h, "PHYS#Samsung SSD 980 1TB#IDX0", "S2");
+        let d = delta(prev, Some(7816));
         assert_eq!(
-            delta(prev, Some(7816)),
-            ErrorLogDelta::Stable { value: 7816 }
+            d,
+            ErrorLogDelta::Stable {
+                value: 7816,
+                previous_session: "S1".into()
+            }
         );
+        // STABLE names the session it was compared with.
+        assert_eq!(d.previous_session(), Some("S1"));
+        assert_eq!(d.baseline_code(), "COMPLETED_SESSION");
+    }
+
+    /// v1.0 evidence fix (MSI live): `error_log_delta.code = STABLE` with
+    /// `previous_completed_session = null`. A comparison without the
+    /// previous COMPLETED session is NO BASELINE / FIRST_COMPLETED.
+    #[test]
+    fn stable_without_previous_completed_session_is_no_baseline() {
+        let disk = "PHYS#Samsung SSD 980 1TB#IDX0";
+        // Nothing completed before: never STABLE, whatever the value.
+        let d = delta_against_history(&[], disk, "NOW", Some(7816));
+        assert_eq!(d.code(), "FIRST_COMPLETED");
+        assert_eq!(d.baseline_code(), "NO_BASELINE");
+        assert_eq!(d.previous_session(), None);
+        assert!(d.text(true).contains("NO BASELINE"), "{}", d.text(true));
+        assert!(d.text(false).contains("NO BASELINE"));
+        // A baseline record without a session id cannot anchor STABLE.
+        let blank = rec(
+            "  ",
+            "2026-10-01T10:00:00",
+            SessionStatus::Completed,
+            Some(7816),
+        );
+        let d = delta_against_history(&[blank], disk, "NOW", Some(7816));
+        assert_eq!(d.code(), "FIRST_COMPLETED", "{d:?}");
+        // A hand-built comparison without the id is downgraded too.
+        for d in [
+            ErrorLogDelta::Stable {
+                value: 3,
+                previous_session: String::new(),
+            },
+            ErrorLogDelta::Delta {
+                previous: 1,
+                current: 3,
+                previous_session: " ".into(),
+            },
+            ErrorLogDelta::CounterReset {
+                previous: 5,
+                current: 3,
+                previous_session: String::new(),
+            },
+        ] {
+            assert_eq!(d.with_baseline_guard(), ErrorLogDelta::FirstCompleted);
+        }
+        // Results that are not comparisons are left alone.
+        assert_eq!(
+            ErrorLogDelta::Unknown.with_baseline_guard(),
+            ErrorLogDelta::Unknown
+        );
+        assert_eq!(ErrorLogDelta::Unknown.baseline_code(), "NOT_COMPARED");
+        // Every comparison produced from real history names its session.
+        let h = vec![rec(
+            "S1",
+            "2026-10-01T10:00:00",
+            SessionStatus::Completed,
+            Some(10),
+        )];
+        for now in [10, 12, 4] {
+            let d = delta_against_history(&h, disk, "NOW", Some(now));
+            assert!(d.is_comparison(), "{d:?}");
+            assert_eq!(d.previous_session(), Some("S1"), "{d:?}");
+        }
     }
 
     #[test]

@@ -2088,6 +2088,10 @@ pub struct WinStateDiagApp {
     crypto: Option<cryptopro::HashState>,
     crypto_detection: cryptopro::Detection,
     crypto_rx: Option<Receiver<CryptoEvent>>,
+    /// v1.0: read-only startup inventory (presence / version / licence),
+    /// registry only; the HASH check stays with the diagnostic.
+    crypto_inventory: Option<cryptopro::Inventory>,
+    crypto_inventory_rx: Option<Receiver<cryptopro::Inventory>>,
     driver_audit: DriverAuditState,
     drivers_open: bool,
     /// v0.4.4: active page (Diagnostics / Hardware).
@@ -2271,6 +2275,8 @@ impl Default for WinStateDiagApp {
             crypto: None,
             crypto_detection: cryptopro::Detection::NotInstalled,
             crypto_rx: None,
+            crypto_inventory: None,
+            crypto_inventory_rx: None,
             driver_audit: DriverAuditState::Idle,
             drivers_open: false,
             page: Page::Diagnostics,
@@ -2338,8 +2344,11 @@ impl Default for WinStateDiagApp {
         // user action (Start, or a module's own button).
         //
         // The only launch work: the SSD/NVMe disk selector is filled in the
-        // background (see `enumerate_disk_selector`).
+        // background (see `enumerate_disk_selector`), and the read-only
+        // CryptoPro inventory (registry only: presence, version, licence;
+        // no process, no HASH check, never ReHash).
         app.enumerate_disk_selector();
+        app.read_crypto_inventory();
         if app.reference.is_some() {
             app.client_name = fixture::CLIENT_NAME.into();
             app.computer_name = fixture::COMPUTER_NAME.into();
@@ -3917,6 +3926,33 @@ impl WinStateDiagApp {
     // CryptoPro (read-only check; ReHash only after confirmation)
     // -----------------------------------------------------------------
 
+    /// v1.0: automatic read-only CryptoPro inventory at launch. It is not a
+    /// diagnostic collector: registry reads only, no subprocess, no report.
+    fn read_crypto_inventory(&mut self) {
+        if self.reference.is_some() || cfg!(test) || self.crypto_inventory_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(cryptopro::inventory(&cryptopro::SystemRegistry));
+        });
+        self.crypto_inventory_rx = Some(rx);
+    }
+
+    fn poll_crypto_inventory(&mut self) {
+        let Some(rx) = &self.crypto_inventory_rx else {
+            return;
+        };
+        let Ok(inv) = rx.try_recv() else {
+            return;
+        };
+        self.crypto_inventory_rx = None;
+        for line in inv.journal() {
+            push_journal(&mut self.journal, line);
+        }
+        self.crypto_inventory = Some(inv);
+    }
+
     fn start_crypto_check(&mut self) {
         self.request_collector("cryptopro");
         if self.reference.is_some() || cfg!(test) || self.crypto_rx.is_some() {
@@ -3957,6 +3993,7 @@ impl WinStateDiagApp {
     }
 
     fn poll_crypto(&mut self) {
+        self.poll_crypto_inventory();
         let Some(rx) = &self.crypto_rx else {
             return;
         };
@@ -3984,7 +4021,15 @@ impl WinStateDiagApp {
     fn crypto_vm(&self) -> CryptoVm {
         match &self.crypto {
             None if self.crypto_rx.is_some() => CryptoVm::Checking,
-            // v1.0 Startup Idle: checked with the diagnostic, not at launch.
+            // v1.0: the startup inventory proved CryptoPro CSP is absent.
+            None if self
+                .crypto_inventory
+                .as_ref()
+                .is_some_and(|i| !i.installed()) =>
+            {
+                CryptoVm::NotInstalled
+            }
+            // v1.0 Startup Idle: the HASH is checked with the diagnostic.
             None => CryptoVm::NotChecked,
             Some(cryptopro::HashState::HashOk) => CryptoVm::HashOk,
             Some(cryptopro::HashState::NoHash) => CryptoVm::NoHash,
@@ -6537,10 +6582,14 @@ impl WinStateDiagApp {
             return;
         };
         let verdicts = crash_dump::incident_verdicts(inv, &self.crash.analyses);
-        let json = incidents::to_json(
+        let session = report_package::lock(&self.package_of("crash"))
+            .session()
+            .map(|s| s.session_id.clone());
+        let json = incidents::to_json_in_session(
             &verdicts,
             inv.unexpected_shutdowns.max(inv.incidents.len()),
             &inv.live_kernel_reports,
+            session.as_deref(),
         );
         let d = i18n::t(self.language);
         if let Some((_, v)) = verdicts.first() {
@@ -8177,10 +8226,11 @@ impl WinStateDiagApp {
                                             .iter()
                                             .take(8)
                                             .map(|r| format!(
-                                                "{}\\{} ({})",
+                                                "{}\\{} ({}, {} B)",
                                                 r.folder,
                                                 r.name,
-                                                r.time.replace('T', " ")
+                                                r.time.replace('T', " "),
+                                                r.size
                                             ))
                                             .collect::<Vec<_>>()
                                             .join(" · ")
@@ -9269,6 +9319,7 @@ impl eframe::App for WinStateDiagApp {
         }
         if self.is_running()
             || self.crypto_rx.is_some()
+            || self.crypto_inventory_rx.is_some()
             || matches!(self.hardware, HardwareViewState::Collecting { .. })
             || self.benchmark_is_running()
             || self.nvme_rx.is_some()

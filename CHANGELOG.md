@@ -2,6 +2,27 @@
 
 ## [1.0] - unreleased - v1.0 Stable candidate (master consolidation, evidence intelligence, live fixes)
 
+### v1.0 Evidence fixes + Power Telemetry research (2026-10-13)
+- **NVMe error-log history:** STABLE, DELTA and COUNTER_RESET now carry the previous COMPLETED session they compare against. The evidence (`error_log_delta`) adds `baseline`: `COMPLETED_SESSION` / `NO_BASELINE` / `NOT_COMPARED`. A comparison without that session is reported as FIRST_COMPLETED / NO BASELINE, never as STABLE with `previous_completed_session = null`.
+- **LiveKernelReports:**
+  - A report object is identified by full path + size + time. The same file name with another size, folder or time stays a separate object. It gets its own `report_id`, `kind`, `size` and `same_name_objects`.
+  - The kind comes from the first folder below `LiveKernelReports`, so `WATCHDOG\old\…` counts as WATCHDOG.
+  - `Incidents_*.json` records `observed_in_session`.
+  - Signals and Details show the size.
+- **Application Summary:**
+  - The process identity comes from EventData, independent of the UI language:
+    - Application Error 1000: app / module / exception;
+    - Application Hang 1002;
+    - WER 1001: P1 / P4 / P7, and P9 for CLR20r3; a non-process WER report is grouped by its event name;
+    - .NET 1026: Application / Exception Info.
+  - The localized message is a fallback only.
+  - An unidentified event is its own group («неопознанный процесс (Provider Id)»), never a shared "-" group.
+- **CryptoPro at startup:**
+  - An automatic read-only inventory reads presence, version and licence key (masked: `5050Z-*****`) from the registry only. No process is started.
+  - The licence term is reported as НЕ ОПРЕДЕЛЁН: Windows has no documented read-only source for it.
+  - The HASH check (cpverify) still runs with the diagnostic. ReHash is never automatic. All other modules stay IDLE.
+- **Power Telemetry research** (no production change): `research/power_telemetry/` has the read-only probe, the MSI coverage matrix, the security / licensing audit and a Power Backend proposal.
+
 ### v1.0 Startup Idle / Client Identity microfix (2026-10-13)
 - **Startup Idle:** a launch no longer starts the Driver Audit, the CryptoPro check, or the crash-inventory, sensor, passport and ATA SMART reads, and creates no report folder, session or ZIP. The initial state is IDLE / «Ожидание запуска». The cards show honest idle states: «Проверка драйверов не запускалась», CryptoPro «НЕ ПРОВЕРЕНО». Only the SSD/NVMe disk selector is filled at launch. It runs in the background with in-process device queries: no subprocess, no SMART, nothing written. The writability probe moved to the explicit benchmark start.
 - The start-up log moved to `Reports\Logs\startup_graphics.log`. Each session copies a snapshot of it into its own report.
