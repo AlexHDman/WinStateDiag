@@ -23,6 +23,7 @@ mod incidents;
 mod manifest;
 mod nvme_health;
 mod passport;
+mod passport2;
 mod power;
 mod ps_exec;
 mod report_package;

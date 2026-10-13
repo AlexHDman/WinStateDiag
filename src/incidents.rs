@@ -197,6 +197,19 @@ impl Confidence {
             Confidence::Low => "LOW",
         }
     }
+
+    /// v1.1: «средняя (MEDIUM)».
+    pub fn label(self, ru: bool) -> String {
+        let word = match (self, ru) {
+            (Confidence::High, true) => "высокая",
+            (Confidence::High, false) => "high",
+            (Confidence::Medium, true) => "средняя",
+            (Confidence::Medium, false) => "medium",
+            (Confidence::Low, true) => "низкая",
+            (Confidence::Low, false) => "low",
+        };
+        format!("{word} ({})", self.code())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +251,56 @@ impl DumpCause {
 
 impl Verdict {
     /// "HANG CONFIRMED / BSOD NOT REGISTERED / CAUSE NOT DETERMINED".
+    /// v1.1: the headline for a person — words in the UI language with
+    /// the canonical identifiers kept in brackets («зависание не
+    /// подтверждено (HANG NOT CONFIRMED)»). `headline()` stays canonical
+    /// for evidence and probes.
+    pub fn headline_localized(&self, ru: bool) -> String {
+        let pick = |a: &str, b: &str| if ru { a.to_string() } else { b.to_string() };
+        let hang = if self.hang_confirmed {
+            format!(
+                "{} (HANG CONFIRMED)",
+                pick("зависание подтверждено", "hang confirmed")
+            )
+        } else {
+            format!(
+                "{} (HANG NOT CONFIRMED)",
+                pick("зависание не подтверждено", "hang not confirmed")
+            )
+        };
+        let bsod = if self.bsod_registered {
+            format!(
+                "{} (BSOD REGISTERED)",
+                pick("BSOD зарегистрирован", "BSOD registered")
+            )
+        } else {
+            format!(
+                "{} (BSOD NOT REGISTERED)",
+                pick("BSOD не зарегистрирован", "BSOD not registered")
+            )
+        };
+        let cause = match (&self.dump_cause, self.subsystem) {
+            (Some(d), _) => format!(
+                "{} {} ({}, {})",
+                pick("вероятный драйвер", "probable driver"),
+                d.label(),
+                d.confidence,
+                pick("анализ дампа", "dump analysis")
+            ),
+            (None, Some(s)) => format!(
+                "{} {} ({})",
+                pick("вероятная подсистема", "probable subsystem"),
+                s.code(),
+                self.confidence.label(ru)
+            ),
+            (None, None) => format!(
+                "{} (CAUSE NOT DETERMINED)",
+                pick("причина не определена", "cause not determined")
+            ),
+        };
+        format!("{hang} / {bsod} / {cause}")
+    }
+
     pub fn headline(&self) -> String {
         format!(
             "{} / {} / {}",
@@ -541,8 +604,6 @@ pub fn parse_live_kernel_reports(v: Option<&json::Value>) -> Vec<LiveKernelRepor
 /// crash inventory, Incidents.json and the crash Details.
 pub const WINDOW_DAYS: u32 = 30;
 pub const COUNTING_RULE: &str = "one unexpected shutdown = one boot: Kernel-Power 41 and EventLog 6008 logged within 15 minutes are one incident; BugCheck = WER 1001 or Kernel-Power 41 with a non-zero code, deduplicated within 15 minutes";
-/// Incidents with full event timelines (the count above is the total).
-pub const MAX_LISTED_INCIDENTS: usize = 5;
 
 pub fn to_json(
     incidents: &[(Incident, Verdict)],

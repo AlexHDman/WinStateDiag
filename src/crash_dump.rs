@@ -674,6 +674,11 @@ pub struct ParsedAnalysis {
     pub symbol_name: Option<String>,
     pub stack_text: Vec<String>,
     pub symbol_errors: Vec<String>,
+    /// v1.1: WinDbg itself shortens PROCESS_NAME to the 14 characters of
+    /// the kernel's image-name field (e.g. `RvControlSvc.e`); the parser
+    /// never cuts it further. True when the debugger's short form is all
+    /// the dump text offers (no full `….exe` name to restore it from).
+    pub process_name_truncated: bool,
 }
 
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -823,7 +828,99 @@ pub fn parse_analyze_output(text: &str) -> ParsedAnalysis {
         }
         i += 1;
     }
+    // v1.1: a verdict field present ANYWHERE in the raw text (a prompt or
+    // other prefix before the key, a second block) is never left empty.
+    for (slot, key) in [
+        (&mut p.module_name, "MODULE_NAME"),
+        (&mut p.image_name, "IMAGE_NAME"),
+        (&mut p.process_name, "PROCESS_NAME"),
+    ] {
+        if slot.is_none() {
+            *slot = raw_field(&lines, key);
+        }
+    }
+    if let Some(name) = p.process_name.clone() {
+        let (full, truncated) = restore_process_name(&name, &lines);
+        p.process_name = Some(full);
+        p.process_name_truncated = truncated;
+    }
     p
+}
+
+/// The value of `KEY:` anywhere in a line (the key must start a word).
+fn raw_field(lines: &[String], key: &str) -> Option<String> {
+    lines.iter().find_map(|l| {
+        let mut from = 0;
+        while let Some(rel) = l[from..].find(key) {
+            let at = from + rel;
+            let before_ok = l[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+            if before_ok && let Some(v) = field(&l[at..], key) {
+                return Some(v.to_string());
+            }
+            from = at + key.len();
+        }
+        None
+    })
+}
+
+/// v1.1: WinDbg prints at most 14 characters of a process image name
+/// (`RvControlSvc.e`). When the same dump text names the full image
+/// (`RvControlSvc.exe` in a path, an `IMAGE_NAME` or `!process` line) the
+/// full name is restored; otherwise the short form is kept as the debugger
+/// printed it and flagged (never shortened further, never guessed).
+fn restore_process_name(name: &str, lines: &[String]) -> (String, bool) {
+    let n = name.trim();
+    let looks_short = n.chars().count() == 14 && !n.to_ascii_lowercase().ends_with(".exe");
+    if !looks_short {
+        return (n.to_string(), false);
+    }
+    let low = n.to_ascii_lowercase();
+    for l in lines {
+        for token in l.split(|c: char| {
+            c.is_whitespace() || matches!(c, '\\' | '/' | '"' | '\'' | '(' | ')' | ',' | ';')
+        }) {
+            let t = token.trim_matches(|c: char| c == ':' || c == '`');
+            let tl = t.to_ascii_lowercase();
+            if tl.len() > low.len() && tl.starts_with(&low) && tl.ends_with(".exe") {
+                return (t.to_string(), false);
+            }
+        }
+    }
+    (n.to_string(), true)
+}
+
+/// v1.1: debugger service noise that is not analysis content (NatVis
+/// visualizer (un)loading, the Debugger Extensions Gallery start-up). It
+/// is hidden from the main Crash Analyzer view only; the raw evidence
+/// keeps every original line.
+pub fn is_debugger_noise(line: &str) -> bool {
+    let t = line.trim();
+    let l = t.to_ascii_lowercase();
+    l.starts_with("natvis script")
+        || l.contains("debugger extensions gallery")
+        || l.starts_with("extensionrepository")
+        || l.starts_with("useexperimentalfeaturefornugetshare")
+        || l.starts_with("allownugetexeupdate")
+        || l.starts_with("noninteractivenuget")
+        || l.starts_with("allownugetmscredentialproviderinstall")
+        || l.starts_with("allowparallelinitializationoflocalrepositories")
+        || l.starts_with("enableredirecttochakrajsprovider")
+        || l.starts_with("-- configuring repositories")
+        || l.starts_with("----> repository")
+        || l.starts_with("database path")
+        || l.starts_with("inaccessible repositories")
+        || (l.starts_with("timeout") && l.contains("ms"))
+}
+
+/// `text` without debugger service noise (main view only).
+pub fn without_debugger_noise(text: &str) -> String {
+    text.lines()
+        .filter(|l| !is_debugger_noise(l))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// v1.0.1 PARSER_INCOMPLETE guard: a specific (non-core) module that the
@@ -1090,6 +1187,24 @@ impl Confidence {
             Confidence::Medium => "MEDIUM",
             Confidence::High => "HIGH",
         }
+    }
+
+    /// v1.1: the user-facing word with the canonical identifier kept in
+    /// brackets — «средняя (MEDIUM)».
+    pub fn label(self, ru: bool) -> String {
+        let word = match (self, ru) {
+            (Confidence::NotDetermined, true) => "причина не определена",
+            (Confidence::NotDetermined, false) => "cause not determined",
+            (Confidence::ParserIncomplete, true) => "разбор неполный",
+            (Confidence::ParserIncomplete, false) => "parse incomplete",
+            (Confidence::Low, true) => "низкая",
+            (Confidence::Low, false) => "low",
+            (Confidence::Medium, true) => "средняя",
+            (Confidence::Medium, false) => "medium",
+            (Confidence::High, true) => "высокая",
+            (Confidence::High, false) => "high",
+        };
+        format!("{word} ({})", self.code())
     }
 }
 

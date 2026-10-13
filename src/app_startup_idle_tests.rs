@@ -177,11 +177,7 @@ fn crypto_check_reports_inventory_and_hash_with_origin_and_time() {
         }),
     };
     for (inv, state, expected) in [
-        (
-            installed,
-            cryptopro::HashState::HashOk,
-            CryptoVm::HashOk,
-        ),
+        (installed, cryptopro::HashState::HashOk, CryptoVm::HashOk),
         (
             cryptopro::Inventory { product: None },
             cryptopro::HashState::NotInstalled,

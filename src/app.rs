@@ -2225,6 +2225,11 @@ pub struct WinStateDiagApp {
     driver_previous: Option<Box<AuditReport>>,
     /// v1.1: when the launch preflight started (None = not started).
     preflight_started: Option<CheckStamp>,
+    /// v1.1 Hardware Passport 2.0: the collector JSON (built in the UI
+    /// language when drawn), window and export status.
+    passport2_json: Option<String>,
+    passport2_open: bool,
+    passport2_status: Option<ExportStatus>,
     drivers_open: bool,
     /// v0.4.4: active page (Diagnostics / Hardware).
     page: Page,
@@ -2422,6 +2427,9 @@ impl Default for WinStateDiagApp {
             driver_history_clear_confirm: false,
             driver_previous: None,
             preflight_started: None,
+            passport2_json: None,
+            passport2_open: false,
+            passport2_status: None,
             drivers_open: false,
             page: Page::Diagnostics,
             crash: CrashState::default(),
@@ -4056,6 +4064,12 @@ impl WinStateDiagApp {
                 let what = i18n::t(self.language).hw_journal_refreshed;
                 self.journal_hardware_result(what, result);
             }
+            // v1.1 Hardware Passport 2.0: the native single-page window.
+            HardwareEvent::Passport(json) => {
+                self.passport2_json = Some(json);
+                self.passport2_open = true;
+                self.passport2_status = None;
+            }
             HardwareEvent::Failed(err) => {
                 let hw = i18n::t(self.language).module_name_hardware;
                 push_journal(&mut self.journal, format!("[ERROR] {hw}: {err}"));
@@ -5422,6 +5436,7 @@ impl WinStateDiagApp {
 
     /// v1.1: the result shown before a re-check stays available until the
     /// re-check SUCCEEDS (a failed re-check never replaces it).
+    #[cfg_attr(test, allow(dead_code))]
     fn keep_previous_driver_result(&mut self, previous: DriverAuditState) {
         if let DriverAuditState::Done(report) = previous {
             self.driver_previous = Some(report);
@@ -7005,7 +7020,11 @@ impl WinStateDiagApp {
         if let Some((_, v)) = verdicts.first() {
             push_journal(
                 &mut self.journal,
-                format!("{}: {}", d.module_incidents, v.headline()),
+                format!(
+                    "{}: {}",
+                    d.module_incidents,
+                    v.headline_localized(self.language == Language::Ru)
+                ),
             );
         }
         let name = format!(
@@ -7488,7 +7507,7 @@ impl WinStateDiagApp {
                             .crash
                             .analyses
                             .first()
-                            .map(|a| a.confidence.code().to_string())
+                            .map(|a| a.confidence.label(ru))
                             .unwrap_or_else(|| d.crash_analysis_pending.to_string()),
                     ),
                     Tone::Warning,
@@ -7546,12 +7565,12 @@ impl WinStateDiagApp {
                 ));
                 rows.push(InfoRow::new(
                     d.crash_row_process,
-                    a.parsed.process_name.clone().unwrap_or_else(|| "—".into()),
+                    process_name_text(a, ru),
                     Tone::Idle,
                 ));
                 rows.push(InfoRow::new(
                     d.crash_row_confidence,
-                    a.confidence.code(),
+                    a.confidence.label(ru),
                     match a.confidence {
                         crash_dump::Confidence::High => Tone::Warning,
                         _ => Tone::Idle,
@@ -7646,7 +7665,7 @@ impl WinStateDiagApp {
         {
             rows.push(InfoRow::new(
                 d.crash_row_incident,
-                v.headline(),
+                v.headline_localized(ru),
                 if v.hang_confirmed || v.bsod_registered {
                     Tone::Warning
                 } else {
@@ -8496,7 +8515,7 @@ impl WinStateDiagApp {
                                             "{} — {} — {}",
                                             a.dump.name,
                                             a.status.code(),
-                                            a.confidence.code()
+                                            a.confidence.label(ru)
                                         ),
                                     );
                                     egui::Grid::new(("wsd_crash_kv", n))
@@ -8504,7 +8523,7 @@ impl WinStateDiagApp {
                                         .spacing(vec2(14.0, 4.0))
                                         .striped(true)
                                         .show(ui, |ui| {
-                                            for (k, v) in crash_analysis_rows(a, d) {
+                                            for (k, v) in crash_analysis_rows(a, d, ru) {
                                                 ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
                                                 ui.add(egui::Label::new(v).wrap());
                                                 ui.end_row();
@@ -8533,7 +8552,11 @@ impl WinStateDiagApp {
                                         );
                                         ui.add(
                                             egui::Label::new(
-                                                RichText::new(&m.raw).monospace().size(11.5),
+                                                RichText::new(crash_dump::without_debugger_noise(
+                                                    &m.raw,
+                                                ))
+                                                .monospace()
+                                                .size(11.5),
                                             )
                                             .wrap(),
                                         );
@@ -8594,7 +8617,7 @@ impl WinStateDiagApp {
                                 ui.label(RichText::new(d.crash_incident_none).color(c::TEXT_MUTED));
                             }
                             for (inc, v) in &verdicts {
-                                ui.label(RichText::new(v.headline()).strong().color(
+                                ui.label(RichText::new(v.headline_localized(ru)).strong().color(
                                     if v.hang_confirmed || v.bsod_registered {
                                         c::YELLOW_WARNING
                                     } else {
@@ -8753,13 +8776,13 @@ impl WinStateDiagApp {
                 o.push_str(&format!(
                     "{} · {}\r\n",
                     crash_dump::incident_line(&inc),
-                    v.headline()
+                    v.headline_localized(ru)
                 ));
             }
         }
         for a in &self.crash.analyses {
             o.push_str("\r\n------------------------------------------------------------\r\n");
-            for (k, v) in crash_analysis_rows(a, d) {
+            for (k, v) in crash_analysis_rows(a, d, ru) {
                 o.push_str(&format!("{k}: {v}\r\n"));
             }
             if !a.parsed.stack_text.is_empty() {
@@ -8769,7 +8792,13 @@ impl WinStateDiagApp {
                 }
             }
             if let Some(m) = &a.module_info {
-                o.push_str(&format!("lmvm {}:\r\n{}\r\n", m.module, m.raw));
+                // v1.1: debugger service noise stays in the raw evidence
+                // only (the RAW section below keeps every original line).
+                o.push_str(&format!(
+                    "lmvm {}:\r\n{}\r\n",
+                    m.module,
+                    crash_dump::without_debugger_noise(&m.raw)
+                ));
             }
             if let Some(r) = &a.resolution {
                 for l in crash_dump::resolution_lines(r, ru) {
@@ -9566,7 +9595,11 @@ fn disk_details_text(title: &str, sections: &[(String, Vec<(String, String)>)]) 
 }
 
 /// v1.0 key facts of one analyzed dump (Details grid and text export).
-fn crash_analysis_rows(a: &crash_dump::DumpAnalysis, d: &i18n::Dict) -> Vec<(String, String)> {
+fn crash_analysis_rows(
+    a: &crash_dump::DumpAnalysis,
+    d: &i18n::Dict,
+    ru: bool,
+) -> Vec<(String, String)> {
     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
     let mut rows = vec![
         (
@@ -9586,16 +9619,13 @@ fn crash_analysis_rows(a: &crash_dump::DumpAnalysis, d: &i18n::Dict) -> Vec<(Str
         ("FAILURE_BUCKET_ID".into(), opt(&a.parsed.failure_bucket_id)),
         ("MODULE_NAME".into(), opt(&a.parsed.module_name)),
         ("IMAGE_NAME".into(), opt(&a.parsed.image_name)),
-        ("PROCESS_NAME".into(), opt(&a.parsed.process_name)),
+        ("PROCESS_NAME".into(), process_name_text(a, ru)),
         (
             d.crash_row_module.to_string(),
             a.probable_module()
                 .unwrap_or_else(|| d.crash_not_determined.into()),
         ),
-        (
-            d.crash_row_confidence.to_string(),
-            a.confidence.code().to_string(),
-        ),
+        (d.crash_row_confidence.to_string(), a.confidence.label(ru)),
         (
             "Symbols".into(),
             a.parsed.symbol_status().code().to_string(),
@@ -9632,6 +9662,23 @@ fn crash_analysis_rows(a: &crash_dump::DumpAnalysis, d: &i18n::Dict) -> Vec<(Str
         ));
     }
     rows
+}
+
+/// v1.1: PROCESS_NAME as the dump states it; a name WinDbg itself cut to
+/// 14 characters is marked as such (the parser never shortens it).
+fn process_name_text(a: &crash_dump::DumpAnalysis, ru: bool) -> String {
+    match &a.parsed.process_name {
+        None => "—".into(),
+        Some(n) if a.parsed.process_name_truncated => format!(
+            "{n} ({})",
+            if ru {
+                "имя сокращено WinDbg до 14 символов"
+            } else {
+                "name shortened by WinDbg to 14 characters"
+            }
+        ),
+        Some(n) => n.clone(),
+    }
 }
 
 /// UI label of a canonical sensor role (identity stays in `Role`).
@@ -9854,6 +9901,7 @@ impl eframe::App for WinStateDiagApp {
         self.raw_passes_window(&ctx);
         self.drivers_window(&ctx);
         self.crypto_details_window(&ctx);
+        self.passport2_window(&ctx);
         self.journal_window(&ctx);
         self.expc_details_window(&ctx);
         self.stage_details_window(&ctx);

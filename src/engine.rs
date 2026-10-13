@@ -1184,6 +1184,9 @@ pub enum HardwareEvent {
     Persisted(Result<PathBuf, String>),
     /// "Обновить" in the viewer produced new evidence.
     Refreshed(Result<PathBuf, String>),
+    /// v1.1 Hardware Passport 2.0: the collector's JSON for the native
+    /// single-page passport window (the WinForms viewer is not shown).
+    Passport(String),
     /// Collection failed; no viewer.
     Failed(String),
     /// The viewer was closed.
@@ -1269,14 +1272,20 @@ fn hardware_view_inner(
                 if line == "WSD_HW_PHASE|report" {
                     let _ = tx.send(HardwareEvent::Saving);
                 } else if let Some(base) = line.strip_prefix("WSD_HW_SAVED|") {
-                    let result = persist_hardware_evidence(req, &runtime.reports_root(), base);
+                    let (result, passport) =
+                        persist_hardware_evidence(req, &runtime.reports_root(), base);
                     if shown {
                         let _ = tx.send(HardwareEvent::Refreshed(result));
                     } else {
                         let _ = tx.send(HardwareEvent::Persisted(result));
-                        // Evidence is persisted: now the viewer may open.
+                        // v1.1: the native Passport 2.0 window shows the
+                        // collected JSON; the script ends without its own
+                        // WinForms viewer ("SKIP").
+                        if let Some(json) = passport {
+                            let _ = tx.send(HardwareEvent::Passport(json));
+                        }
                         if let Some(mut input) = stdin.take() {
-                            let _ = input.write_all(b"SHOW\r\n");
+                            let _ = input.write_all(b"SKIP\r\n");
                             let _ = input.flush();
                         }
                         shown = true;
@@ -1315,14 +1324,25 @@ fn hardware_view_inner(
 }
 
 /// Copies `<base>.txt/.json/.html` from the internal working folder into
-/// the session package (evidence persisted, ZIP updated).
+/// the session package (evidence persisted, ZIP updated). v1.1: also
+/// returns the passport JSON text for the native Passport 2.0 window.
 fn persist_hardware_evidence(
     req: &HardwareViewRequest,
     runtime_reports: &Path,
     base: &str,
-) -> Result<PathBuf, String> {
-    let files = find_hardware_files(runtime_reports, base.trim())?;
-    lock(&req.package).contribute(&req.client_name, &req.computer_name, &req.date, files)
+) -> (Result<PathBuf, String>, Option<String>) {
+    let files = match find_hardware_files(runtime_reports, base.trim()) {
+        Ok(files) => files,
+        Err(e) => return (Err(e), None),
+    };
+    let json = files
+        .iter()
+        .find(|f| f.name.to_ascii_lowercase().ends_with(".json"))
+        .map(|f| String::from_utf8_lossy(&f.bytes).into_owned());
+    (
+        lock(&req.package).contribute(&req.client_name, &req.computer_name, &req.date, files),
+        json,
+    )
 }
 
 fn find_hardware_files(root: &Path, base: &str) -> Result<Vec<EvidenceFile>, String> {

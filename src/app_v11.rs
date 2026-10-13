@@ -390,3 +390,290 @@ pub(crate) fn driver_history_section(
     });
     act
 }
+
+// ---------------------------------------------------------------------
+// v1.1 Hardware Passport 2.0 window
+// ---------------------------------------------------------------------
+
+/// What the Passport 2.0 footer asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassportAct {
+    Refresh,
+    Copy,
+    Save,
+    Close,
+}
+
+/// Colour of a passport value by its kind (configuration / current
+/// measurement / not confirmed).
+pub(crate) fn passport_value_color(kind: crate::passport2::Kind) -> egui::Color32 {
+    match kind {
+        crate::passport2::Kind::Config => c::TEXT_PRIMARY,
+        crate::passport2::Kind::Measured => c::GREEN_SUCCESS,
+        crate::passport2::Kind::Unconfirmed => c::TEXT_MUTED,
+    }
+}
+
+fn passport_card(ui: &mut egui::Ui, card: &crate::passport2::Card) {
+    use crate::passport2::Kind;
+    egui::Frame::new()
+        .fill(c::BG_CARD_INNER)
+        .stroke(egui::Stroke::new(1.0, c::BORDER_INNER))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(&card.title)
+                    .size(17.0)
+                    .strong()
+                    .color(c::TEXT_TITLE),
+            );
+            ui.add_space(3.0);
+            let width = ui.available_width();
+            egui::Grid::new(("wsd_pp_card", card.title.as_str()))
+                .num_columns(2)
+                .min_col_width(width * 0.30)
+                .max_col_width(width * 0.66)
+                .spacing(vec2(12.0, 4.0))
+                .show(ui, |ui| {
+                    for r in &card.rows {
+                        let value = |text: &str| {
+                            let t = RichText::new(text).color(passport_value_color(r.kind));
+                            if r.kind == Kind::Unconfirmed {
+                                t.italics()
+                            } else {
+                                t
+                            }
+                        };
+                        match (r.label.is_empty(), r.value.is_empty()) {
+                            // A sub-heading (disk / GPU / battery name).
+                            (false, true) => {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&r.label).strong().color(c::TEXT_PRIMARY),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.label("");
+                            }
+                            // A note line under the previous row.
+                            (true, _) => {
+                                ui.label("");
+                                ui.add(egui::Label::new(value(&r.value)).wrap());
+                            }
+                            (false, false) => {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&r.label).color(c::TEXT_SECONDARY),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.add(egui::Label::new(value(&r.value)).wrap());
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+/// v1.1 Passport 2.0 page body (header, legend, cards, not-confirmed list)
+/// — without the fixed footer. Two columns when the window is wide.
+pub(crate) fn passport_body(ui: &mut egui::Ui, d: &i18n::Dict, p: &crate::passport2::Passport) {
+    ui.label(
+        RichText::new(d.pp_title)
+            .size(24.0)
+            .strong()
+            .color(c::TEXT_TITLE),
+    );
+    ui.label(RichText::new(d.pp_subtitle).color(c::TEXT_SECONDARY));
+    if !p.system.is_empty() {
+        ui.add(egui::Label::new(RichText::new(&p.system).color(c::TEXT_PRIMARY)).wrap());
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (text, kind) in [
+            (d.pp_legend_config, crate::passport2::Kind::Config),
+            (d.pp_legend_measured, crate::passport2::Kind::Measured),
+            (d.pp_legend_unconfirmed, crate::passport2::Kind::Unconfirmed),
+        ] {
+            ui.label(RichText::new("●").color(passport_value_color(kind)));
+            ui.label(RichText::new(text).small().color(c::TEXT_MUTED));
+            ui.add_space(8.0);
+        }
+    });
+    ui.add_space(6.0);
+    let two = ui.available_width() >= 820.0;
+    if two {
+        ui.columns(2, |cols| {
+            for (i, card) in p.cards.iter().enumerate() {
+                passport_card(&mut cols[i % 2], card);
+                cols[i % 2].add_space(8.0);
+            }
+        });
+    } else {
+        for card in &p.cards {
+            passport_card(ui, card);
+            ui.add_space(8.0);
+        }
+    }
+    egui::Frame::new()
+        .fill(c::BG_CARD_INNER)
+        .stroke(egui::Stroke::new(1.0, c::BORDER_INNER))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(d.pp_unconfirmed_title)
+                    .size(17.0)
+                    .strong()
+                    .color(c::TEXT_TITLE),
+            );
+            if p.unconfirmed.is_empty() {
+                ui.label(RichText::new(d.pp_unconfirmed_none).color(c::TEXT_MUTED));
+            }
+            for u in &p.unconfirmed {
+                ui.add(egui::Label::new(RichText::new(u).italics().color(c::TEXT_MUTED)).wrap());
+            }
+        });
+}
+
+/// The fixed bottom panel: [Обновить] [Скопировать сводку]
+/// [Сохранить отчёт] … [Закрыть] and the collection / export line.
+pub(crate) fn passport_footer(
+    ui: &mut egui::Ui,
+    d: &i18n::Dict,
+    collected: Option<&str>,
+    busy: bool,
+    has_data: bool,
+    status: Option<&(String, egui::Color32)>,
+) -> Option<PassportAct> {
+    let mut act = None;
+    ui.separator();
+    if let Some(at) = collected {
+        ui.label(
+            RichText::new(d.pp_collected_fmt.replace("{time}", at))
+                .small()
+                .color(c::TEXT_MUTED),
+        );
+    }
+    ui.horizontal(|ui| {
+        if details::primary_button(ui, d.pp_refresh, !busy).clicked() {
+            act = Some(PassportAct::Refresh);
+        }
+        if details::secondary_button(ui, d.pp_copy, has_data).clicked() {
+            act = Some(PassportAct::Copy);
+        }
+        if details::secondary_button(ui, d.pp_save, has_data).clicked() {
+            act = Some(PassportAct::Save);
+        }
+        if busy {
+            ui.label(RichText::new(d.pp_collecting).color(c::TEXT_SECONDARY));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if details::secondary_button(ui, d.pp_close, true).clicked() {
+                act = Some(PassportAct::Close);
+            }
+        });
+    });
+    if let Some((text, color)) = status {
+        ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
+    }
+    act
+}
+
+/// Footer height reserved under the scrolling page (points).
+pub(crate) const PASSPORT_FOOTER_H: f32 = 78.0;
+
+impl WinStateDiagApp {
+    /// The passport page model in the current UI language.
+    pub(crate) fn passport2_view(&self) -> Option<crate::passport2::Passport> {
+        let json = self.passport2_json.as_deref()?;
+        crate::passport2::build(
+            json,
+            &crate::passport2::Texts {
+                ru: self.language == Language::Ru,
+                d: i18n::t(self.language),
+            },
+        )
+    }
+
+    /// v1.1 Hardware Passport 2.0: one large resizable, scrollable window
+    /// in the WinStateDiag palette with a fixed bottom panel.
+    pub(crate) fn passport2_window(&mut self, ctx: &egui::Context) {
+        if !self.passport2_open {
+            return;
+        }
+        let d = i18n::t(self.language);
+        let view = self.passport2_view();
+        let busy = !matches!(self.hardware, HardwareViewState::Idle);
+        let status = self.passport2_status.as_ref().map(|s| s.text(d));
+        let mut open = true;
+        let mut act: Option<PassportAct> = None;
+        detail_window(
+            ctx,
+            "wsd_hardware_passport2",
+            d.pp_title,
+            [1060.0, 860.0],
+            &mut open,
+            |ui| {
+                let body_h = (ui.available_height() - PASSPORT_FOOTER_H).max(160.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_passport2_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(body_h)
+                    .show(ui, |ui| match &view {
+                        Some(p) => passport_body(ui, d, p),
+                        None => {
+                            ui.label(
+                                RichText::new(d.pp_title)
+                                    .size(24.0)
+                                    .strong()
+                                    .color(c::TEXT_TITLE),
+                            );
+                            ui.label(
+                                RichText::new(if busy {
+                                    d.pp_collecting
+                                } else {
+                                    d.pp_not_collected
+                                })
+                                .color(c::TEXT_SECONDARY),
+                            );
+                        }
+                    });
+                act = passport_footer(
+                    ui,
+                    d,
+                    view.as_ref().map(|p| p.collected_at.as_str()),
+                    busy,
+                    view.is_some(),
+                    status.as_ref(),
+                );
+            },
+        );
+        match act {
+            Some(PassportAct::Refresh) => {
+                self.passport2_status = None;
+                self.start_hardware_view();
+            }
+            Some(PassportAct::Copy) | Some(PassportAct::Save) => {
+                if let Some(p) = &view {
+                    let text = crate::passport2::summary_text(p, d);
+                    let action = if act == Some(PassportAct::Copy) {
+                        ExportAction::Copy
+                    } else {
+                        ExportAction::Save
+                    };
+                    self.passport2_status =
+                        Some(self.export_text(ctx, action, "HardwarePassport", &text));
+                }
+            }
+            Some(PassportAct::Close) => open = false,
+            None => {}
+        }
+        if !open {
+            self.passport2_open = false;
+        }
+    }
+}
