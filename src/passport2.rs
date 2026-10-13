@@ -704,12 +704,9 @@ pub fn summary_text(p: &Passport, d: &crate::i18n::Dict) -> String {
     out
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-
-    /// Sanitized real MSI collector output (serials / MAC replaced).
-    pub const MSI_JSON: &str = r#"{
+/// v1.1 QA fixture: sanitized real MSI collector output (serials / MAC
+/// replaced) for the `hardware-passport` scene and the tests.
+pub(crate) const QA_PASSPORT_JSON: &str = r#"{
   "Tool": "EXPC Hardware Diagnostics", "SchemaVersion": 1,
   "GeneratedAt": "2026-10-13T13:06:12.0075273+03:00", "ReadOnly": true, "OverallState": "OK",
   "System": {"Manufacturer": "Micro-Star International Co., Ltd.", "Model": "MS-7E34", "Hostname": "MSI",
@@ -738,6 +735,10 @@ pub(crate) mod tests {
   "CollectionErrors": []
 }"#;
 
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
     fn texts(ru: bool) -> Texts<'static> {
         Texts {
             ru,
@@ -755,7 +756,7 @@ pub(crate) mod tests {
 
     #[test]
     fn eight_cards_in_order_with_real_values_and_no_overall_ok() {
-        let p = build(MSI_JSON, &texts(true)).expect("passport");
+        let p = build(QA_PASSPORT_JSON, &texts(true)).expect("passport");
         let kinds: Vec<CardKind> = p.cards.iter().map(|c| c.kind).collect();
         assert_eq!(
             kinds,
@@ -801,7 +802,7 @@ pub(crate) mod tests {
 
     #[test]
     fn disks_show_what_windows_reports_and_only_real_measurements() {
-        let p = build(MSI_JSON, &texts(true)).unwrap();
+        let p = build(QA_PASSPORT_JSON, &texts(true)).unwrap();
         let st = card(&p, CardKind::Storage);
         let samsung = st
             .rows
@@ -832,7 +833,7 @@ pub(crate) mod tests {
 
     #[test]
     fn graphics_network_power_and_unconfirmed_values() {
-        let p = build(MSI_JSON, &texts(false)).unwrap();
+        let p = build(QA_PASSPORT_JSON, &texts(false)).unwrap();
         let gpu = card(&p, CardKind::Gpu);
         assert!(gpu.rows.iter().any(|r| r.value == "7.96 GB"));
         assert!(gpu.rows.iter().any(|r| r.value == "shared with RAM"));
@@ -843,7 +844,7 @@ pub(crate) mod tests {
         let pw = card(&p, CardKind::Power);
         assert_eq!(pw.rows[0].value, crate::i18n::EN.pp_no_battery);
         // Placeholders become "not confirmed", never shown as data.
-        let doc = MSI_JSON.replace(r#""Version": "1.0""#, r#""Version": "Default string""#);
+        let doc = QA_PASSPORT_JSON.replace(r#""Version": "1.0""#, r#""Version": "Default string""#);
         let p = build(&doc, &texts(true)).unwrap();
         let board = card(&p, CardKind::Board);
         assert_eq!(board.rows[2].kind, Kind::Unconfirmed);
@@ -857,7 +858,7 @@ pub(crate) mod tests {
 
     #[test]
     fn battery_values_are_measurements_and_missing_ones_unconfirmed() {
-        let doc = MSI_JSON.replace(
+        let doc = QA_PASSPORT_JSON.replace(
             r#""Batteries": []"#,
             r#""Batteries": [{"Name": "BAT0", "ChargePercent": 81, "WearPercent": 12.5, "DesignCapacity": 57000, "FullChargeCapacity": 49875, "CycleCount": "Not reported"}]"#,
         );

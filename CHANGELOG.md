@@ -1,5 +1,45 @@
 # Changelog
 
+## [1.1] - unreleased - v1.1 Final Integration
+
+- **Startup orchestration (preflight).**
+  - At launch these run automatically, asynchronously and read-only:
+    - Driver Audit;
+    - CryptoPro: registry inventory + `cpverify -rv`, never ReHash;
+    - WinDbg / cdb detection and the crash / dump discovery (one inventory scan, no `!analyze`, no symbols).
+  - The preflight creates no session, ZIP or report. Its Driver Audit is never offered to a report, and its crash listing is observed by no session.
+  - A full diagnostic started while the preflight runs gets its own fresh SESSION crash scan and CryptoPro check.
+  - Every result carries its origin and time: PREFLIGHT / MANUAL / SESSION.
+  - Closing the app (`on_exit`) sets a shutdown flag. Every background wait (`ProcessGuard::wait_or_cancel`) then ends its process tree, and a running diagnostic is cancelled.
+- **CryptoPro GUI.**
+  - Compact card: logo + name, round ⟳ (fresh read-only check; disabled while busy), status disc, status + time caption, «Детали».
+  - Details: presence, CSP version, licence key (masked) and term, HASH state, verifier, last check, data source, errors; Copy / Close.
+  - «Выполнить ReHash» is separate: a warning («изменяет систему») and an explicit confirmation are required. It is offered only from NO HASH, never during a check, and the state is re-verified afterwards.
+  - The NO HASH card button no longer starts ReHash with one click.
+- **Driver Audit GUI.**
+  - Header «ПРОВЕРКА ДРАЙВЕРОВ [Проверка] [Подробнее]».
+  - «Проверка» re-checks this module only, never in parallel. A successful re-check replaces the result; a failed one keeps the previous result and says so.
+  - Details journal header [Копировать] [Сохранить отчёт] [Очистить журнал]. Save = the current Driver Audit report via the Windows Save As dialog. Clear asks first and clears only this UI's history.
+- **Hardware Passport 2.0.**
+  - The WinForms viewer with tabs is replaced by one large, resizable, scrollable egui window built from the same read-only collector JSON. The collector and the saved evidence are unchanged; the script is told `SKIP` instead of `SHOW`.
+  - Cards: CPU, memory, motherboard, BIOS/UEFI, storage, graphics, network, power/battery.
+  - Configuration / current measurement / not confirmed are shown apart. Placeholder strings are "not confirmed". There is no universal "OK" (a disk shows what Windows reports).
+  - Fixed footer: [Обновить] [Скопировать сводку] [Сохранить отчёт] [Закрыть].
+  - Two columns on wide windows, one on narrow windows / high DPI.
+  - Disk Details unchanged.
+- **Crash analyzer polish.**
+  - MODULE_NAME / IMAGE_NAME / PROCESS_NAME are filled from the raw WinDbg text when the structured parse misses them (prefixed lines).
+  - PROCESS_NAME is never cut by the parser. WinDbg's 14-character form (`RvControlSvc.e`) is restored from a full `….exe` name in the dump text, or marked «имя сокращено WinDbg».
+  - NatVis / Extensions Gallery noise is hidden from the main view; the raw output is unchanged.
+  - Confidence and incident statuses read as words with the canonical id kept: «средняя (MEDIUM)», «зависание не подтверждено (HANG NOT CONFIRMED)». Evidence JSON keeps the canonical codes.
+  - WinDbg status: «Установлен · Backend готов» / «Не найден» / «Требуется проверка».
+- **QA / gate.**
+  - New offscreen QA flag `--qa-offscreen`: the capture window sits outside the desktop, never focused, no taskbar button.
+  - New scenes: crypto-details, crypto-rehash-confirm, driver-details, hardware-passport. The release gate renders them offscreen.
+- Version 1.1 (`Cargo.toml` 1.1.0; title, FileVersion / ProductVersion, manifest and `dist\WinStateDiag-v1.1`).
+- Removed 6 stray 0x18 control bytes from source comments / a QA fixture.
+- 21 new regression tests (626 total).
+
 ## [1.0] - unreleased - v1.0 Stable candidate (master consolidation, evidence intelligence, live fixes)
 
 ### v1.0 Evidence fixes + Power Telemetry research (2026-10-13)

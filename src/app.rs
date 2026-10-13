@@ -4115,7 +4115,7 @@ impl WinStateDiagApp {
     // CryptoPro (read-only check; ReHash only after confirmation)
     // -----------------------------------------------------------------
 
-    /// The CryptoPro check that runs now: the user's ⟳ outside a session,
+    /// The CryptoPro check that runs now: the user's ⟳ outside a session,
     /// the session's own check during a diagnostic.
     fn start_crypto_check(&mut self) {
         let origin = if self.is_running() {
@@ -4140,7 +4140,13 @@ impl WinStateDiagApp {
         }
         self.crypto_origin = origin;
         self.crypto_export_status = None;
-        if self.reference.is_some() || cfg!(test) {
+        if self.reference.is_some() {
+            return;
+        }
+        // A fresh check never shows the previous result as current.
+        self.crypto = None;
+        self.crypto_inventory = None;
+        if cfg!(test) {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4155,8 +4161,6 @@ impl WinStateDiagApp {
             let state = cryptopro::check(&det, &runner);
             let _ = tx.send(CryptoEvent::Checked(det, state));
         });
-        self.crypto = None;
-        self.crypto_inventory = None;
         self.crypto_rx = Some(rx);
     }
 
@@ -6739,7 +6743,7 @@ impl WinStateDiagApp {
             return;
         }
         self.begin_operation(false);
-        // v1.1: a preflight inventory is never analyzed into a report — the
+        // v1.1: a preflight inventory is never analyzed into a report — the
         // explicit analysis scans again for its own session first.
         let preflight = self
             .crash
@@ -9764,7 +9768,7 @@ fn gpo_text(i: &gpo_admx::GpoInputs, r: &gpo_admx::GpoResult) -> Vec<u8> {
 }
 
 impl WinStateDiagApp {
-    /// v1.1: the application closes — every background check is cancelled
+    /// v1.1: the application closes — every background check is cancelled
     /// (its process tree ends) and a running diagnostic is stopped. Nothing
     /// is started any more and nothing new is written.
     pub(crate) fn shutdown(&mut self, flag: &std::sync::atomic::AtomicBool) {
@@ -13867,6 +13871,10 @@ mod qa_scenes;
 
 #[path = "app_v11.rs"]
 mod v11;
+
+#[cfg(test)]
+#[path = "app_v11_tests.rs"]
+mod v11_tests;
 
 #[cfg(test)]
 #[path = "app_v10_tests.rs"]

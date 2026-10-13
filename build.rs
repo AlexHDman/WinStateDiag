@@ -116,7 +116,7 @@ fn embed_app_manifest() {
     }
 }
 
-/// v1.0 version policy: releases are named `major.minor` (v1.0, v1.1, …,
+/// v1.0 version policy: releases are named `major.minor` (v1.0, v1.1, …,
 /// v2.0); a patch digit is shown only when it is not zero. Cargo needs a
 /// full semver (`1.0.0`), so the display form is derived here once and used
 /// by the title, the manifest, the EXE VERSIONINFO strings and the release

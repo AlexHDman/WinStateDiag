@@ -63,7 +63,7 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SCHEMA_VERSION: &str = "1.0";
 pub const PRODUCER: &str = "WinStateDiag";
 /// The canonical application version (Cargo.toml `[package] version`,
-/// release form "1.0" — see build.rs `display_version`).
+/// release form "1.0" — see build.rs `display_version`).
 pub const PRODUCER_VERSION: &str = env!("WSD_DISPLAY_VERSION");
 
 #[derive(Clone, Debug)]

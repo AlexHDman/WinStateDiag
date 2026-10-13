@@ -641,6 +641,12 @@ impl SessionPackage {
     /// a session (v1.0: an explicit run always is), otherwise waits in
     /// memory for the first module that creates the package. Returns the
     /// ZIP when updated now.
+    /// v1.1 tests: evidence held back until a report exists.
+    #[cfg(test)]
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     pub fn offer(&mut self, files: Vec<EvidenceFile>) -> Result<Option<PathBuf>, String> {
         let exists = self
             .identity

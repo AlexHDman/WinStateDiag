@@ -533,12 +533,22 @@ fn run_renderer(args: &[String], mode: GraphicsMode, handshake: Option<PathBuf>)
     }
     // Initial size = reference canvas at 80%; the first frame fits it to the
     // monitor and the canvas then scales uniformly with the window.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(title.clone())
+        .with_inner_size([ui::tokens::CANVAS_W * 0.8, ui::tokens::CANVAS_H * 0.8])
+        .with_min_inner_size([640.0_f32, 516.0_f32])
+        .with_icon(window_icon());
+    // v1.1 offscreen QA: a visual-reference capture renders in a window
+    // placed outside the visible desktop that never takes focus and has no
+    // taskbar button — the user's desktop is not occupied.
+    if reference && args.iter().any(|a| a == "--qa-offscreen") {
+        viewport = viewport
+            .with_position([-30000.0_f32, -30000.0_f32])
+            .with_active(false)
+            .with_taskbar(false);
+    }
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(title.clone())
-            .with_inner_size([ui::tokens::CANVAS_W * 0.8, ui::tokens::CANVAS_H * 0.8])
-            .with_min_inner_size([640.0_f32, 516.0_f32])
-            .with_icon(window_icon()),
+        viewport,
         ..Default::default()
     };
     graphics_wgpu::configure(&mut options.wgpu_options, mode);

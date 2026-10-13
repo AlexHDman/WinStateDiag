@@ -343,11 +343,14 @@ try {
     Log "== 17. QA RENDERS"
     New-Item -ItemType Directory -Force -Path (Join-Path $root 'docs\visual') | Out-Null
     $scenes = [ordered]@{ 'diagnostics' = 'DIAGNOSTICS'; 'hardware' = 'HARDWARE'; 'sensor-reading' = 'SENSOR_READING';
-        'sensor-details' = 'SENSOR_DETAILS'; 'crash-analyzer' = 'CRASH_ANALYZER'; 'windbg-install' = 'WINDBG_INSTALL'; 'disk-details' = 'DISK_DETAILS' }
+        'sensor-details' = 'SENSOR_DETAILS'; 'crash-analyzer' = 'CRASH_ANALYZER'; 'windbg-install' = 'WINDBG_INSTALL'; 'disk-details' = 'DISK_DETAILS';
+        'crypto-details' = 'CRYPTO_DETAILS'; 'crypto-rehash-confirm' = 'CRYPTO_REHASH_CONFIRM'; 'driver-details' = 'DRIVER_DETAILS';
+        'hardware-passport' = 'HARDWARE_PASSPORT' }
     foreach ($s in $scenes.Keys) {
         $png = Join-Path $root "docs\visual\v${version}_$($scenes[$s]).png"
         if (Test-Path -LiteralPath $png) { Remove-Item -LiteralPath $png -Force }
-        [void](Run-Exe $distExe @('--visual-reference', '--scene', $s, '--capture', "`"$png`"") "17_RENDER_$($scenes[$s])" 180)
+        # v1.1: offscreen QA window (outside the desktop, never focused).
+        [void](Run-Exe $distExe @('--visual-reference', '--qa-offscreen', '--scene', $s, '--capture', "`"$png`"") "17_RENDER_$($scenes[$s])" 180)
         if (-not (Test-Path -LiteralPath $png)) { Fail '17_RENDER' $scenes[$s] }
         Log "RENDER $($scenes[$s])=OK"
     }
