@@ -1189,13 +1189,15 @@ pub(crate) struct DriverHistoryEntry {
     pub outcome: String,
 }
 
-/// v1.1: appends one Driver Audit history line (bounded) and records the
-/// time / origin of the latest result.
+/// v1.1: appends one Driver Audit history line (bounded, every attempt)
+/// and — for a SUCCESSFUL result only — records the time / origin of the
+/// result now shown (a failed attempt never re-stamps the previous one).
 fn record_check(
     history: &mut Vec<DriverHistoryEntry>,
     checked: &mut Option<CheckStamp>,
     stamp: CheckStamp,
     outcome: String,
+    success: bool,
 ) {
     history.push(DriverHistoryEntry {
         stamp: stamp.clone(),
@@ -1204,7 +1206,9 @@ fn record_check(
     if history.len() > 200 {
         history.remove(0);
     }
-    *checked = Some(stamp);
+    if success {
+        *checked = Some(stamp);
+    }
 }
 
 /// Driver Audit lifecycle: a read-only audit runs inside every diagnostic
@@ -1369,13 +1373,13 @@ fn drivers_vm(report: &AuditReport, d: &i18n::Dict) -> DriversVm {
     }
 }
 
-fn start_driver_audit() -> DriverAuditState {
+fn start_driver_audit(cancel: Arc<AtomicBool>) -> DriverAuditState {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let work = std::env::temp_dir()
             .join("WinStateDiag")
             .join(format!("driver-audit-{}", std::process::id()));
-        let result = driver_audit::run_audit(&work);
+        let result = driver_audit::run_audit_with_cancel(&work, &cancel);
         let _ = std::fs::remove_dir_all(&work);
         let _ = tx.send(result);
     });
@@ -2223,6 +2227,8 @@ pub struct WinStateDiagApp {
     driver_history_clear_confirm: bool,
     /// v1.1: the last good result while a re-check runs.
     driver_previous: Option<Box<AuditReport>>,
+    /// v1.1: cancel flag of the running app-side Driver Audit.
+    driver_cancel: Option<Arc<AtomicBool>>,
     /// v1.1: when the launch preflight started (None = not started).
     preflight_started: Option<CheckStamp>,
     /// v1.1 Hardware Passport 2.0: the collector JSON (built in the UI
@@ -2426,6 +2432,7 @@ impl Default for WinStateDiagApp {
             driver_history: Vec::new(),
             driver_history_clear_confirm: false,
             driver_previous: None,
+            driver_cancel: None,
             preflight_started: None,
             passport2_json: None,
             passport2_open: false,
@@ -3581,6 +3588,9 @@ impl WinStateDiagApp {
         // New run: the dashboard card starts empty; the session journal
         // (full viewer / Save / Copy) keeps every earlier line.
         self.journal.clear_view();
+        // v1.1: the session's engine runs its own Driver Audit — never a
+        // second one in parallel.
+        self.cancel_app_driver_audit();
         self.begin_operation(true);
         let session = self
             .session_identity()
@@ -3790,6 +3800,7 @@ impl WinStateDiagApp {
                                     &mut self.driver_checked,
                                     stamp,
                                     summary,
+                                    true,
                                 );
                                 self.driver_audit = DriverAuditState::Done(report);
                             }
@@ -3799,6 +3810,7 @@ impl WinStateDiagApp {
                                     &mut self.driver_checked,
                                     stamp,
                                     format!("{}: {err}", d.driver_status_error),
+                                    false,
                                 );
                                 if !matches!(self.driver_audit, DriverAuditState::Done(_)) {
                                     self.driver_audit = DriverAuditState::Failed(err);
@@ -4133,7 +4145,9 @@ impl WinStateDiagApp {
     fn start_crypto_check_as(&mut self, origin: CheckOrigin) {
         self.request_collector("cryptopro");
         if self.crypto_rx.is_some() {
-            if origin == CheckOrigin::Session && self.crypto_origin == CheckOrigin::Preflight {
+            // v1.1: whatever runs now (preflight, ⟳ or a ReHash), the
+            // session gets its own fresh check right after it.
+            if origin == CheckOrigin::Session && self.crypto_origin != CheckOrigin::Session {
                 self.crypto_recheck_for_session = true;
             }
             return;
@@ -4243,6 +4257,9 @@ impl WinStateDiagApp {
                     }
                     self.crypto = Some(outcome.state);
                     self.crypto_checked = Some(CheckStamp::now(CheckOrigin::Manual));
+                    if std::mem::take(&mut self.crypto_recheck_for_session) && self.is_running() {
+                        self.start_crypto_check_as(CheckOrigin::Session);
+                    }
                     return;
                 }
             }
@@ -4314,13 +4331,13 @@ impl WinStateDiagApp {
                         ),
                     }
                 }
-                self.record_driver_check(stamp, summary);
+                self.record_driver_check(stamp, summary, true);
                 self.driver_previous = None;
                 self.driver_audit = DriverAuditState::Done(Box::new(report));
             }
             Err(err) => {
                 push_journal(&mut self.journal, format!("[WARN] {err}"));
-                self.record_driver_check(stamp, format!("{}: {err}", d.driver_status_error));
+                self.record_driver_check(stamp, format!("{}: {err}", d.driver_status_error), false);
                 // A failed re-check never hides the last good result.
                 self.driver_audit = match self.driver_previous.take() {
                     Some(previous) => DriverAuditState::Done(previous),
@@ -4332,12 +4349,13 @@ impl WinStateDiagApp {
 
     /// v1.1: time / origin of the latest Driver Audit result and one line
     /// in this UI's Driver Audit history.
-    fn record_driver_check(&mut self, stamp: CheckStamp, outcome: String) {
+    fn record_driver_check(&mut self, stamp: CheckStamp, outcome: String, success: bool) {
         record_check(
             &mut self.driver_history,
             &mut self.driver_checked,
             stamp,
             outcome,
+            success,
         );
     }
 
@@ -4362,7 +4380,7 @@ impl WinStateDiagApp {
             self.request_collector("driver_audit");
             #[cfg(not(test))]
             {
-                self.driver_audit = start_driver_audit();
+                self.driver_audit = start_driver_audit(self.new_driver_cancel());
             }
         }
         // B. CryptoPro: registry inventory + read-only HASH check.
@@ -4938,7 +4956,8 @@ impl WinStateDiagApp {
                 .driver_checked
                 .as_ref()
                 .map(|s| s.caption(i18n::t(self.language))),
-            drivers_check_enabled: !matches!(self.driver_audit, DriverAuditState::Running(_)),
+            drivers_check_enabled: !matches!(self.driver_audit, DriverAuditState::Running(_))
+                && !self.is_running(),
             computer_name: self.computer_name.clone(),
             stages,
             overall,
@@ -5417,7 +5436,9 @@ impl WinStateDiagApp {
     /// Details window): a separate module run in its own correctly
     /// identified session (nothing else is started; never two at once).
     fn request_driver_audit(&mut self) {
-        if matches!(self.driver_audit, DriverAuditState::Running(_)) {
+        // v1.1: never two audits — not while one runs, and not during a
+        // full diagnostic (its engine runs the session's own audit).
+        if matches!(self.driver_audit, DriverAuditState::Running(_)) || self.is_running() {
             return;
         }
         self.driver_export_status = None;
@@ -5428,7 +5449,8 @@ impl WinStateDiagApp {
         // Unit tests never start the collector.
         #[cfg(not(test))]
         {
-            let previous = std::mem::replace(&mut self.driver_audit, start_driver_audit());
+            let cancel = self.new_driver_cancel();
+            let previous = std::mem::replace(&mut self.driver_audit, start_driver_audit(cancel));
             self.keep_previous_driver_result(previous);
         }
         #[cfg(test)]
@@ -5436,6 +5458,35 @@ impl WinStateDiagApp {
             let _ = start_driver_audit;
             self.driver_rerun_requests += 1;
         }
+    }
+
+    /// v1.1: a fresh cancel flag for the app-side Driver Audit run.
+    fn new_driver_cancel(&mut self) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.driver_cancel = Some(Arc::clone(&cancel));
+        cancel
+    }
+
+    /// v1.1: a full diagnostic starts: an app-side Driver Audit (preflight
+    /// or manual) still running is cancelled — its process tree ends — so
+    /// the engine's session audit is the only one. The last good result
+    /// stays on the card until the session's audit replaces it.
+    fn cancel_app_driver_audit(&mut self) {
+        if !matches!(self.driver_audit, DriverAuditState::Running(_)) {
+            return;
+        }
+        if let Some(cancel) = self.driver_cancel.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        self.driver_audit = match self.driver_previous.take() {
+            Some(previous) => DriverAuditState::Done(previous),
+            None => DriverAuditState::Idle,
+        };
+        let d = i18n::t(self.language);
+        push_journal(
+            &mut self.journal,
+            d.driver_cancelled_for_session.to_string(),
+        );
     }
 
     /// v1.1: the result shown before a re-check stays available until the
@@ -6484,6 +6535,34 @@ impl WinStateDiagApp {
         }
     }
 
+    /// v1.1: the Driver Audit result a REPORT may use — never a launch
+    /// preflight result (that one is shown on the card only).
+    fn report_audit(&self) -> Option<&AuditReport> {
+        self.audit_report().filter(|_| {
+            !self
+                .driver_checked
+                .as_ref()
+                .is_some_and(|s| s.origin == CheckOrigin::Preflight)
+        })
+    }
+
+    /// v1.1: the crash inventory a REPORT may use — never the launch
+    /// preflight listing.
+    fn report_inventory(&self) -> Option<&crash_dump::Inventory> {
+        match &self.crash.inventory {
+            Some(Ok(inv))
+                if !self
+                    .crash
+                    .inventory_checked
+                    .as_ref()
+                    .is_some_and(|s| s.origin == CheckOrigin::Preflight) =>
+            {
+                Some(inv)
+            }
+            _ => None,
+        }
+    }
+
     /// v1.0 the Driver Audit as SHOWN: the base audit plus the dump-driven
     /// items for a probable third-party kernel module named by a crash dump
     /// (outside the normal audit scope when needed). Base audit unchanged.
@@ -7068,7 +7147,8 @@ impl WinStateDiagApp {
             } = item;
             // Confidence uses the BASE Driver Audit only: the dump-driven
             // item derived from this very dump never corroborates it.
-            let a = crash_dump::DumpAnalysis::build(dmp, bc, status, raw, self.audit_report())
+            // v1.1: a preflight audit never corroborates report evidence.
+            let a = crash_dump::DumpAnalysis::build(dmp, bc, status, raw, self.report_audit())
                 .with_module(module_info, resolution);
             let (txt, js, dmp_name) = crash_dump::evidence_names(&stamp, n + 1, &a.dump.name);
             let copied = bytes.map(|b| {
@@ -8195,18 +8275,18 @@ impl WinStateDiagApp {
     /// v1.0 machine-readable (system, hardware) state codes — two separate
     /// concepts: "Hardware state: OK" never means "computer healthy".
     fn state_codes(&self) -> (String, String) {
-        let inv = match &self.crash.inventory {
-            Some(Ok(inv)) => Some(inv),
-            _ => None,
-        };
+        // v1.1: the manifest states of a client report never come from the
+        // launch preflight (its results are display-only).
+        let inv = self.report_inventory();
         let hang = inv.is_some_and(|inv| {
             crash_dump::incident_verdicts(inv, &self.crash.analyses)
                 .iter()
                 .any(|(_, v)| v.hang_confirmed)
         });
-        let driver_problem = self
-            .audit_view()
-            .is_some_and(|r| r.overall == Severity::Problem);
+        let driver_problem = self.report_audit().is_some()
+            && self
+                .audit_view()
+                .is_some_and(|r| r.overall == Severity::Problem);
         let system = match inv {
             Some(inv) if !inv.bugchecks.is_empty() => "ATTENTION_BSOD",
             _ if hang => "ATTENTION_HANG",
@@ -9773,6 +9853,9 @@ impl WinStateDiagApp {
     /// is started any more and nothing new is written.
     pub(crate) fn shutdown(&mut self, flag: &std::sync::atomic::AtomicBool) {
         engine::request_shutdown(flag);
+        if let Some(cancel) = &self.driver_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
         if let Some(cancel) = &self.session_cancel {
             cancel.store(true, Ordering::SeqCst);
         }

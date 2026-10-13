@@ -741,6 +741,7 @@ pub struct Dict {
     pub origin_preflight_short: &'static str,
     pub origin_manual_short: &'static str,
     pub origin_session_short: &'static str,
+    pub driver_cancelled_for_session: &'static str,
 }
 
 pub static RU: Dict = Dict {
@@ -1462,6 +1463,7 @@ pub static RU: Dict = Dict {
     origin_preflight_short: "Предварительно",
     origin_manual_short: "Повторно",
     origin_session_short: "В диагностике",
+    driver_cancelled_for_session: "[INFO] Проверка драйверов вне сессии остановлена: диагностика выполнит собственную проверку.",
 };
 
 pub static EN: Dict = Dict {
@@ -2183,6 +2185,7 @@ pub static EN: Dict = Dict {
     origin_preflight_short: "Preflight",
     origin_manual_short: "Re-check",
     origin_session_short: "In session",
+    driver_cancelled_for_session: "[INFO] The Driver Audit outside the session was stopped: the diagnostic runs its own audit.",
 };
 
 /// The one lookup point: every draw/build function calls `i18n::t(lang)`

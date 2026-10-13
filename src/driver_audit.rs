@@ -1982,13 +1982,9 @@ pub fn write_report(report: &AuditReport, dir: &Path, tag: &str) -> Result<PathB
 // Collection (Windows only)
 // ---------------------------------------------------------------------
 
-/// Runs the read-only collector from `work_dir` and classifies the result.
-pub fn run_audit(work_dir: &Path) -> Result<AuditReport, String> {
-    run_audit_with_cancel(work_dir, &std::sync::atomic::AtomicBool::new(false))
-}
-
-/// As [`run_audit`]; `cancel` (the Stop button of a diagnostic run) ends
-/// the collector process early. Classification is unchanged.
+/// Runs the read-only collector from `work_dir` and classifies the result;
+/// `cancel` (Stop, a superseding diagnostic, app close) ends the collector
+/// process early. Classification is unchanged.
 pub fn run_audit_with_cancel(
     work_dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,

@@ -266,7 +266,7 @@ fn the_launch_code_path_starts_only_the_read_only_preflight() {
     let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
     for needed in [
         "self.driver_origin = CheckOrigin::Preflight;",
-        "self.driver_audit = start_driver_audit();",
+        "self.driver_audit = start_driver_audit(self.new_driver_cancel());",
         "self.start_crypto_check_as(CheckOrigin::Preflight);",
         "self.start_crash_scan_as(CheckOrigin::Preflight);",
     ] {

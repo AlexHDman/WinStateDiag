@@ -277,9 +277,12 @@ fn preflight_results_never_join_the_client_session() {
         app.crash.rescan_for_session,
         "the session gets its own scan"
     );
-    // The preflight results arrive during the session …
-    dtx.send(Ok(audit())).unwrap();
+    // The preflight Driver Audit was cancelled (the engine audits for the
+    // session) — its late result has nowhere to go …
+    assert!(matches!(app.driver_audit, DriverAuditState::Idle));
+    assert!(dtx.send(Ok(audit())).is_err());
     app.poll_driver_audit();
+    // … and the preflight crash listing arrives during the session …
     ctx_.send(CrashMsg::Inventory(Ok(inventory(
         crash_dump::DebuggerStatus::NotInstalled,
     ))))
@@ -858,4 +861,135 @@ fn dashboard_crypto_and_driver_headers_fit_at_100_125_150() {
             );
         }
     }
+}
+
+// ---------------- PR #4 review round 1 regressions ----------------
+
+/// P1: preflight results are display-only — the manifest states and the
+/// crash-dump correlation of a client report never use them.
+#[test]
+fn preflight_results_never_feed_report_states_or_correlation() {
+    let (mut app, exe) = app_in("derived");
+    app.start_preflight();
+    let mut bad = audit();
+    bad.overall = Severity::Problem;
+    deliver_audit(&mut app, Ok(bad));
+    let mut inv = inventory(crash_dump::DebuggerStatus::NotInstalled);
+    inv.bugchecks = vec![crash_dump::BugcheckEvent {
+        time: "2026-10-03T00:35:00".into(),
+        code: 0x139,
+        params: Vec::new(),
+        dump_path: None,
+        source: crash_dump::BugcheckSource::Wer1001,
+    }];
+    app.start_crash_scan_as(CheckOrigin::Preflight);
+    deliver_scan(&mut app, inv.clone());
+    // Shown on the cards …
+    assert!(app.audit_report().is_some());
+    assert!(matches!(app.crash.inventory, Some(Ok(_))));
+    // … but never a report's state or correlation input.
+    assert!(app.report_audit().is_none());
+    assert!(app.report_inventory().is_none());
+    assert_eq!(app.state_codes().0, "NO_DATA");
+    // The same data from a SESSION / manual run is used.
+    app.start_crash_scan_as(CheckOrigin::Manual);
+    deliver_scan(&mut app, inv);
+    app.driver_origin = CheckOrigin::Manual;
+    let mut bad = audit();
+    bad.overall = Severity::Problem;
+    deliver_audit(&mut app, Ok(bad));
+    assert!(app.report_audit().is_some());
+    assert_eq!(app.state_codes().0, "ATTENTION_BSOD");
+    cleanup(&exe);
+}
+
+/// P1: a full diagnostic cancels a running app-side audit (its process
+/// tree ends) — the engine's audit is the only one; no manual audit can
+/// start during the session.
+#[test]
+fn start_diagnostics_cancels_the_running_preflight_audit() {
+    let (mut app, exe) = app_in("drvcancel");
+    app.start_preflight();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<AuditReport, String>>();
+    app.driver_audit = DriverAuditState::Running(rx);
+    let cancel = app.new_driver_cancel();
+    app.client_name = "Клиент".into();
+    app.start_diagnostics();
+    assert!(cancel.load(Ordering::SeqCst), "process tree ends");
+    assert!(matches!(app.driver_audit, DriverAuditState::Idle));
+    assert!(
+        app.journal
+            .iter()
+            .any(|e| e.message == i18n::RU.driver_cancelled_for_session)
+    );
+    drop(tx);
+    // During the session «Проверка» is disabled and starts nothing.
+    assert!(!app.build_vm(0.0, 0.0).drivers_check_enabled);
+    let before = app.collector_requests.len();
+    app.apply(Action::CheckDrivers);
+    assert_eq!(app.collector_requests.len(), before);
+    cleanup(&exe);
+}
+
+/// P2: whatever CryptoPro operation runs when a diagnostic starts (⟳ or a
+/// ReHash), the session gets its own fresh check right after it.
+#[test]
+fn session_gets_its_own_crypto_check_after_a_manual_check_or_rehash() {
+    for rehash in [false, true] {
+        let (mut app, exe) = app_in("cryptosession");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.crypto_rx = Some(rx);
+        app.crypto_origin = CheckOrigin::Manual;
+        app.client_name = "Клиент".into();
+        app.start_diagnostics();
+        assert!(app.crypto_recheck_for_session, "rehash={rehash}");
+        let before = app.collector_requests.len();
+        if rehash {
+            tx.send(CryptoEvent::Rehashed(cryptopro::RehashOutcome {
+                state: cryptopro::HashState::HashOk,
+                journal: vec!["[PASS] ReHash".into()],
+            }))
+            .unwrap();
+        } else {
+            tx.send(CryptoEvent::Checked(
+                cryptopro::Detection::NotInstalled,
+                cryptopro::HashState::HashOk,
+            ))
+            .unwrap();
+        }
+        app.poll_crypto();
+        assert_eq!(app.collector_requests[before..], ["cryptopro"]);
+        assert_eq!(app.crypto_origin, CheckOrigin::Session);
+        assert!(!app.crypto_recheck_for_session);
+        cleanup(&exe);
+    }
+}
+
+/// P2: a failed attempt never re-stamps the result that stays shown.
+#[test]
+fn failed_audit_keeps_the_time_and_origin_of_the_shown_result() {
+    let (mut app, exe) = app_in("drvstamp");
+    app.start_preflight();
+    deliver_audit(&mut app, Ok(audit()));
+    let shown = app.driver_checked.clone().unwrap();
+    assert_eq!(shown.origin, CheckOrigin::Preflight);
+    // Engine audit of a session fails: the preflight result stays, with
+    // its own stamp; the failure is in the history.
+    app.client_name = "Клиент".into();
+    app.start_diagnostics();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(engine::EngineEvent::DriverAudit(Err(
+        "collector failed".into()
+    )))
+    .unwrap();
+    if let RunState::Running { rx: run_rx, .. } = &mut app.state {
+        *run_rx = rx;
+    }
+    app.poll_engine();
+    assert!(matches!(app.driver_audit, DriverAuditState::Done(_)));
+    assert_eq!(app.driver_checked.as_ref(), Some(&shown));
+    assert!(app.driver_history.last().is_some_and(
+        |e| e.outcome.contains("collector failed") && e.stamp.origin == CheckOrigin::Session
+    ));
+    cleanup(&exe);
 }
