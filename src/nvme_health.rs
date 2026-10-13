@@ -1705,7 +1705,8 @@ pub(crate) mod tests {
     /// IOCTL or pass-through path exists in this module.
     #[test]
     fn source_is_strictly_read_only() {
-        let src = include_str!("nvme_health.rs");
+        // CRLF checkouts (core.autocrlf): match on LF.
+        let src = include_str!("nvme_health.rs").replace("\r\n", "\n");
         let code = &src[..src.find("#[cfg(test)]\npub(crate) mod tests").unwrap()];
         for forbidden in [
             "GENERIC_WRITE",
