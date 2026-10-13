@@ -2,6 +2,26 @@
 
 Protocol: `C:\AI\EXPC_DEVELOPMENT_PROTOCOL.md` (v1.2). Project-specific safety / release contract (`scripts/release/`, fail-closed gate) overrides it.
 
+## Current checkpoint — MICROFIX 01 FINAL VALIDATION (2026-10-13)
+
+| Field | Value |
+|---|---|
+| Status / stage / state | **PARTIAL**; stabilization; validation stopped at environment blockers; no further implementation |
+| Task mode / agent / environment | Final validation only; Codex / GPT-6 family (exact variant/effort not exposed); Windows, HEADLESS/BACKGROUND |
+| Branch@SHA | `fix/v1.1-live-polish` @ `b74cece932d5fd6d39e99faedfbc9c0c2346ea6e` |
+| Git / concurrency | Clean before checks; no parallel Cargo/Rust/test processes before or after sequential checks. Only this checkpoint is modified by final validation. |
+| GitHub remote | **NOT VERIFIED**: `git ls-remote` cannot connect to `github.com:443`. Local `origin/fix/v1.1-live-polish` equals HEAD, but this does not verify current server state. No blind push. |
+| CIM | **NOT VERIFIED**: current process belongs to `CodexSandboxUsers`, Medium integrity, administrator role disabled. `Winmgmt` is Running. Independent CIM and WMI reads both return access denied; CIM reports `0x80041003`. Evidence identifies current process/environment access denial; WMI corruption and a requirement for elevation are not established. No unrestricted-user comparison, UAC, ACL/service/system changes. |
+| CLI TESTS | `cargo fmt --check`: PASS; `cargo check --all-targets --offline`: PASS; `cargo test --offline`: exit 101, **640 passed / 1 failed**, `passport::tests::collector_runs` lacks CIM data. That environment-dependent acceptance is **NOT VERIFIED**; full suite is not PASS. |
+| MICROFIX 01 / OFFSCREEN QA | Existing `app::v11_tests`: **36/36 PASS**, including native repeated callbacks, every Passport card and Copy, scroll/resize/footer and other Details windows. Headless native-callback fixtures only; GPU capture NOT RUN. No demonstrated Microfix defect; source/design/collector unchanged. |
+| BUILD | `cargo build --release --offline`: PASS. `target\release\win_state_diag.exe`, 17,334,784 bytes, SHA256 `9141FE28EB5C85DAC3BA4C1704EA7C846E7C9129E1F6E50DDDD86659ADCCD4BE`. Existing dist SHA256 remains `F3E7A10DE4BA49034F6850496DBEDA4E1888FCDB174FE236B3185265C6FD10EA`. |
+| LIVE GUI | **NOT RUN**; not implied by regression PASS |
+| Evidence | `target/microfix01-final-20261013T180025/` contains diagnostic summary and individual command logs. Historical implementation checkpoint retained below. |
+| Commit / push | **BLOCKED** for this checkpoint: session permission profile makes `.git` read-only; GitHub is also unreachable. No new commit/push/merge/tag/release. |
+| Remaining blockers / next action | Authorized environment with CIM and GitHub access is required to verify the collector and current remote HEAD, then commit/push this checkpoint only to `fix/v1.1-live-polish`. Physical GUI remains a separate acceptance step. STOP. |
+
+## Historical implementation checkpoint (retained unchanged)
+
 | Field | Value |
 |---|---|
 | Project | WinStateDiag v1.1 |
