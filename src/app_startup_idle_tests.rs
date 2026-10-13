@@ -165,7 +165,8 @@ fn startup_runs_no_diagnostic_and_starts_no_collector_in_both_languages() {
 /// the runtime checks above could not see.
 #[test]
 fn the_launch_code_path_contains_no_collector_start() {
-    let src = include_str!("app.rs");
+    // Sources may be checked out with CRLF (core.autocrlf): slice on LF.
+    let src = &include_str!("app.rs").replace("\r\n", "\n");
     let start = src
         .find("impl Default for WinStateDiagApp {")
         .expect("constructor");
@@ -197,7 +198,7 @@ fn the_launch_code_path_contains_no_collector_start() {
         !body.contains("WindowsTopologySource"),
         "no write probe at launch"
     );
-    let topo = include_str!("storage_topology.rs");
+    let topo = &include_str!("storage_topology.rs").replace("\r\n", "\n");
     let at = topo
         .find("impl TopologySource for LaunchTopologySource")
         .unwrap();

@@ -2523,7 +2523,8 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
         assert_eq!(args[0], "-z", "dump opened read-only");
         assert!(args.iter().any(|a| a == "!analyze -v; q"));
         assert!(args[3].starts_with("srv*") && args[3].ends_with(MS_SYMBOL_SERVER));
-        let src = include_str!("crash_dump.rs");
+        // CRLF checkouts (core.autocrlf): match on LF.
+        let src = include_str!("crash_dump.rs").replace("\r\n", "\n");
         let code = &src[..src.find("#[cfg(test)]\npub(crate) mod tests").unwrap()];
         for forbidden in [
             "remove_file",
@@ -2802,7 +2803,8 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
             ["install", "--id", "Microsoft.WinDbg", "-e", "--source"]
         );
         assert!(args.contains(&"--disable-interactivity".to_string()));
-        let src = include_str!("crash_dump.rs");
+        // CRLF checkouts (core.autocrlf): match on LF.
+        let src = include_str!("crash_dump.rs").replace("\r\n", "\n");
         let code = &src[..src.find("#[cfg(test)]\npub(crate) mod tests").unwrap()];
         // No visible console window, no UAC tricks.
         for forbidden in ["cmd.exe", "runas", "-Verb", "ShellExecute", "--silent"] {

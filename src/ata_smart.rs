@@ -627,7 +627,8 @@ mod tests {
 
     #[test]
     fn reader_is_strictly_read_only() {
-        let src = include_str!("ata_smart.rs");
+        // CRLF checkouts (core.autocrlf): match on LF.
+        let src = include_str!("ata_smart.rs").replace("\r\n", "\n");
         let code = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
         for forbidden in [
             "SMART_SEND_DRIVE_COMMAND",
