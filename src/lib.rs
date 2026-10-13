@@ -429,7 +429,7 @@ fn consistency_probe(out: Option<PathBuf>) -> i32 {
         format!("APP_VERSION={APP_VERSION}"),
         format!("PRODUCER_VERSION={}", manifest::PRODUCER_VERSION),
     ];
-    let mut ok = APP_VERSION == "1.0" && manifest::PRODUCER_VERSION == "1.0";
+    let mut ok = APP_VERSION == "1.1" && manifest::PRODUCER_VERSION == "1.1";
     // Storage: an ATA SMART health record through the shipped writers.
     let disk = storage_topology::PhysicalDiskInfo {
         index: 1,
@@ -607,6 +607,10 @@ struct StartupGuard {
 }
 
 impl eframe::App for StartupGuard {
+    fn on_exit(&mut self) {
+        self.inner.on_exit();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.inner.logic(ctx, frame);
     }
@@ -639,8 +643,8 @@ mod consistency_probe_tests {
         let out = dir.join("c.txt");
         let code = super::consistency_probe(Some(out.clone()));
         let text = std::fs::read_to_string(&out).unwrap();
-        assert!(text.contains("TITLE=WinStateDiag — v1.0"), "{text}");
-        assert!(text.contains("PRODUCER_VERSION=1.0"), "{text}");
+        assert!(text.contains("TITLE=WinStateDiag — v1.1"), "{text}");
+        assert!(text.contains("PRODUCER_VERSION=1.1"), "{text}");
         assert!(
             text.contains(
                 "STORAGE_ATA health_status=OK correlation_state=OK correlation_health=OK -> PASS"

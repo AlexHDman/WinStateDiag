@@ -479,11 +479,11 @@ fn crypto_logo(ctx: &egui::Context, muted: bool) -> egui::TextureHandle {
     t
 }
 
-/// ONE CryptoPro card, composed as in the canonical master: simplified red
-/// mark + name (top), status disc (middle), status word directly under it
-/// (check + word read as one object), ReHash/Проверка button (bottom).
-/// Only NO HASH makes the button clickable (unchanged behaviour: one click
-/// runs the existing ReHash workflow, no confirmation dialog).
+/// ONE compact CryptoPro card (v1.1 approved layout): simplified red mark +
+/// name and the round re-check button (top), status disc (middle), the
+/// status word with its time / origin caption, «Детали» (bottom). ReHash
+/// is never on the card: it lives in Details behind a warning and an
+/// explicit confirmation.
 fn draw_crypto(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
@@ -498,7 +498,8 @@ fn draw_crypto(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>
         Color32::WHITE,
     );
     let name_x = mx(o, l::CRYPTO_NAME_X);
-    let name_max = card.right() - 8.0 - name_x;
+    let recheck_c = mpos(o, l::CRYPTO_RECHECK_CENTER[0], l::CRYPTO_RECHECK_CENTER[1]);
+    let name_max = recheck_c.x - l::CRYPTO_RECHECK_D / 2.0 - 6.0 - name_x;
     paint::text(
         &p,
         name_x,
@@ -580,27 +581,47 @@ fn draw_crypto(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>
         col,
     );
 
-    // ReHash button: same place and size in every state. Clickable (blue)
-    // only for NO HASH; otherwise a calm, readable non-interactive control.
-    let button_rect = r(o, l::CRYPTO_BUTTON);
-    let active = vm.crypto == CryptoVm::NoHash;
-    let (kind, icon_kind) = if active {
-        (ButtonKind::Primary, ButtonIcon::Refresh)
-    } else {
-        (ButtonKind::Passive, ButtonIcon::RefreshAccent)
-    };
+    // v1.1: when / how this state was produced (preflight / re-check /
+    // session) - never mistaken for a full diagnostic result.
+    if let Some(caption) = &vm.crypto_caption {
+        paint::text(
+            &p,
+            card.center().x,
+            my(o, l::CRYPTO_CAPTION_BASELINE),
+            Align::Center,
+            caption,
+            fit_style(&p, caption, t::CAPTION, status_max),
+            c::TEXT_MUTED,
+        );
+    }
+
+    // Re-check: a fresh read-only check (never ReHash); only when idle.
+    let recheck = paint::round_refresh_button(
+        ui,
+        recheck_c,
+        l::CRYPTO_RECHECK_D,
+        "crypto_recheck",
+        vm.crypto_recheck_enabled,
+    );
+    if recheck.clicked() && vm.crypto_recheck_enabled {
+        actions.push(Action::CryptoRecheck);
+    }
+    recheck.on_hover_text(d.crypto_recheck_tip);
+
+    // Details: always available (presence, version, licence, HASH, time,
+    // source, errors; ReHash behind its warning).
     let resp = paint::button(
         ui,
-        button_rect,
-        "crypto_rehash",
-        d.crypto_rehash_button,
-        kind,
-        active && vm.controls_enabled,
-        icon_kind,
+        r(o, l::CRYPTO_BUTTON),
+        "crypto_details",
+        d.crypto_details_button,
+        ButtonKind::Secondary,
+        true,
+        ButtonIcon::None,
         t::CRYPTO_ACTION,
     );
-    if resp.clicked() && active && vm.controls_enabled {
-        actions.push(Action::CryptoRehashRequest);
+    if resp.clicked() {
+        actions.push(Action::ShowCryptoDetails);
     }
 }
 
@@ -1056,6 +1077,34 @@ fn draw_drivers(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action
         t::TITLE_DRIVERS,
     );
     let details_enabled = !matches!(vm.drivers, DriversVm::Running);
+    // v1.1 «Проверка»: manual re-check of this module only (never two).
+    if paint::button(
+        ui,
+        r(o, l::DRIVERS_CHECK_BUTTON),
+        "drivers_check",
+        d.driver_check_button,
+        ButtonKind::Secondary,
+        vm.drivers_check_enabled,
+        ButtonIcon::None,
+        t::BUTTON_TEXT,
+    )
+    .clicked()
+        && vm.drivers_check_enabled
+    {
+        actions.push(Action::CheckDrivers);
+    }
+    // v1.1: when / how the shown result was produced.
+    if let Some(caption) = &vm.drivers_caption {
+        paint::text(
+            &p,
+            mx(o, l::DRIVERS_TITLE_X),
+            my(o, l::DRIVERS_CAPTION_BASELINE),
+            Align::Min,
+            caption,
+            t::CHECK_CAPTION,
+            c::TEXT_MUTED,
+        );
+    }
     if paint::button(
         ui,
         r(o, l::DRIVERS_BUTTON),

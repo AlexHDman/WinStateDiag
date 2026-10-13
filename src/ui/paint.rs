@@ -506,19 +506,12 @@ pub enum ButtonKind {
     Secondary,
     /// Secondary look with the softer label colour (journal "Очистить").
     Subtle,
-    /// Non-interactive secondary look: the control is present and readable
-    /// (e.g. CryptoPro ReHash while HASH is fine) but not clickable. Unlike
-    /// the disabled grey it keeps the card composition calm and legible.
-    Passive,
 }
 
 #[derive(Clone, Copy)]
 pub enum ButtonIcon {
     None,
     Play,
-    Refresh,
-    /// Refresh glyph in the accent blue (CryptoPro ReHash).
-    RefreshAccent,
     Trash,
 }
 
@@ -541,11 +534,6 @@ pub fn button(
     let hovered = enabled && response.hovered();
     let pressed = enabled && response.is_pointer_button_down_on();
     let (fill, border, text_col) = match (kind, enabled) {
-        (ButtonKind::Passive, _) => (
-            c::BUTTON_SECONDARY_FILL,
-            c::BUTTON_SECONDARY_BORDER,
-            c::TEXT_BODY,
-        ),
         (_, false) => (
             c::BUTTON_DISABLED_FILL,
             c::BORDER_INNER,
@@ -594,9 +582,7 @@ pub fn button(
     let (icon_box, icon_gap) = match icon {
         ButtonIcon::None => (0.0, 0.0),
         ButtonIcon::Trash => (17.0, 15.0),
-        ButtonIcon::Play | ButtonIcon::Refresh | ButtonIcon::RefreshAccent => {
-            (style.size, style.size * 0.05 + 10.0)
-        }
+        ButtonIcon::Play => (style.size, style.size * 0.05 + 10.0),
     };
     let icon_w = icon_box + icon_gap;
     let tw = text_width(painter, label, style);
@@ -611,17 +597,6 @@ pub fn button(
             painter,
             Rect::from_center_size(icon_center, vec2(isz * 0.78, isz * 0.9)),
             text_col,
-        ),
-        ButtonIcon::Refresh => icon_refresh(painter, icon_center, isz * 0.9, text_col),
-        ButtonIcon::RefreshAccent => icon_refresh(
-            painter,
-            icon_center,
-            isz * 1.05,
-            if enabled || kind == ButtonKind::Passive {
-                c::BLUE_ACCENT
-            } else {
-                text_col
-            },
         ),
         ButtonIcon::Trash => icon_trash(
             painter,
@@ -639,6 +614,55 @@ pub fn button(
         style,
         text_col,
     );
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// v1.1 round icon button (CryptoPro ⟳): a secondary-style disc with the
+/// refresh glyph, real hover / pressed states; disabled = calm grey.
+pub fn round_refresh_button(
+    ui: &mut Ui,
+    center: Pos2,
+    diameter: f32,
+    id_salt: &str,
+    enabled: bool,
+) -> Response {
+    let rect = Rect::from_center_size(center, vec2(diameter, diameter));
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, ui.id().with(id_salt), sense);
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let (fill, border, glyph) = if !enabled {
+        (
+            c::BUTTON_DISABLED_FILL,
+            c::BORDER_INNER,
+            c::BUTTON_DISABLED_TEXT,
+        )
+    } else if pressed {
+        (
+            c::BUTTON_SECONDARY_PRESSED,
+            c::BORDER_ACTIVE,
+            c::BLUE_ACCENT,
+        )
+    } else if hovered {
+        (c::BUTTON_SECONDARY_HOVER, c::BORDER_ACTIVE, c::BLUE_ACCENT)
+    } else {
+        (
+            c::BUTTON_SECONDARY_FILL,
+            c::BUTTON_SECONDARY_BORDER,
+            c::BLUE_ACCENT,
+        )
+    };
+    let painter = ui.painter();
+    painter.circle(center, diameter / 2.0, fill, Stroke::new(1.0, border));
+    icon_refresh(painter, center, diameter * 0.5, glyph);
     if enabled {
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {

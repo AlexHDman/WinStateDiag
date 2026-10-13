@@ -484,6 +484,14 @@ pub struct DashboardVm {
     pub stop_enabled: bool,
     /// CryptoPro card: exactly one current state.
     pub crypto: CryptoVm,
+    /// v1.1: when / how the shown CryptoPro state was produced.
+    pub crypto_caption: Option<String>,
+    /// v1.1: ⟳ is available (no check / ReHash running).
+    pub crypto_recheck_enabled: bool,
+    /// v1.1: when / how the shown Driver Audit result was produced.
+    pub drivers_caption: Option<String>,
+    /// v1.1: «Проверка» is available (no audit running).
+    pub drivers_check_enabled: bool,
     pub computer_name: String,
     pub stages: Vec<StageRow>,
     pub overall: OverallVm,
@@ -538,8 +546,17 @@ pub enum CryptoVm {
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    /// NO HASH clicked: ask for confirmation of the ReHash.
+    /// «Выполнить ReHash» (CryptoPro Details): open the warning /
+    /// confirmation (v1.1: nothing runs yet).
     CryptoRehashRequest,
+    /// v1.1: the user confirmed the ReHash warning.
+    CryptoRehashConfirmed,
+    CryptoRehashCancelled,
+    /// v1.1: ⟳ on the CryptoPro card — a fresh read-only check.
+    CryptoRecheck,
+    ShowCryptoDetails,
+    /// v1.1: «Проверка» on the Driver Audit card — manual re-check.
+    CheckDrivers,
     /// A physical-disk card was clicked directly (v0.3.6 UI finalization):
     /// select exactly that candidate index. No dropdown, no cycling.
     SelectSsdDisk(usize),

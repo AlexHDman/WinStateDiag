@@ -811,11 +811,11 @@ mod tests {
         let lock = include_str!("../Cargo.lock").replace("\r\n", "\n");
         let package = toml.split("[dependencies]").next().unwrap();
         assert!(package.contains("name = \"win_state_diag\""));
-        assert!(package.contains("\nversion = \"1.0.0\"\n"), "{package}");
-        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"1.0.0\"\n"));
-        // v1.0 policy: displayed / manifest / folder version is "1.0".
-        assert_eq!(PRODUCER_VERSION, "1.0");
-        assert_eq!(crate::APP_VERSION, "1.0");
+        assert!(package.contains("\nversion = \"1.1.0\"\n"), "{package}");
+        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"1.1.0\"\n"));
+        // v1.1: displayed / manifest / folder version is "1.1".
+        assert_eq!(PRODUCER_VERSION, "1.1");
+        assert_eq!(crate::APP_VERSION, "1.1");
         let main = include_str!("lib.rs").replace("\r\n", "\n");
         assert!(main.contains("pub const APP_VERSION: &str = env!(\"WSD_DISPLAY_VERSION\");"));
         assert!(main.contains("format!(\"WinStateDiag — v{APP_VERSION}\")"));

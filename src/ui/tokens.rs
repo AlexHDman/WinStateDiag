@@ -122,16 +122,23 @@ pub mod layout {
 
     /// CryptoPro: one tall card spanning the Client + EXPC rows.
     pub const CRYPTO_CARD: R = [373.0, 121.0, 185.0, 232.0];
+    /// v1.1 compact CryptoPro card: logo + name, round ⟳ at the top
+    /// right, status disc, compact status + time caption, «Детали» below.
     /// Simplified red CryptoPro mark (outer shield removed).
-    pub const CRYPTO_LOGO: R = [388.0, 139.0, 50.0, 50.0];
-    pub const CRYPTO_NAME_X: f32 = 447.0;
-    pub const CRYPTO_NAME_BASELINE: f32 = 169.5;
-    /// Status check (disc) — centred in the card, directly above HASH.
-    pub const CRYPTO_ICON: R = [437.0, 207.0, 58.0, 58.0];
-    /// HASH sits 14px under the check: check + HASH read as one object.
-    pub const CRYPTO_STATUS_BASELINE: f32 = 293.5;
-    /// ReHash / Проверка: comfortable side margins, bottom of the card.
-    pub const CRYPTO_BUTTON: R = [388.0, 309.0, 156.0, 37.0];
+    pub const CRYPTO_LOGO: R = [385.0, 134.0, 40.0, 40.0];
+    pub const CRYPTO_NAME_X: f32 = 431.0;
+    pub const CRYPTO_NAME_BASELINE: f32 = 161.0;
+    /// Round ⟳ (fresh read-only check): centre and diameter.
+    pub const CRYPTO_RECHECK_CENTER: [f32; 2] = [533.0, 154.0];
+    pub const CRYPTO_RECHECK_D: f32 = 30.0;
+    /// Status disc — centred in the card, directly above the status.
+    pub const CRYPTO_ICON: R = [439.0, 188.0, 54.0, 54.0];
+    /// Status word sits under the disc: disc + word read as one object.
+    pub const CRYPTO_STATUS_BASELINE: f32 = 268.0;
+    /// v1.1: when / how the state was produced (small, muted).
+    pub const CRYPTO_CAPTION_BASELINE: f32 = 288.0;
+    /// «Детали»: comfortable side margins, bottom of the card.
+    pub const CRYPTO_BUTTON: R = [388.0, 303.0, 156.0, 36.0];
 
     pub const HARDWARE_CARD: R = [19.0, 364.0, 539.0, 89.0];
     pub const HARDWARE_TITLE_BASELINE: f32 = 386.5;
@@ -175,6 +182,10 @@ pub mod layout {
     pub const DRIVERS_TITLE_X: f32 = 90.0;
     pub const DRIVERS_TITLE_BASELINE: f32 = 724.5;
     pub const DRIVERS_BUTTON: R = [420.0, 703.0, 118.0, 32.0];
+    /// v1.1 «Проверка» (manual re-check) left of «Подробнее».
+    pub const DRIVERS_CHECK_BUTTON: R = [310.0, 703.0, 104.0, 32.0];
+    /// v1.1 time / origin caption under the title.
+    pub const DRIVERS_CAPTION_BASELINE: f32 = 741.5;
     pub const DRIVER_ROW_FIRST_BASELINE: f32 = 757.8;
     pub const DRIVER_ROW_PITCH: f32 = 28.15;
     pub const DRIVER_ROWS_MAX: usize = 6;
@@ -703,6 +714,8 @@ pub mod typography {
     /// Temp-file note inside the Selected Drive Information panel.
     pub const SSD_NOTE: TextStyle = s(12.0, Regular);
     pub const CAPTION: TextStyle = s(14.2, Regular);
+    /// v1.1 time / origin caption of a module card.
+    pub const CHECK_CAPTION: TextStyle = s(12.0, Regular);
     /// "Прошло" / "Осталось (ETA)".
     pub const TIME_LABEL: TextStyle = s(13.5, Regular);
     pub const MUTED: TextStyle = s(15.0, Regular);
