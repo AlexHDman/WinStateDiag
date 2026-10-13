@@ -280,8 +280,17 @@ fn preflight_results_never_join_the_client_session() {
     // The preflight Driver Audit was cancelled (the engine audits for the
     // session) — its late result has nowhere to go …
     assert!(matches!(app.driver_audit, DriverAuditState::Idle));
-    assert!(dtx.send(Ok(audit())).is_err());
+    assert!(
+        app.driver_draining.is_some(),
+        "drained until its worker ends"
+    );
+    dtx.send(Ok(audit())).unwrap();
     app.poll_driver_audit();
+    assert!(app.driver_draining.is_none());
+    assert!(
+        matches!(app.driver_audit, DriverAuditState::Idle),
+        "result discarded"
+    );
     // … and the preflight crash listing arrives during the session …
     ctx_.send(CrashMsg::Inventory(Ok(inventory(
         crash_dump::DebuggerStatus::NotInstalled,
@@ -992,4 +1001,145 @@ fn failed_audit_keeps_the_time_and_origin_of_the_shown_result() {
         |e| e.outcome.contains("collector failed") && e.stamp.origin == CheckOrigin::Session
     ));
     cleanup(&exe);
+}
+
+// ---------------- PR #4 review round 2 regressions ----------------
+
+/// The pending session check survives the end of the diagnostic; Stop
+/// cancels it.
+#[test]
+fn pending_session_checks_survive_the_run_end_and_stop_cancels_them() {
+    // CryptoPro: the diagnostic ended before the running check did.
+    let (mut app, exe) = app_in("pendingend");
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.crypto_rx = Some(rx);
+    app.crypto_origin = CheckOrigin::Manual;
+    app.client_name = "Клиент".into();
+    app.start_diagnostics();
+    assert!(app.crypto_recheck_for_session);
+    app.state = RunState::Idle;
+    let before = app.collector_requests.len();
+    tx.send(CryptoEvent::Checked(
+        cryptopro::Detection::NotInstalled,
+        cryptopro::HashState::HashOk,
+    ))
+    .unwrap();
+    app.poll_crypto();
+    assert_eq!(app.collector_requests[before..], ["cryptopro"]);
+    assert_eq!(app.crypto_origin, CheckOrigin::Session);
+    // Crash: the preflight scan ends after the run; the fresh scan still
+    // belongs to the session's package.
+    let session_package = Arc::clone(&app.package);
+    app.crash.rescan_for_session = true;
+    app.crash.rescan_package = Some(Arc::clone(&session_package));
+    app.crash.scan_origin = Some(CheckOrigin::Preflight);
+    deliver_scan(
+        &mut app,
+        inventory(crash_dump::DebuggerStatus::NotInstalled),
+    );
+    assert_eq!(app.crash.scan_origin, Some(CheckOrigin::Session));
+    assert!(Arc::ptr_eq(&app.package_of("crash"), &session_package));
+    cleanup(&exe);
+    // Stop cancels both pending requests.
+    let (mut app, exe) = app_in("pendingstop");
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.crypto_rx = Some(rx);
+    app.crypto_origin = CheckOrigin::Manual;
+    app.client_name = "Клиент".into();
+    app.start_diagnostics();
+    app.crash.rescan_for_session = true;
+    app.request_stop();
+    assert!(!app.crypto_recheck_for_session && !app.crash.rescan_for_session);
+    assert!(app.crash.rescan_package.is_none());
+    cleanup(&exe);
+}
+
+/// A cancelled audit blocks the next one until its worker has finished.
+#[test]
+fn cancelled_audit_blocks_the_next_one_until_it_ended() {
+    let (mut app, exe) = app_in("draining");
+    let (tx, rx) = std::sync::mpsc::channel::<Result<AuditReport, String>>();
+    app.driver_audit = DriverAuditState::Running(rx);
+    let _cancel = app.new_driver_cancel();
+    app.client_name = "Клиент".into();
+    app.start_diagnostics();
+    assert!(app.driver_draining.is_some());
+    // The diagnostic stops at once; the cancelled worker still runs.
+    app.state = RunState::Idle;
+    assert!(!app.build_vm(0.0, 0.0).drivers_check_enabled);
+    let before = app.collector_requests.len();
+    app.apply(Action::CheckDrivers);
+    assert_eq!(app.collector_requests.len(), before, "no overlap");
+    // The worker reports (cancelled) — only now a new audit may start.
+    tx.send(Err("stopped".into())).unwrap();
+    app.poll_driver_audit();
+    assert!(app.driver_draining.is_none());
+    assert!(app.build_vm(0.0, 0.0).drivers_check_enabled);
+    app.apply(Action::CheckDrivers);
+    assert_eq!(app.collector_requests.len(), before + 1);
+    // One working folder per run.
+    let src = include_str!("app.rs").replace("\r\n", "\n");
+    assert!(src.contains("format!(\"driver-audit-{}-{run}\", std::process::id())"));
+    cleanup(&exe);
+}
+
+/// The passport footer stays fully reachable in the narrowest window.
+#[test]
+fn passport_footer_wraps_in_a_narrow_window() {
+    let ctx = egui::Context::default();
+    crate::ui::fonts::install(&ctx);
+    let mut boxes: Vec<(String, Rect)> = Vec::new();
+    for _ in 0..3 {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(420.0, 600.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let _ =
+                v11::passport_footer(ui, &i18n::RU, Some("2026-10-13 13:06"), false, true, None);
+        });
+        out.textures_delta.clear();
+        boxes.clear();
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                boxes.push((t.galley.text().to_string(), c.shape.visual_bounding_rect()));
+            }
+        }
+    }
+    for b in [
+        i18n::RU.pp_refresh,
+        i18n::RU.pp_copy,
+        i18n::RU.pp_save,
+        i18n::RU.pp_close,
+    ] {
+        let r = boxes
+            .iter()
+            .find(|(t, _)| t == b)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("{b} missing"));
+        assert!(r.max.x <= 420.0 + 0.5, "{b} cut off: {r:?}");
+    }
+}
+
+/// The dump-cause branch of the incident headline is localized too.
+#[test]
+fn dump_cause_confidence_is_localized_in_the_headline() {
+    let v = incidents::Verdict {
+        hang_confirmed: false,
+        bsod_registered: true,
+        subsystem: None,
+        confidence: incidents::Confidence::Low,
+        signals: Vec::new(),
+        dump_cause: Some(incidents::DumpCause {
+            dump: "100326-9500-01.dmp".into(),
+            bugcheck: "0x00000139".into(),
+            module: "RvNetMP60.sys".into(),
+            owner: Some(("Radmin VPN".into(), true)),
+            confidence: "MEDIUM".into(),
+        }),
+    };
+    let ru = v.headline_localized(true);
+    assert!(ru.contains("средняя (MEDIUM)"), "{ru}");
+    assert!(v.headline().contains("MEDIUM"), "canonical kept");
+    assert_eq!(incidents::confidence_label("ODD", true), "ODD");
 }

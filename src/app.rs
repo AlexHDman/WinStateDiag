@@ -1376,9 +1376,15 @@ fn drivers_vm(report: &AuditReport, d: &i18n::Dict) -> DriversVm {
 fn start_driver_audit(cancel: Arc<AtomicBool>) -> DriverAuditState {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // One working folder per run: a cancelled run's cleanup never
+        // touches the files of the next one.
+        let run = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
         let work = std::env::temp_dir()
             .join("WinStateDiag")
-            .join(format!("driver-audit-{}", std::process::id()));
+            .join(format!("driver-audit-{}-{run}", std::process::id()));
         let result = driver_audit::run_audit_with_cancel(&work, &cancel);
         let _ = std::fs::remove_dir_all(&work);
         let _ = tx.send(result);
@@ -1864,6 +1870,8 @@ struct CrashState {
     /// fresh session scan follows it (the preflight listing never joins
     /// a client report).
     rescan_for_session: bool,
+    /// v1.1: the session package that asked for that fresh scan.
+    rescan_package: Option<SharedPackage>,
     analyses: Vec<crash_dump::DumpAnalysis>,
     busy: CrashBusy,
     /// v1.0 live stage of the running analysis.
@@ -2229,6 +2237,8 @@ pub struct WinStateDiagApp {
     driver_previous: Option<Box<AuditReport>>,
     /// v1.1: cancel flag of the running app-side Driver Audit.
     driver_cancel: Option<Arc<AtomicBool>>,
+    /// v1.1: a cancelled audit whose worker has not finished yet.
+    driver_draining: Option<Receiver<Result<AuditReport, String>>>,
     /// v1.1: when the launch preflight started (None = not started).
     preflight_started: Option<CheckStamp>,
     /// v1.1 Hardware Passport 2.0: the collector JSON (built in the UI
@@ -2433,6 +2443,7 @@ impl Default for WinStateDiagApp {
             driver_history_clear_confirm: false,
             driver_previous: None,
             driver_cancel: None,
+            driver_draining: None,
             preflight_started: None,
             passport2_json: None,
             passport2_open: false,
@@ -3973,6 +3984,10 @@ impl WinStateDiagApp {
         if !self.is_running() {
             return;
         }
+        // v1.1: the stopped session no longer waits for its own checks.
+        self.crash.rescan_for_session = false;
+        self.crash.rescan_package = None;
+        self.crypto_recheck_for_session = false;
         if let Some(cancel) = &self.session_cancel {
             if !cancel.swap(true, Ordering::SeqCst) {
                 let msg = i18n::t(self.language).journal_stopping.to_string();
@@ -4242,9 +4257,10 @@ impl WinStateDiagApp {
                     self.crypto_detection = det;
                     self.crypto = Some(state);
                     self.crypto_checked = Some(CheckStamp::now(self.crypto_origin));
-                    // v1.1: a diagnostic started during the preflight check
-                    // gets its own fresh session check.
-                    if std::mem::take(&mut self.crypto_recheck_for_session) && self.is_running() {
+                    // v1.1: a diagnostic started during this check gets its
+                    // own fresh session check (also when it already ended;
+                    // Stop / close cancel the request).
+                    if std::mem::take(&mut self.crypto_recheck_for_session) {
                         self.start_crypto_check_as(CheckOrigin::Session);
                     }
                     return;
@@ -4257,7 +4273,7 @@ impl WinStateDiagApp {
                     }
                     self.crypto = Some(outcome.state);
                     self.crypto_checked = Some(CheckStamp::now(CheckOrigin::Manual));
-                    if std::mem::take(&mut self.crypto_recheck_for_session) && self.is_running() {
+                    if std::mem::take(&mut self.crypto_recheck_for_session) {
                         self.start_crypto_check_as(CheckOrigin::Session);
                     }
                     return;
@@ -4287,6 +4303,12 @@ impl WinStateDiagApp {
     }
 
     fn poll_driver_audit(&mut self) {
+        if let Some(rx) = &self.driver_draining
+            && !matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+        {
+            // The cancelled audit's worker has finished (result discarded).
+            self.driver_draining = None;
+        }
         let DriverAuditState::Running(rx) = &self.driver_audit else {
             return;
         };
@@ -4375,7 +4397,9 @@ impl WinStateDiagApp {
         }
         self.preflight_started = Some(CheckStamp::now(CheckOrigin::Preflight));
         // A. Driver Audit.
-        if !matches!(self.driver_audit, DriverAuditState::Running(_)) {
+        if !matches!(self.driver_audit, DriverAuditState::Running(_))
+            && self.driver_draining.is_none()
+        {
             self.driver_origin = CheckOrigin::Preflight;
             self.request_collector("driver_audit");
             #[cfg(not(test))]
@@ -4957,6 +4981,7 @@ impl WinStateDiagApp {
                 .as_ref()
                 .map(|s| s.caption(i18n::t(self.language))),
             drivers_check_enabled: !matches!(self.driver_audit, DriverAuditState::Running(_))
+                && self.driver_draining.is_none()
                 && !self.is_running(),
             computer_name: self.computer_name.clone(),
             stages,
@@ -5438,7 +5463,10 @@ impl WinStateDiagApp {
     fn request_driver_audit(&mut self) {
         // v1.1: never two audits — not while one runs, and not during a
         // full diagnostic (its engine runs the session's own audit).
-        if matches!(self.driver_audit, DriverAuditState::Running(_)) || self.is_running() {
+        if matches!(self.driver_audit, DriverAuditState::Running(_))
+            || self.driver_draining.is_some()
+            || self.is_running()
+        {
             return;
         }
         self.driver_export_status = None;
@@ -5478,10 +5506,15 @@ impl WinStateDiagApp {
         if let Some(cancel) = self.driver_cancel.take() {
             cancel.store(true, Ordering::SeqCst);
         }
-        self.driver_audit = match self.driver_previous.take() {
+        let restored = match self.driver_previous.take() {
             Some(previous) => DriverAuditState::Done(previous),
             None => DriverAuditState::Idle,
         };
+        // The cancelled worker is drained until its process really ended;
+        // no new app-side audit starts before that.
+        if let DriverAuditState::Running(rx) = std::mem::replace(&mut self.driver_audit, restored) {
+            self.driver_draining = Some(rx);
+        }
         let d = i18n::t(self.language);
         push_journal(
             &mut self.journal,
@@ -6794,6 +6827,7 @@ impl WinStateDiagApp {
                 && self.crash.scan_origin == Some(CheckOrigin::Preflight)
             {
                 self.crash.rescan_for_session = true;
+                self.crash.rescan_package = Some(Arc::clone(&self.package));
             }
             return;
         }
@@ -6990,11 +7024,14 @@ impl WinStateDiagApp {
         // analyzer). Never inside the message loop above: its cleanup would
         // drop the NEW analysis channel.
         // v1.1: the session's own scan after a preflight scan it found.
-        if self.crash_rx.is_none()
-            && std::mem::take(&mut self.crash.rescan_for_session)
-            && self.is_running()
-        {
+        if self.crash_rx.is_none() && std::mem::take(&mut self.crash.rescan_for_session) {
+            // The scan belongs to the session that asked for it, even when
+            // that diagnostic has finished meanwhile.
+            let package = self.crash.rescan_package.take();
             self.start_crash_scan_as(CheckOrigin::Session);
+            if let Some(package) = package {
+                self.op_packages.insert("crash", package);
+            }
         }
         if self.crash_rx.is_none() && self.crash.inventory.is_some() {
             if std::mem::take(&mut self.crash_analyze_after_scan)
@@ -7045,6 +7082,7 @@ impl WinStateDiagApp {
                     // A diagnostic started meanwhile: its report gets a
                     // fresh listing (started after this channel is done).
                     self.crash.rescan_for_session = true;
+                    self.crash.rescan_package = Some(Arc::clone(&self.package));
                 }
                 // v1.0 installer: winget said "installed" → the re-scan
                 // confirms the analyzer (or reports what is still missing).
@@ -7075,8 +7113,11 @@ impl WinStateDiagApp {
                         .push(format!("re-detect: {}", state.code()));
                 }
                 // The scan started with a diagnostic run joins its report
-                // (a preflight listing never does).
-                if self.is_running() && origin != CheckOrigin::Preflight {
+                // (also when it finishes after the run); a preflight listing
+                // never does.
+                if origin == CheckOrigin::Session
+                    || (self.is_running() && origin != CheckOrigin::Preflight)
+                {
                     self.contribute_incidents();
                 }
             }
@@ -9861,6 +9902,7 @@ impl WinStateDiagApp {
         }
         self.crash_analyze_after_scan = false;
         self.crash.rescan_for_session = false;
+        self.crash.rescan_package = None;
         self.crypto_recheck_for_session = false;
     }
 }

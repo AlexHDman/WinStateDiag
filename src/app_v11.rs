@@ -541,6 +541,9 @@ pub(crate) fn passport_body(ui: &mut egui::Ui, d: &i18n::Dict, p: &crate::passpo
 
 /// The fixed bottom panel: [Обновить] [Скопировать сводку]
 /// [Сохранить отчёт] … [Закрыть] and the collection / export line.
+/// Smallest footer height reserved under the scrolling page (points).
+pub(crate) const PASSPORT_FOOTER_MIN_H: f32 = 78.0;
+
 pub(crate) fn passport_footer(
     ui: &mut egui::Ui,
     d: &i18n::Dict,
@@ -558,7 +561,9 @@ pub(crate) fn passport_footer(
                 .color(c::TEXT_MUTED),
         );
     }
-    ui.horizontal(|ui| {
+    // Wraps onto further rows in a narrow window — every button stays
+    // reachable at any allowed width.
+    ui.horizontal_wrapped(|ui| {
         if details::primary_button(ui, d.pp_refresh, !busy).clicked() {
             act = Some(PassportAct::Refresh);
         }
@@ -568,23 +573,18 @@ pub(crate) fn passport_footer(
         if details::secondary_button(ui, d.pp_save, has_data).clicked() {
             act = Some(PassportAct::Save);
         }
+        if details::secondary_button(ui, d.pp_close, true).clicked() {
+            act = Some(PassportAct::Close);
+        }
         if busy {
             ui.label(RichText::new(d.pp_collecting).color(c::TEXT_SECONDARY));
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if details::secondary_button(ui, d.pp_close, true).clicked() {
-                act = Some(PassportAct::Close);
-            }
-        });
     });
     if let Some((text, color)) = status {
         ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
     }
     act
 }
-
-/// Footer height reserved under the scrolling page (points).
-pub(crate) const PASSPORT_FOOTER_H: f32 = 78.0;
 
 impl WinStateDiagApp {
     /// The passport page model in the current UI language.
@@ -618,7 +618,15 @@ impl WinStateDiagApp {
             [1060.0, 860.0],
             &mut open,
             |ui| {
-                let body_h = (ui.available_height() - PASSPORT_FOOTER_H).max(160.0);
+                // The footer's real (possibly wrapped) height of the last
+                // frame is reserved under the scrolling page.
+                let footer_id = egui::Id::new("wsd_passport2_footer_h");
+                let footer_h = ui
+                    .ctx()
+                    .data(|m| m.get_temp::<f32>(footer_id))
+                    .unwrap_or(PASSPORT_FOOTER_MIN_H)
+                    .max(PASSPORT_FOOTER_MIN_H);
+                let body_h = (ui.available_height() - footer_h).max(160.0);
                 egui::ScrollArea::vertical()
                     .id_salt("wsd_passport2_scroll")
                     .auto_shrink([false, false])
@@ -642,6 +650,7 @@ impl WinStateDiagApp {
                             );
                         }
                     });
+                let top = ui.cursor().top();
                 act = passport_footer(
                     ui,
                     d,
@@ -650,6 +659,8 @@ impl WinStateDiagApp {
                     view.is_some(),
                     status.as_ref(),
                 );
+                let used = ui.min_rect().bottom() - top + 8.0;
+                ui.ctx().data_mut(|m| m.insert_temp(footer_id, used));
             },
         );
         match act {

@@ -189,6 +189,21 @@ pub enum Confidence {
     Low,
 }
 
+/// v1.1: a canonical confidence code (`MEDIUM`) as «средняя (MEDIUM)»;
+/// an unknown code is shown as it is.
+pub fn confidence_label(code: &str, ru: bool) -> String {
+    let word = match (code.trim(), ru) {
+        ("HIGH", true) => "высокая",
+        ("HIGH", false) => "high",
+        ("MEDIUM", true) => "средняя",
+        ("MEDIUM", false) => "medium",
+        ("LOW", true) => "низкая",
+        ("LOW", false) => "low",
+        _ => return code.to_string(),
+    };
+    format!("{word} ({})", code.trim())
+}
+
 impl Confidence {
     pub fn code(self) -> &'static str {
         match self {
@@ -284,7 +299,7 @@ impl Verdict {
                 "{} {} ({}, {})",
                 pick("вероятный драйвер", "probable driver"),
                 d.label(),
-                d.confidence,
+                confidence_label(&d.confidence, ru),
                 pick("анализ дампа", "dump analysis")
             ),
             (None, Some(s)) => format!(
