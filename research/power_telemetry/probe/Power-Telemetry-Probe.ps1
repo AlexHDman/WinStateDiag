@@ -136,8 +136,12 @@ foreach ($cls in 'Win32_PerfFormattedData_PowerMeterCounter_EnergyMeter', 'Win32
         $inst = @(Get-CimInstance $cls -ErrorAction Stop)
         if ($inst.Count -eq 0) { Add-Presence $cls 'NO INSTANCES' 'class registered, no EMI device exposed' }
         foreach ($m in $inst) {
-            $p = $null
-            foreach ($prop in 'Power', 'PowerBudget') { if ($null -ne $m.$prop -and $null -eq $p) { $p = [double]$m.$prop } }
+            # Measured power only; PowerBudget is a configured LIMIT and is
+            # exported separately, never as a reading.
+            $p = if ($null -ne $m.Power) { [double]$m.Power } else { $null }
+            if ($null -ne $m.PowerBudget) {
+                Add-Value 'POWER_BUDGET' ("$cls/" + [string]$m.Name) ([math]::Round([double]$m.PowerBudget / 1000.0, 3)) 'W' "Windows PMB ($cls).PowerBudget" 'HIGH' 'configured budget (limit), not a measurement'
+            }
             # The RAPL domain is the LAST name part (RAPL_Package0_PKG):
             # 'Package0' is the socket, not the domain.
             $domain = ([string]$m.Name).Split('_')[-1].ToUpperInvariant()
@@ -150,7 +154,9 @@ foreach ($cls in 'Win32_PerfFormattedData_PowerMeterCounter_EnergyMeter', 'Win32
                 default { 'EMI_CHANNEL_POWER' }
             }
             if ($m.Name -eq '_Total') { continue }
-            if ($null -ne $p) {
+            if ($null -eq $p) {
+                Add-Value $param ("$cls/" + [string]$m.Name) $null 'W' "Windows EMI ($cls)" 'NONE' 'no measured Power value -> NO DATA'
+            } else {
                 $w = [math]::Round($p / 1000.0, 3)
                 if ($w -le 0 -and $domain -eq 'DRAM') {
                     Add-Value $param ("$cls/" + [string]$m.Name) $null 'W' "Windows EMI ($cls)" 'NONE' 'channel exposed but reports 0 (DRAM RAPL not supported on this platform) -> NO DATA'
@@ -164,7 +170,7 @@ foreach ($cls in 'Win32_PerfFormattedData_PowerMeterCounter_EnergyMeter', 'Win32
 
 # CIM probe classes (SMBIOS / vendor): usually empty on desktops.
 foreach ($c in @(
-        @{ cls = 'Win32_Fan'; param = 'FAN_RPM'; prop = 'DesiredSpeed'; unit = 'RPM' },
+        @{ cls = 'Win32_Fan'; param = 'FAN_REQUESTED_RPM'; prop = 'DesiredSpeed'; unit = 'RPM' },
         @{ cls = 'Win32_VoltageProbe'; param = 'VOLTAGE_PROBE'; prop = 'CurrentReading'; unit = 'mV' },
         @{ cls = 'Win32_TemperatureProbe'; param = 'TEMPERATURE_PROBE'; prop = 'CurrentReading'; unit = 'dC' },
         @{ cls = 'Win32_CurrentProbe'; param = 'CURRENT_PROBE'; prop = 'CurrentReading'; unit = 'mA' })) {
