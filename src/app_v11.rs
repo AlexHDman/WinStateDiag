@@ -653,6 +653,8 @@ impl WinStateDiagApp {
                         }
                     });
                 let top = ui.cursor().top();
+                // A later layout pass must not erase a click from the
+                // first pass; apply the selected action once, below.
                 act = passport_footer(
                     ui,
                     d,
@@ -660,7 +662,8 @@ impl WinStateDiagApp {
                     busy,
                     view.is_some(),
                     status.as_ref(),
-                );
+                )
+                .or(act);
                 let used = ui.min_rect().bottom() - top + 8.0;
                 ui.ctx().data_mut(|m| m.insert_temp(footer_id, used));
             },
