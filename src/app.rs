@@ -1872,6 +1872,8 @@ struct CrashState {
     rescan_for_session: bool,
     /// v1.1: the session package that asked for that fresh scan.
     rescan_package: Option<SharedPackage>,
+    /// v1.1: the SessionId a running SESSION scan belongs to.
+    scan_session: Option<String>,
     analyses: Vec<crash_dump::DumpAnalysis>,
     busy: CrashBusy,
     /// v1.0 live stage of the running analysis.
@@ -2219,6 +2221,8 @@ pub struct WinStateDiagApp {
     /// v1.1: a full diagnostic started while the preflight check was still
     /// running — a fresh SESSION check follows it (never reused).
     crypto_recheck_for_session: bool,
+    /// v1.1: the SessionId a running SESSION CryptoPro check belongs to.
+    crypto_op_session: Option<String>,
     /// v1.1 CryptoPro Details window + ReHash confirmation dialog.
     crypto_details_open: bool,
     crypto_rehash_confirm: bool,
@@ -2432,6 +2436,7 @@ impl Default for WinStateDiagApp {
             crypto_origin: CheckOrigin::Session,
             crypto_checked: None,
             crypto_recheck_for_session: false,
+            crypto_op_session: None,
             crypto_details_open: false,
             crypto_rehash_confirm: false,
             crypto_export_status: None,
@@ -4160,14 +4165,23 @@ impl WinStateDiagApp {
     fn start_crypto_check_as(&mut self, origin: CheckOrigin) {
         self.request_collector("cryptopro");
         if self.crypto_rx.is_some() {
-            // v1.1: whatever runs now (preflight, ⟳ or a ReHash), the
-            // session gets its own fresh check right after it.
-            if origin == CheckOrigin::Session && self.crypto_origin != CheckOrigin::Session {
+            // v1.1: whatever runs now (preflight, ⟳, a ReHash or the check
+            // of an EARLIER session), this session gets its own fresh check
+            // right after it.
+            if origin == CheckOrigin::Session
+                && (self.crypto_origin != CheckOrigin::Session
+                    || self.crypto_op_session != self.current_session_id())
+            {
                 self.crypto_recheck_for_session = true;
             }
             return;
         }
         self.crypto_origin = origin;
+        self.crypto_op_session = if origin == CheckOrigin::Session {
+            self.current_session_id()
+        } else {
+            None
+        };
         self.crypto_export_status = None;
         if self.reference.is_some() {
             return;
@@ -5486,6 +5500,18 @@ impl WinStateDiagApp {
             let _ = start_driver_audit;
             self.driver_rerun_requests += 1;
         }
+    }
+
+    /// v1.1: the SessionId of the current session package (if bound).
+    fn current_session_id(&self) -> Option<String> {
+        self.session_identity().map(|s| s.session_id)
+    }
+
+    /// v1.1: the user pressed Stop and the engine has not ended yet.
+    fn session_stopping(&self) -> bool {
+        self.session_cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::SeqCst))
     }
 
     /// v1.1: a fresh cancel flag for the app-side Driver Audit run.
@@ -6823,8 +6849,11 @@ impl WinStateDiagApp {
     fn start_crash_scan_as(&mut self, origin: CheckOrigin) {
         self.request_collector("crash_scan");
         if self.crash_rx.is_some() {
+            // A session gets its own scan after a preflight / manual scan or
+            // the scan of an EARLIER session that is still running.
             if origin == CheckOrigin::Session
-                && self.crash.scan_origin == Some(CheckOrigin::Preflight)
+                && (self.crash.scan_origin != Some(CheckOrigin::Session)
+                    || self.crash.scan_session != self.current_session_id())
             {
                 self.crash.rescan_for_session = true;
                 self.crash.rescan_package = Some(Arc::clone(&self.package));
@@ -6836,6 +6865,11 @@ impl WinStateDiagApp {
             self.claim_package("crash");
         }
         self.crash.scan_origin = Some(origin);
+        self.crash.scan_session = if origin == CheckOrigin::Session {
+            self.current_session_id()
+        } else {
+            None
+        };
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.crash_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -7078,9 +7112,10 @@ impl WinStateDiagApp {
                         .session()
                         .map(|s| s.session_id.clone())
                 };
-                if origin == CheckOrigin::Preflight && self.is_running() {
-                    // A diagnostic started meanwhile: its report gets a
-                    // fresh listing (started after this channel is done).
+                if origin == CheckOrigin::Preflight && self.is_running() && !self.session_stopping()
+                {
+                    // A diagnostic started meanwhile (and not stopped): its
+                    // report gets a fresh listing (after this channel).
                     self.crash.rescan_for_session = true;
                     self.crash.rescan_package = Some(Arc::clone(&self.package));
                 }

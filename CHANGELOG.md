@@ -38,7 +38,7 @@
   - New scenes: crypto-details, crypto-rehash-confirm, driver-details, hardware-passport. The release gate renders them offscreen.
 - Version 1.1 (`Cargo.toml` 1.1.0; title, FileVersion / ProductVersion, manifest and `dist\WinStateDiag-v1.1`).
 - Removed 6 stray 0x18 control bytes from source comments / a QA fixture.
-- 29 new regression tests (634 total).
+- 32 new regression tests (637 total).
 
 ## [1.0] - unreleased - v1.0 Stable candidate (master consolidation, evidence intelligence, live fixes)
 

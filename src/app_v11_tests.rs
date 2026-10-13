@@ -1143,3 +1143,123 @@ fn dump_cause_confidence_is_localized_in_the_headline() {
     assert!(v.headline().contains("MEDIUM"), "canonical kept");
     assert_eq!(incidents::confidence_label("ODD", true), "ODD");
 }
+
+// ---------------- PR #4 review round 3 regressions ----------------
+
+/// Stop, then the late preflight listing: no rescan is re-queued.
+#[test]
+fn late_preflight_listing_after_stop_queues_no_rescan() {
+    let (mut app, exe) = app_in("stoplate");
+    app.start_preflight();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.crash_rx = Some(rx);
+    app.crash.busy = CrashBusy::Scanning;
+    app.client_name = "Клиент".into();
+    app.start_diagnostics();
+    app.request_stop();
+    assert!(app.is_running(), "the engine has not reported yet");
+    let before = app.collector_requests.len();
+    tx.send(CrashMsg::Inventory(Ok(inventory(
+        crash_dump::DebuggerStatus::NotInstalled,
+    ))))
+    .unwrap();
+    drop(tx);
+    app.poll_crash();
+    assert!(!app.crash.rescan_for_session);
+    assert_eq!(app.collector_requests.len(), before, "nothing restarted");
+    cleanup(&exe);
+}
+
+/// Session B gets its own checks although session A's checks still run.
+#[test]
+fn a_new_session_queues_its_own_checks_behind_an_earlier_session() {
+    let (mut app, exe) = app_in("twosessions");
+    app.client_name = "A".into();
+    app.start_diagnostics();
+    let a = app.current_session_id().unwrap();
+    // A's checks are still running when A ends and B starts.
+    let (_ctx, crx) = std::sync::mpsc::channel();
+    app.crash_rx = Some(crx);
+    app.crash.scan_origin = Some(CheckOrigin::Session);
+    app.crash.scan_session = Some(a.clone());
+    let (_ytx, yrx) = std::sync::mpsc::channel();
+    app.crypto_rx = Some(yrx);
+    app.crypto_origin = CheckOrigin::Session;
+    app.crypto_op_session = Some(a.clone());
+    app.state = RunState::Idle;
+    app.client_name = "B".into();
+    app.start_diagnostics();
+    let b = app.current_session_id().unwrap();
+    assert_ne!(a, b);
+    assert!(app.crash.rescan_for_session, "B gets its own crash scan");
+    assert!(
+        app.crypto_recheck_for_session,
+        "B gets its own CryptoPro check"
+    );
+    let pkg = app.crash.rescan_package.clone().unwrap();
+    assert_eq!(
+        report_package::lock(&pkg)
+            .session()
+            .map(|s| s.session_id.clone()),
+        Some(b)
+    );
+    cleanup(&exe);
+}
+
+/// The full passport window at the minimum allowed size: every footer
+/// control stays inside the window.
+#[test]
+fn passport_window_at_minimum_size_keeps_the_footer_visible() {
+    let (mut app, exe) = app_in("ppmin");
+    app.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.to_string());
+    app.passport2_open = true;
+    app.passport2_status = Some(ExportStatus::Failed(
+        "a long export error message that wraps over several lines in a narrow window".into(),
+    ));
+    let ctx = egui::Context::default();
+    crate::ui::fonts::install(&ctx);
+    let mut boxes: Vec<(String, Rect)> = Vec::new();
+    for _ in 0..4 {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(420.0, 300.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::Area::new(egui::Id::new("pp_min"))
+                .fixed_pos(egui::Pos2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.set_max_size(vec2(420.0, 300.0));
+                    let d = &i18n::RU;
+                    let _ = v11::passport_footer(
+                        ui,
+                        d,
+                        Some("2026-10-13 13:06"),
+                        false,
+                        true,
+                        app.passport2_status.as_ref().map(|s| s.text(d)).as_ref(),
+                    );
+                });
+        });
+        out.textures_delta.clear();
+        boxes.clear();
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                boxes.push((t.galley.text().to_string(), c.shape.visual_bounding_rect()));
+            }
+        }
+    }
+    let footer_bottom = boxes.iter().map(|(_, r)| r.max.y).fold(0.0_f32, f32::max);
+    // Footer height fits a 300-point window together with a title bar and
+    // a minimal page sliver.
+    assert!(
+        footer_bottom < 300.0 - 24.0 - 30.0,
+        "footer {footer_bottom}"
+    );
+    for b in [i18n::RU.pp_refresh, i18n::RU.pp_close] {
+        let r = boxes.iter().find(|(t, _)| t == b).map(|(_, r)| *r).unwrap();
+        assert!(r.max.x <= 420.5 && r.max.y <= 300.0, "{b}: {r:?}");
+    }
+    let src = include_str!("app_v11.rs").replace("\r\n", "\n");
+    assert!(src.contains("let body_h = (ui.available_height() - footer_h).max(24.0);"));
+    cleanup(&exe);
+}

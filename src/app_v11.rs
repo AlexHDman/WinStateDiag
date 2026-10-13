@@ -626,7 +626,9 @@ impl WinStateDiagApp {
                     .data(|m| m.get_temp::<f32>(footer_id))
                     .unwrap_or(PASSPORT_FOOTER_MIN_H)
                     .max(PASSPORT_FOOTER_MIN_H);
-                let body_h = (ui.available_height() - footer_h).max(160.0);
+                // The footer has priority: the page may shrink to a sliver
+                // (it scrolls) so the bottom controls are never clipped.
+                let body_h = (ui.available_height() - footer_h).max(24.0);
                 egui::ScrollArea::vertical()
                     .id_salt("wsd_passport2_scroll")
                     .auto_shrink([false, false])
