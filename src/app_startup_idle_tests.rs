@@ -160,6 +160,63 @@ fn startup_runs_no_diagnostic_and_starts_no_collector_in_both_languages() {
     assert_eq!(i18n::EN.curop_waiting_name, "Waiting to start");
 }
 
+/// v1.0: the automatic read-only CryptoPro inventory at launch reports
+/// presence / version / licence into the journal, requests no collector,
+/// starts no HASH check (no cpverify) and never offers ReHash; every other
+/// module stays IDLE.
+#[test]
+fn startup_crypto_inventory_is_read_only_and_keeps_modules_idle() {
+    let installed = cryptopro::Inventory {
+        product: Some(cryptopro::CspProduct {
+            name: "КриптоПро CSP".into(),
+            version: "5.0.13800".into(),
+            product_code: "{50F91F80-D397-437C-B0C8-62128DE3B55E}".into(),
+            license: cryptopro::LicenseKey::Installed {
+                masked: "5050Z-*****".into(),
+            },
+            term: cryptopro::LicenseTerm::NotDetermined,
+        }),
+    };
+    for (inv, expected) in [
+        (installed, CryptoVm::NotChecked),
+        (
+            cryptopro::Inventory { product: None },
+            CryptoVm::NotInstalled,
+        ),
+    ] {
+        let mut app = WinStateDiagApp::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(inv.clone()).unwrap();
+        app.crypto_inventory_rx = Some(rx);
+        let ctx = headless_ctx();
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        assert_eq!(app.crypto_inventory.as_ref(), Some(&inv));
+        assert!(app.crypto_inventory_rx.is_none());
+        assert!(
+            app.collector_requests.is_empty(),
+            "{:?}",
+            app.collector_requests
+        );
+        assert!(
+            app.crypto.is_none() && app.crypto_rx.is_none(),
+            "no HASH check"
+        );
+        assert!(matches!(app.state, RunState::Idle));
+        assert!(matches!(app.driver_audit, DriverAuditState::Idle));
+        assert!(app.sensors_rx.is_none() && app.crash_rx.is_none());
+        assert!(session(&app).is_none(), "no session / report");
+        let vm = app.build_vm(0.0, 0.0);
+        assert_eq!(vm.crypto, expected);
+        let journal: Vec<String> = app.journal.iter().map(|e| e.message.clone()).collect();
+        for line in inv.journal() {
+            assert!(journal.contains(&line), "{line} missing from {journal:?}");
+        }
+        assert!(!journal.iter().any(|l| l.contains("ReHash выполнен")));
+    }
+}
+
 /// Source contract: the constructor (the launch) never starts a collector,
 /// a thread or a process — not even behind a "not under test" guard that
 /// the runtime checks above could not see.
@@ -186,8 +243,33 @@ fn the_launch_code_path_contains_no_collector_start() {
     ] {
         assert!(!ctor.contains(forbidden), "launch code calls `{forbidden}`");
     }
-    // Its only work: the disk selector, in the background, write-free.
+    // Its only work: the disk selector, in the background, write-free —
+    // and the v1.0 read-only CryptoPro inventory (registry only).
     assert_eq!(ctor.matches("app.enumerate_disk_selector();").count(), 1);
+    assert_eq!(ctor.matches("app.read_crypto_inventory();").count(), 1);
+    let at = src
+        .find("    fn read_crypto_inventory(&mut self) {")
+        .unwrap();
+    let body = &src[at..at
+        + src[at..]
+            .find(
+                "
+    }
+",
+            )
+            .unwrap()];
+    assert!(body.contains("thread::spawn"), "never on the UI thread");
+    assert!(body.contains("cryptopro::inventory(&cryptopro::SystemRegistry)"));
+    for forbidden in [
+        "Command",
+        "HiddenRunner",
+        "check(",
+        "rehash",
+        "request_collector",
+        "contribute",
+    ] {
+        assert!(!body.contains(forbidden), "inventory calls `{forbidden}`");
+    }
     let at = src
         .find("    fn enumerate_disk_selector(&mut self) {")
         .unwrap();
@@ -806,4 +888,47 @@ fn session_journal_line_is_localized() {
         assert!(last.contains("—") && last.contains("MSI"), "{last}");
         let _ = std::fs::remove_dir_all(exe.parent().unwrap());
     }
+}
+
+/// v1.0 evidence fix (PR #3 review): a crash inventory scanned in session
+/// A and analyzed after a new session B opened keeps A as the session that
+/// observed its LiveKernelReports listing.
+#[test]
+fn cached_crash_inventory_keeps_its_observing_session() {
+    let (mut app, exe) = app_in("lkr-session");
+    app.client_name = "Client A".into();
+    app.begin_operation(false);
+    app.claim_package("crash");
+    let a = session(&app).expect("session A").session_id;
+    let inv = crash_dump::Inventory {
+        bugchecks: Vec::new(),
+        dumps: Vec::new(),
+        debugger: crash_dump::DebuggerStatus::NotInstalled,
+        notes: Vec::new(),
+        unexpected_shutdowns: 0,
+        incidents: Vec::new(),
+        live_kernel_reports: vec![incidents::LiveKernelReport {
+            name: "WATCHDOG-20261004-2057.dmp".into(),
+            folder: "WATCHDOG".into(),
+            size: 524288,
+            time: "2026-10-04T20:57:30".into(),
+            path: r"C:\Windows\LiveKernelReports\WATCHDOG\WATCHDOG-20261004-2057.dmp".into(),
+        }],
+    };
+    app.accept_crash_msg(CrashMsg::Inventory(Ok(inv)));
+    // Another client: a new session B; the analysis claims it.
+    app.client_name = "Client B".into();
+    app.begin_operation(false);
+    app.claim_package("crash");
+    let b = session(&app).expect("session B").session_id;
+    assert_ne!(a, b);
+    app.contribute_incidents();
+    let entries = report_package::read_zip(&zip_of(&app)).unwrap();
+    let e = entries
+        .iter()
+        .find(|e| e.name.starts_with(incidents::EVIDENCE_PREFIX))
+        .expect("Incidents evidence");
+    let v = json::parse(std::str::from_utf8(&e.bytes).unwrap()).unwrap();
+    assert_eq!(str_of(&v, "observed_in_session"), a);
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
 }

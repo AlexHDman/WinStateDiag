@@ -59,3 +59,6 @@ __pycache__/
 # v1.0 approved GUI visual references (local design input for the polish
 # phase; kept unmodified on disk, not shipped and not in git).
 /assets/UI_details/
+
+# Power telemetry research: raw probe output names the machine - local only.
+/research/power_telemetry/logs/

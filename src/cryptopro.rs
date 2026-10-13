@@ -300,6 +300,314 @@ impl CommandRunner for HiddenRunner {
     }
 }
 
+// ---------------------------------------------------------------------
+// v1.0 startup inventory (read-only, registry only)
+// ---------------------------------------------------------------------
+//
+// Launched automatically at startup: presence, version, licence key and
+// licence term of CryptoPro CSP, read from the registry only — no process
+// is started (no cpverify, no csptest), nothing is written and ReHash is
+// never involved. The integrity HASH check stays with the diagnostic.
+
+/// Read-only view of HKLM (64- and 32-bit views); faked in tests.
+pub trait RegistryView {
+    /// Subkey names of `path` under HKLM (empty when absent).
+    fn subkeys(&self, path: &str) -> Vec<String>;
+    /// A REG_SZ value of `path` under HKLM.
+    fn string(&self, path: &str, name: &str) -> Option<String>;
+}
+
+pub const UNINSTALL_ROOTS: [&str; 2] = [
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+];
+const INSTALLER_PRODUCTS: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products";
+
+/// Licence key installed for the CSP product.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LicenseKey {
+    /// A serial number is registered; only its first group is kept
+    /// (`5050Z-*****`) — the full key never enters journal or evidence.
+    Installed {
+        masked: String,
+    },
+    NotFound,
+}
+
+/// Licence term. Windows CryptoPro CSP has no documented read-only source
+/// for the expiry (the `cpconfig -license -view` CLI exists on Linux
+/// only), so it is never guessed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LicenseTerm {
+    NotDetermined,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inventory {
+    /// `None` = CryptoPro CSP is not installed.
+    pub product: Option<CspProduct>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CspProduct {
+    pub name: String,
+    pub version: String,
+    pub product_code: String,
+    pub license: LicenseKey,
+    pub term: LicenseTerm,
+}
+
+impl Inventory {
+    pub fn installed(&self) -> bool {
+        self.product.is_some()
+    }
+
+    /// Startup journal lines (RU).
+    pub fn journal(&self) -> Vec<String> {
+        let Some(p) = &self.product else {
+            return vec![
+                "[INFO] CryptoPro CSP: не установлен (проверка реестра, только чтение).".into(),
+            ];
+        };
+        let version = if p.version.is_empty() {
+            "версия не указана".to_string()
+        } else {
+            p.version.clone()
+        };
+        let license = match &p.license {
+            LicenseKey::Installed { masked } => format!("ключ установлен ({masked})"),
+            LicenseKey::NotFound => "ключ в реестре не найден".to_string(),
+        };
+        vec![
+            format!("[INFO] CryptoPro CSP обнаружен: {version}."),
+            format!("[INFO] CryptoPro CSP: лицензия — {license}."),
+            "[INFO] CryptoPro CSP: срок действия лицензии — НЕ ОПРЕДЕЛЁН (нет документированного read-only источника в Windows; см. «Управление лицензиями КриптоПро PKI»)."
+                .into(),
+            "[INFO] CryptoPro HASH проверяется при запуске диагностики (ReHash автоматически не выполняется).".into(),
+        ]
+    }
+}
+
+/// `{50F91F80-D397-437C-B0C8-62128DE3B55E}` → `08F19F05793DC7340B8C2621D83E5BE5`
+/// (the Windows Installer packed product code).
+pub fn packed_product_code(guid: &str) -> Option<String> {
+    let hex: String = guid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let g = guid.trim();
+    if hex.len() != 32 || !(g.starts_with('{') && g.ends_with('}')) {
+        return None;
+    }
+    let rev = |s: &str| s.chars().rev().collect::<String>();
+    let mut out = String::new();
+    out.push_str(&rev(&hex[0..8]));
+    out.push_str(&rev(&hex[8..12]));
+    out.push_str(&rev(&hex[12..16]));
+    for i in (16..32).step_by(2) {
+        out.push_str(&rev(&hex[i..i + 2]));
+    }
+    Some(out.to_ascii_uppercase())
+}
+
+/// `5050Z-ABCDE-…` → `5050Z-*****`.
+pub fn mask_serial(serial: &str) -> String {
+    let s = serial.trim();
+    let head: String = s.chars().take_while(|c| *c != '-').take(5).collect();
+    format!("{head}-*****")
+}
+
+fn is_csp_name(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    (n.starts_with("криптопро csp")
+        || n.starts_with("cryptopro csp")
+        || n.starts_with("crypto-pro csp"))
+        && !n.contains("plug-in")
+}
+
+/// Startup inventory from the registry. Read-only.
+pub fn inventory(reg: &dyn RegistryView) -> Inventory {
+    for root in UNINSTALL_ROOTS {
+        for key in reg.subkeys(root) {
+            let path = format!("{root}\\{key}");
+            let Some(name) = reg.string(&path, "DisplayName") else {
+                continue;
+            };
+            if !is_csp_name(&name) {
+                continue;
+            }
+            let version = reg
+                .string(&path, "DisplayVersion")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let serial = packed_product_code(&key).and_then(|packed| {
+                reg.string(
+                    &format!("{INSTALLER_PRODUCTS}\\{packed}\\InstallProperties"),
+                    "ProductID",
+                )
+            });
+            let license = match serial.filter(|s| !s.trim().is_empty()) {
+                Some(s) => LicenseKey::Installed {
+                    masked: mask_serial(&s),
+                },
+                None => LicenseKey::NotFound,
+            };
+            return Inventory {
+                product: Some(CspProduct {
+                    name: name.trim().to_string(),
+                    version,
+                    product_code: key,
+                    license,
+                    term: LicenseTerm::NotDetermined,
+                }),
+            };
+        }
+    }
+    Inventory { product: None }
+}
+
+/// The real HKLM view (64-bit and 32-bit registry), read-only access.
+pub struct SystemRegistry;
+
+#[cfg(windows)]
+mod winreg {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+    const KEY_READ: u32 = 0x2_0019;
+    const KEY_WOW64_64KEY: u32 = 0x0100;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const RRF_SUBKEY_WOW6464KEY: u32 = 0x0001_0000;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            hkey: isize,
+            sub_key: *const u16,
+            options: u32,
+            sam: u32,
+            result: *mut isize,
+        ) -> i32;
+        fn RegEnumKeyExW(
+            hkey: isize,
+            index: u32,
+            name: *mut u16,
+            name_len: *mut u32,
+            reserved: *mut u32,
+            class: *mut u16,
+            class_len: *mut u32,
+            last_write: *mut u64,
+        ) -> i32;
+        fn RegCloseKey(hkey: isize) -> i32;
+        fn RegGetValueW(
+            hkey: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            ty: *mut u32,
+            data: *mut u16,
+            len: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    pub fn subkeys(path: &str) -> Vec<String> {
+        let mut key: isize = 0;
+        let p = wide(path);
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                p.as_ptr(),
+                0,
+                KEY_READ | KEY_WOW64_64KEY,
+                &mut key,
+            )
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut i = 0u32;
+        loop {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = unsafe {
+                RegEnumKeyExW(
+                    key,
+                    i,
+                    buf.as_mut_ptr(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 || i > 10_000 {
+                break;
+            }
+            out.push(String::from_utf16_lossy(&buf[..len as usize]));
+            i += 1;
+        }
+        unsafe { RegCloseKey(key) };
+        out
+    }
+
+    pub fn string(path: &str, name: &str) -> Option<String> {
+        let p = wide(path);
+        let n = wide(name);
+        let mut buf = vec![0u16; 1024];
+        let mut len = (buf.len() * 2) as u32;
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                p.as_ptr(),
+                n.as_ptr(),
+                RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let chars = (len as usize / 2).saturating_sub(1).min(buf.len());
+        Some(String::from_utf16_lossy(&buf[..chars]))
+    }
+}
+
+impl RegistryView for SystemRegistry {
+    fn subkeys(&self, path: &str) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            winreg::subkeys(path)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Vec::new()
+        }
+    }
+    fn string(&self, path: &str, name: &str) -> Option<String> {
+        #[cfg(windows)]
+        {
+            winreg::string(path, name)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (path, name);
+            None
+        }
+    }
+}
+
 /// cpverify writes in the console code page; the verdict words are ASCII,
 /// so a lossy decode is enough (CP866/1251 Cyrillic may show as '?').
 fn decode_console(bytes: &[u8]) -> String {
@@ -512,5 +820,158 @@ mod tests {
         }
         let labels: std::collections::BTreeSet<_> = all.iter().map(|s| s.label()).collect();
         assert_eq!(labels.len(), 4);
+    }
+
+    /// Fake HKLM: (path, name) → value; subkeys derived from the paths.
+    struct FakeReg(Vec<(String, String, String)>);
+
+    impl RegistryView for FakeReg {
+        fn subkeys(&self, path: &str) -> Vec<String> {
+            let prefix = format!("{path}\\");
+            let mut out: Vec<String> = Vec::new();
+            for (p, _, _) in &self.0 {
+                if let Some(rest) = p.strip_prefix(&prefix) {
+                    let k = rest.split('\\').next().unwrap_or(rest).to_string();
+                    if !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+            }
+            out
+        }
+        fn string(&self, path: &str, name: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(p, n, _)| p == path && n == name)
+                .map(|(_, _, v)| v.clone())
+        }
+    }
+
+    fn entry(p: &str, n: &str, v: &str) -> (String, String, String) {
+        (p.into(), n.into(), v.into())
+    }
+
+    /// v1.0: the startup inventory of the real MSI layout — CSP 5.0.13800
+    /// under the 64-bit Uninstall key, the browser plug-in next to it, the
+    /// licence serial under the packed product code.
+    #[test]
+    fn startup_inventory_reads_presence_version_and_masked_licence() {
+        let u = UNINSTALL_ROOTS[0];
+        let csp = "{50F91F80-D397-437C-B0C8-62128DE3B55E}";
+        let reg = FakeReg(vec![
+            entry(
+                &format!("{u}\\{{E12CC7EE-36B7-4AAA-924E-2F5CD75BCECF}}"),
+                "DisplayName",
+                "КриптоПро ЭЦП Browser plug-in",
+            ),
+            entry(&format!("{u}\\{csp}"), "DisplayName", "КриптоПро CSP"),
+            entry(&format!("{u}\\{csp}"), "DisplayVersion", "5.0.13800"),
+            entry(
+                &format!(
+                    "{INSTALLER_PRODUCTS}\\08F19F05793DC7340B8C2621D83E5BE5\\InstallProperties"
+                ),
+                "ProductID",
+                "5050Z-ABCDE-FGHIJ-KLMNO-PQRST",
+            ),
+        ]);
+        let inv = inventory(&reg);
+        let p = inv.product.clone().expect("installed");
+        assert_eq!(p.version, "5.0.13800");
+        assert_eq!(
+            p.license,
+            LicenseKey::Installed {
+                masked: "5050Z-*****".into()
+            }
+        );
+        assert_eq!(p.term, LicenseTerm::NotDetermined);
+        let j = inv.journal().join("\n");
+        assert!(j.contains("5.0.13800"), "{j}");
+        assert!(j.contains("5050Z-*****"), "{j}");
+        assert!(
+            !j.contains("ABCDE"),
+            "the full serial never leaves the registry"
+        );
+        assert!(j.contains("НЕ ОПРЕДЕЛЁН"), "expiry never guessed: {j}");
+        assert!(j.contains("ReHash автоматически не выполняется"), "{j}");
+    }
+
+    #[test]
+    fn startup_inventory_absent_or_without_licence() {
+        assert_eq!(inventory(&FakeReg(vec![])), Inventory { product: None });
+        assert!(inventory(&FakeReg(vec![])).journal()[0].contains("не установлен"));
+        // 32-bit registration, no licence key registered.
+        let u = UNINSTALL_ROOTS[1];
+        let reg = FakeReg(vec![entry(
+            &format!("{u}\\{{11111111-2222-3333-4444-555555555555}}"),
+            "DisplayName",
+            "CryptoPro CSP",
+        )]);
+        let p = inventory(&reg).product.expect("installed");
+        assert_eq!(p.license, LicenseKey::NotFound);
+        assert!(p.version.is_empty());
+        assert!(inventory(&reg).journal()[0].contains("версия не указана"));
+    }
+
+    #[test]
+    fn packed_product_code_and_serial_mask() {
+        assert_eq!(
+            packed_product_code("{50F91F80-D397-437C-B0C8-62128DE3B55E}").as_deref(),
+            Some("08F19F05793DC7340B8C2621D83E5BE5")
+        );
+        assert_eq!(packed_product_code("not-a-guid"), None);
+        assert_eq!(mask_serial("5050Z-ABCDE"), "5050Z-*****");
+        assert_eq!(mask_serial("ABCDEFGHIJ"), "ABCDE-*****");
+    }
+
+    /// The startup inventory is registry-only: no process, no ReHash.
+    #[test]
+    fn startup_inventory_starts_no_process_and_never_rehashes() {
+        let src = include_str!("cryptopro.rs").replace("\r\n", "\n");
+        let start = src
+            .find("pub fn inventory(reg: &dyn RegistryView)")
+            .unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let body = &src[start..end];
+        for banned in [
+            "Command",
+            "run(",
+            "rehash",
+            "-rm",
+            "cpverify",
+            "RegSet",
+            "RegCreate",
+        ] {
+            assert!(!body.contains(banned), "{banned} in the inventory");
+        }
+        let reg_mod = &src[src.find("mod winreg {").unwrap()..];
+        let reg_mod = &reg_mod[..reg_mod
+            .find("\nimpl RegistryView for SystemRegistry")
+            .unwrap()];
+        for banned in [
+            "RegSetValue",
+            "RegCreateKey",
+            "RegDelete",
+            "KEY_WRITE",
+            "KEY_SET_VALUE",
+        ] {
+            assert!(
+                !reg_mod.contains(banned),
+                "{banned}: registry access is read-only"
+            );
+        }
+    }
+
+    /// Live read of this machine's registry (never fails: CryptoPro may
+    /// be absent); proves the FFI path works.
+    #[test]
+    fn startup_inventory_live_registry_read_is_consistent() {
+        let inv = inventory(&SystemRegistry);
+        eprintln!("live CryptoPro inventory: {inv:?}");
+        if let Some(p) = &inv.product {
+            assert!(is_csp_name(&p.name), "{p:?}");
+            if let LicenseKey::Installed { masked } = &p.license {
+                assert!(masked.ends_with("-*****"));
+            }
+        }
     }
 }

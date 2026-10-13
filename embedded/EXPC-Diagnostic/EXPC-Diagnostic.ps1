@@ -1123,33 +1123,117 @@ function Get-ApplicationIssueSignature {
         }
     }
 
-    $appName = ''
-    $moduleName = ''
-    $exception = ''
+    # v1.0 evidence fix: the process identity comes from the structured
+    # EventData first (language-independent), the localized message only as
+    # a fallback. An event whose process cannot be identified is its own
+    # group — unknown events are never merged into one "-" group.
+    $identity = Get-ApplicationProcessIdentity -Event $Event -Message $message
+    $appName = $identity.App
+    $moduleName = $identity.Module
+    $exception = $identity.Exception
 
-    $m = [regex]::Match($message, '(?i)(?:Faulting application name|Имя сбойного приложения):\s*([^,]+)')
-    if ($m.Success) { $appName = $m.Groups[1].Value.Trim() }
-
-    $m = [regex]::Match($message, '(?i)(?:Faulting module name|Имя сбойного модуля):\s*([^,]+)')
-    if ($m.Success) { $moduleName = $m.Groups[1].Value.Trim() }
-
-    $m = [regex]::Match($message, '(?i)(?:Exception code|Код исключения):\s*(0x[0-9a-f]+)')
-    if ($m.Success) { $exception = $m.Groups[1].Value.ToLowerInvariant() }
-
-    if ($provider -match '^\.NET Runtime$') {
-        if ([string]::IsNullOrWhiteSpace($appName)) {
-            $m = [regex]::Match($message, '(?i)(?:Application|Приложение):\s*([^\s]+)')
-            if ($m.Success) { $appName = $m.Groups[1].Value.Trim() }
-        }
-        $m = [regex]::Match($message, '(?i)(?:Exception Info|Сведения об исключении):\s*([^\s]+)')
-        if ($m.Success) { $exception = $m.Groups[1].Value.Trim() }
+    if ([string]::IsNullOrWhiteSpace($appName)) {
+        $key = ''
+        try { if ($null -ne $Event.RecordId) { $key = [string]$Event.RecordId } } catch {}
+        if ([string]::IsNullOrWhiteSpace($key)) { $key = [guid]::NewGuid().ToString('N') }
+        $appName = 'UNRESOLVED#' + $key
     }
-
-    if ([string]::IsNullOrWhiteSpace($appName)) { $appName = '-' }
     if ([string]::IsNullOrWhiteSpace($moduleName)) { $moduleName = '-' }
     if ([string]::IsNullOrWhiteSpace($exception)) { $exception = '-' }
 
     return ("{0}|{1}|{2}|{3}|{4}|{5}" -f $category, $provider, $id, $appName, $moduleName, $exception)
+}
+
+function Get-EventDataStrings {
+    param($Event)
+    $data = @()
+    try { $data = @(([xml]$Event.ToXml()).Event.EventData.Data) } catch {}
+    return @(foreach ($d in $data) { if ($null -eq $d) { '' } elseif ($d -is [string]) { $d } else { [string]$d.'#text' } })
+}
+
+function Format-ExceptionCode {
+    param([string]$Code)
+    $c = ([string]$Code).Trim()
+    if ($c -match '^(?i)(?:0x)?([0-9a-f]{8})$') { return ('0x' + $Matches[1].ToLowerInvariant()) }
+    return $c
+}
+
+# Process identity of an Application Error / Hang / WER / .NET event:
+# App, Module, Exception and the Source the identity was taken from
+# (EventData / WER / Message). Empty App = not identified.
+function Get-ApplicationProcessIdentity {
+    param($Event, [string]$Message = '')
+    $provider = [string]$Event.ProviderName
+    $id = [int]$Event.Id
+    $v = @(Get-EventDataStrings -Event $Event)
+    $at = { param([int]$i) if ($v.Count -gt $i) { ([string]$v[$i]).Trim() } else { '' } }
+    $app = ''; $module = ''; $exception = ''; $source = ''
+
+    if ($provider -eq 'Application Error' -and $id -eq 1000) {
+        # AppName, AppVer, AppStamp, ModName, ModVer, ModStamp, ExceptionCode, ...
+        $app = & $at 0; $module = & $at 3; $exception = Format-ExceptionCode (& $at 6)
+        if ($app) { $source = 'EventData' }
+    } elseif ($provider -eq 'Application Hang' -and $id -eq 1002) {
+        # AppName, AppVer, ProcessId, StartTime, TerminationTime, ExePath, ...
+        $app = & $at 0
+        if ($app) { $source = 'EventData'; $exception = 'hang' }
+    } elseif ($provider -eq 'Windows Error Reporting' -and $id -eq 1001) {
+        # Bucket, EventType, EventName, Response, CabId, P1 .. P10.
+        $eventName = & $at 2
+        # Schema-specific parameter maps (P1 = index 5 … P10 = index 14):
+        #   APPCRASH / MoAppCrash / APPCRASHEX: P1 app, P4 module, P7 exception
+        #   BEX / BEX64 / MoBEX:               P1 app, P4 module, P8 exception (P7 = offset)
+        #   CLR20r3:                           P1 app, P4 assembly, P9 exception type
+        #   AppHang* / MoAppHang*:             P1 app (a hang, no exception)
+        if ($eventName -match '^(?i)(APPCRASH|APPCRASHEX|MoAppCrash)$') {
+            $app = & $at 5; $module = & $at 8; $exception = Format-ExceptionCode (& $at 11)
+        } elseif ($eventName -match '^(?i)(BEX|BEX64|MoBEX)$') {
+            $app = & $at 5; $module = & $at 8; $exception = Format-ExceptionCode (& $at 12)
+        } elseif ($eventName -match '^(?i)CLR20r3$') {
+            $app = & $at 5; $module = & $at 8; $exception = & $at 13
+        } elseif ($eventName -match '^(?i)(AppHang\w*|MoAppHang\w*)$') {
+            $app = & $at 5; $exception = 'hang'
+        } elseif ($eventName -match '^(?i)(LiveKernelEvent|BlueScreen|WindowsUpdateFailure\d*|WindowsWcpOtherFailure\d*|StoreAgent\w+|PnPDriverImportError|PnPDeviceProblemCode|AppxDeploymentFailureBlue)$') {
+            # Known WER kinds that are not about a user process: grouped by
+            # their kind.
+            $app = 'WER:' + $eventName
+        } else {
+            # An unknown schema: only a P1 that is clearly an executable
+            # names the process; otherwise the event keeps its own identity
+            # (UNRESOLVED#RecordId below) — never merged by event name.
+            $p1 = & $at 5
+            if ($p1 -match '(?i)\.exe$') { $app = $p1 }
+        }
+        if ($app) { $source = 'WER' }
+    } elseif ($provider -eq '.NET Runtime' -and $id -eq 1026) {
+        $text = (($v -join "`n") + "`n" + $Message)
+        $m = [regex]::Match($text, '(?im)^\s*(?:Application|Приложение):\s*(\S+)')
+        if ($m.Success) { $app = $m.Groups[1].Value.Trim(); $source = 'EventData' }
+        $m = [regex]::Match($text, '(?i)(?:Exception Info|Сведения об исключении):\s*([^\s]+)')
+        if ($m.Success) { $exception = $m.Groups[1].Value.Trim() }
+    }
+
+    if (-not $app) {
+        $m = [regex]::Match($Message, '(?i)(?:Faulting application name|Имя сбойного приложения):\s*([^,]+)')
+        if ($m.Success) { $app = $m.Groups[1].Value.Trim(); $source = 'Message' }
+        if (-not $app) {
+            $m = [regex]::Match($Message, '(?i)(?:The program|Программа)\s+(\S+\.exe)')
+            if ($m.Success) { $app = $m.Groups[1].Value.Trim(); $source = 'Message' }
+        }
+        if (-not $app) {
+            $m = [regex]::Match($Message, '(?im)^\s*P1:\s*(\S+\.exe)\s*$')
+            if ($m.Success) { $app = $m.Groups[1].Value.Trim(); $source = 'Message' }
+        }
+    }
+    if (-not $module) {
+        $m = [regex]::Match($Message, '(?i)(?:Faulting module name|Имя сбойного модуля):\s*([^,]+)')
+        if ($m.Success) { $module = $m.Groups[1].Value.Trim() }
+    }
+    if (-not $exception) {
+        $m = [regex]::Match($Message, '(?i)(?:Exception code|Код исключения):\s*(0x[0-9a-f]+)')
+        if ($m.Success) { $exception = $m.Groups[1].Value.ToLowerInvariant() }
+    }
+    return [PSCustomObject]@{ App = $app; Module = $module; Exception = $exception; Source = $source }
 }
 
 function Convert-PcieCorrectableStatusToText {
@@ -2622,6 +2706,9 @@ $continue = Invoke-Step -Number 8 -Title 'Ошибки приложений за
             foreach ($g in @($crashGroups | Select-Object -First 3)) {
                 $parts = ([string]$g.Name).Split('|')
                 $appName = if ($parts.Count -ge 4) { $parts[3] } else { '-' }
+                # v1.0 evidence fix: an unidentified process is shown as such
+                # (its own group), never as a shared "-" group.
+                if ($appName -like 'UNRESOLVED#*') { $appName = ('неопознанный процесс ({0} {1})' -f $parts[1], $parts[2]) }
                 $exc = if ($parts.Count -ge 6) { $parts[5] } else { '-' }
                 $label = '{0} — {1}×' -f $appName, $g.Count
                 if ($exc -and $exc -ne '-') { $label += (' · Exception {0}' -f $exc) }

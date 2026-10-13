@@ -51,13 +51,83 @@ impl LiveKernelReport {
     /// another size / time, are different reports; only the very same file
     /// listed twice is one.
     pub fn identity(&self) -> (String, u64, String) {
-        let path = if self.path.trim().is_empty() {
+        (
+            self.object_path().to_lowercase(),
+            self.size,
+            self.time.clone(),
+        )
+    }
+
+    /// Full path of the file, or `folder\name` in older evidence.
+    fn object_path(&self) -> String {
+        if self.path.trim().is_empty() {
             format!("{}\\{}", self.folder.trim(), self.name.trim())
         } else {
             self.path.trim().to_string()
-        };
-        (path.to_lowercase(), self.size, self.time.clone())
+        }
     }
+
+    /// v1.0 evidence fix: the report KIND (WATCHDOG, USBHUB3, …) is the
+    /// first folder below `LiveKernelReports`, not the immediate parent:
+    /// `WATCHDOG\old\x.dmp` is a WATCHDOG report. A file directly in the
+    /// root is named `<KIND>-<date>-<time>.dmp`.
+    pub fn kind(&self) -> String {
+        let path = self.path.replace('/', "\\");
+        // ASCII-only folding keeps byte offsets valid for slicing `path`
+        // (Unicode lowercasing can change the length of a non-ASCII path).
+        let lower = path.to_ascii_lowercase();
+        if let Some(i) = lower.find("\\livekernelreports\\") {
+            let rel = &path[i + "\\livekernelreports\\".len()..];
+            let parts: Vec<&str> = rel.split('\\').filter(|p| !p.is_empty()).collect();
+            if parts.len() >= 2 {
+                return parts[0].to_string();
+            }
+            if let Some(name) = parts.first() {
+                return name_kind(name);
+            }
+        }
+        let folder = self.folder.trim();
+        if folder.is_empty() || folder.eq_ignore_ascii_case("LiveKernelReports") {
+            name_kind(&self.name)
+        } else {
+            folder.to_string()
+        }
+    }
+
+    /// Stable id of this report OBJECT (full path + size + time), so the
+    /// same file name with another size / time / folder stays a separate,
+    /// traceable entry in the evidence.
+    pub fn report_id(&self) -> String {
+        let (path, size, time) = self.identity();
+        // FNV-1a 64: deterministic across runs and builds.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in format!("{path}|{size}|{time}").bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("LKR-{h:016x}")
+    }
+}
+
+/// `WATCHDOG-20261004-2057.dmp` → `WATCHDOG`.
+fn name_kind(name: &str) -> String {
+    let stem = name.trim();
+    let kind = stem.split('-').next().unwrap_or(stem);
+    let kind = kind.strip_suffix(".dmp").unwrap_or(kind);
+    if kind.is_empty() {
+        "LiveKernelReports".to_string()
+    } else {
+        kind.to_string()
+    }
+}
+
+/// Distinct report objects sharing this report's file name (itself
+/// included). More than one = same name, different object — never merged.
+pub fn same_name_objects(r: &LiveKernelReport, reports: &[LiveKernelReport]) -> usize {
+    reports
+        .iter()
+        .filter(|x| x.name.trim().eq_ignore_ascii_case(r.name.trim()))
+        .count()
 }
 
 /// Removes repeated listings of the same report file (`identity`), keeping
@@ -273,7 +343,7 @@ fn signal_of(e: &CorrelatedEvent) -> Option<Signal> {
 }
 
 fn lkr_signal(r: &LiveKernelReport) -> Signal {
-    let f = r.folder.to_ascii_uppercase();
+    let f = r.kind().to_ascii_uppercase();
     Signal {
         subsystem: if f.contains("WATCHDOG") && !f.contains("PDC") {
             Subsystem::Gpu
@@ -341,10 +411,12 @@ pub fn classify(inc: &Incident, reports: &[LiveKernelReport], bugcheck_same_boot
         signals.push((
             lkr_signal(r),
             format!(
-                "{} LiveKernelReports\\{}\\{}",
+                "{} LiveKernelReports\\{}\\{} ({} B, {})",
                 r.time.replace('T', " "),
                 r.folder,
-                r.name
+                r.name,
+                r.size,
+                r.report_id()
             ),
         ));
     }
@@ -477,8 +549,27 @@ pub fn to_json(
     unexpected_shutdowns: usize,
     reports: &[LiveKernelReport],
 ) -> String {
+    to_json_in_session(incidents, unexpected_shutdowns, reports, None)
+}
+
+/// [`to_json`] with the SessionId that observed the listing: the same
+/// report object seen by two sessions is two observations of one object
+/// (same `report_id`), never two reports inside one session.
+pub fn to_json_in_session(
+    incidents: &[(Incident, Verdict)],
+    unexpected_shutdowns: usize,
+    reports: &[LiveKernelReport],
+    session_id: Option<&str>,
+) -> String {
     let q = json::string;
     let mut o = String::from("{\n");
+    o.push_str(&format!(
+        "  \"observed_in_session\": {},\n",
+        session_id
+            .filter(|s| !s.trim().is_empty())
+            .map(q)
+            .unwrap_or_else(|| "null".into())
+    ));
     let status = if incidents.is_empty() {
         "NO_INCIDENTS"
     } else if incidents.iter().any(|(_, v)| v.hang_confirmed) {
@@ -589,16 +680,23 @@ pub fn to_json(
     } else {
         "\n  ],\n"
     });
+    o.push_str(&format!(
+        "  \"live_kernel_report_identity\": {},\n",
+        q("full path + size + time (case-insensitive path); same name with another path / size / time = separate object")
+    ));
     o.push_str("  \"live_kernel_reports\": [");
     for (k, r) in reports.iter().enumerate() {
         o.push_str(if k == 0 { "\n" } else { ",\n" });
         o.push_str(&format!(
-            "    {{ \"folder\": {}, \"name\": {}, \"path\": {}, \"size\": {}, \"time\": {} }}",
+            "    {{ \"report_id\": {}, \"kind\": {}, \"folder\": {}, \"name\": {}, \"path\": {}, \"size\": {}, \"time\": {}, \"same_name_objects\": {} }}",
+            q(&r.report_id()),
+            q(&r.kind()),
             q(&r.folder),
             q(&r.name),
             q(&r.path),
             r.size,
-            q(&r.time)
+            q(&r.time),
+            same_name_objects(r, reports)
         ));
     }
     o.push_str(if reports.is_empty() { "]\n" } else { "\n  ]\n" });
@@ -824,5 +922,80 @@ pub(crate) mod tests {
             js.contains("\"path\": \"C:\\\\Windows\\\\LiveKernelReports"),
             "{js}"
         );
+    }
+
+    /// v1.0 evidence fix: same file name, different sizes. Each distinct
+    /// object keeps its own id, kind and size; a subfolder (`old`) does not
+    /// change the kind; the observing session is recorded; nothing real is
+    /// lost and nothing is double-counted.
+    #[test]
+    fn same_name_different_size_stays_separate_traceable_objects() {
+        let v = json::parse(r#"{"lkr":[
+            {"name":"WATCHDOG-20261004-2057.dmp","dir":"WATCHDOG","path":"C:\\Windows\\LiveKernelReports\\WATCHDOG\\WATCHDOG-20261004-2057.dmp","size":524288,"t":"2026-10-04T20:57:30"},
+            {"name":"WATCHDOG-20261004-2057.dmp","dir":"old","path":"C:\\Windows\\LiveKernelReports\\WATCHDOG\\old\\WATCHDOG-20261004-2057.dmp","size":1048576,"t":"2026-10-04T20:57:31"},
+            {"name":"WATCHDOG-20261004-2057.dmp","dir":"WATCHDOG","path":"C:\\WINDOWS\\LiveKernelReports\\WATCHDOG\\WATCHDOG-20261004-2057.dmp","size":524288,"t":"2026-10-04T20:57:30"},
+            {"name":"USBHUB3-20261001-1000.dmp","dir":"LiveKernelReports","path":"C:\\Windows\\LiveKernelReports\\USBHUB3-20261001-1000.dmp","size":4096,"t":"2026-10-01T10:00:00"}
+        ]}"#)
+        .unwrap();
+        let r = parse_live_kernel_reports(v.get("lkr"));
+        assert_eq!(
+            r.len(),
+            3,
+            "the case-only path variant is the same file: {r:?}"
+        );
+        let ids: Vec<String> = r.iter().map(|x| x.report_id()).collect();
+        assert_ne!(ids[0], ids[1], "different size / folder = different object");
+        assert_eq!(r[0].report_id(), r[0].clone().report_id(), "deterministic");
+        assert_eq!(r[0].kind(), "WATCHDOG");
+        assert_eq!(r[1].kind(), "WATCHDOG", "subfolder `old` is still WATCHDOG");
+        assert_eq!(r[2].kind(), "USBHUB3", "root file: kind from the name");
+        // A non-ASCII path whose Unicode lowercase changes length.
+        let odd = LiveKernelReport {
+            name: "x.dmp".into(),
+            folder: "NDIS".into(),
+            size: 1,
+            time: "2026-10-01T10:00:00".into(),
+            path: "C:\\\u{130}\u{130}\\LiveKernelReports\\NDIS\\x.dmp".into(),
+        };
+        assert_eq!(odd.kind(), "NDIS");
+        assert_eq!(same_name_objects(&r[0], &r), 2);
+        assert_eq!(same_name_objects(&r[2], &r), 1);
+        // Grouping by kind: one WATCHDOG group with BOTH objects.
+        let g = crate::crash_report::lkr_groups(&r, false);
+        let wd = g.iter().find(|x| x.folder == "WATCHDOG").expect("WATCHDOG");
+        assert_eq!(wd.count, 2, "{g:?}");
+        assert!(wd.graphics);
+        assert!(!g.iter().any(|x| x.folder == "old"), "{g:?}");
+        // Evidence: per-object id, kind, size and the observing session.
+        let js = to_json_in_session(&[], 0, &r, Some("WSD-20261013-101500-1"));
+        let pv = json::parse(&js).expect("valid JSON");
+        assert_eq!(
+            pv.get("observed_in_session").and_then(|x| x.as_str()),
+            Some("WSD-20261013-101500-1")
+        );
+        let list = pv
+            .get("live_kernel_reports")
+            .and_then(|x| x.as_arr())
+            .expect("list");
+        assert_eq!(list.len(), 3);
+        let sizes: Vec<f64> = list
+            .iter()
+            .filter_map(|x| match x.get("size") {
+                Some(json::Value::Num(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, [524288.0, 1048576.0, 4096.0]);
+        assert_eq!(
+            list[1].get("same_name_objects"),
+            Some(&json::Value::Num(2.0))
+        );
+        assert_eq!(
+            list[1].get("kind").and_then(|x| x.as_str()),
+            Some("WATCHDOG")
+        );
+        // Without a session the field is explicit null, never invented.
+        let pv = json::parse(&to_json(&[], 0, &r)).unwrap();
+        assert_eq!(pv.get("observed_in_session"), Some(&json::Value::Null));
     }
 }

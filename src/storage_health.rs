@@ -882,13 +882,17 @@ pub fn to_json_with(
         .as_ref()
         .map(crate::storage_history::record_json)
         .unwrap_or_else(|| "null".into());
+    // v1.0 evidence fix: a comparison code is written only together with
+    // the previous COMPLETED session it was measured against.
     let delta = extras
         .error_log_delta
-        .as_ref()
+        .clone()
+        .map(crate::storage_history::ErrorLogDelta::with_baseline_guard)
         .map(|d| {
             format!(
-                "{{\"code\": {}, \"previous_completed_session\": {}, \"en\": {}, \"ru\": {}}}",
+                "{{\"code\": {}, \"baseline\": {}, \"previous_completed_session\": {}, \"en\": {}, \"ru\": {}}}",
                 json::string(d.code()),
+                json::string(d.baseline_code()),
                 d.previous_session()
                     .map(json::string)
                     .unwrap_or_else(|| "null".into()),
@@ -1632,8 +1636,11 @@ pub(crate) mod tests {
             None,
             &[],
             &CorrelationExtras {
-                session: Some(rec),
-                error_log_delta: Some(crate::storage_history::ErrorLogDelta::Stable { value: 3 }),
+                session: Some(rec.clone()),
+                error_log_delta: Some(crate::storage_history::ErrorLogDelta::Stable {
+                    value: 3,
+                    previous_session: "WSD-20261008-090000-1".into(),
+                }),
                 history_error: Some("history.json: access denied".into()),
             },
         );
@@ -1665,10 +1672,52 @@ pub(crate) mod tests {
                 .and_then(|x| x.as_str()),
             Some("STABLE")
         );
+        let dl = v.get("error_log_delta").expect("delta");
+        assert_eq!(
+            dl.get("previous_completed_session")
+                .and_then(|x| x.as_str()),
+            Some("WSD-20261008-090000-1")
+        );
+        assert_eq!(
+            dl.get("baseline").and_then(|x| x.as_str()),
+            Some("COMPLETED_SESSION")
+        );
         assert_eq!(
             v.get("history_error").and_then(|x| x.as_str()),
             Some("history.json: access denied")
         );
+        // v1.0 evidence fix: STABLE without a previous completed session
+        // is never written — the evidence says FIRST_COMPLETED / NO_BASELINE.
+        let orphan = to_json_with(
+            &i,
+            &c,
+            "Patriot P210 512GB",
+            None,
+            &[],
+            &CorrelationExtras {
+                session: Some(rec),
+                error_log_delta: Some(crate::storage_history::ErrorLogDelta::Stable {
+                    value: 3,
+                    previous_session: String::new(),
+                }),
+                history_error: None,
+            },
+        );
+        let v = json::parse(&orphan).expect("valid JSON");
+        let dl = v.get("error_log_delta").expect("delta");
+        assert_eq!(
+            dl.get("code").and_then(|x| x.as_str()),
+            Some("FIRST_COMPLETED")
+        );
+        assert_eq!(
+            dl.get("baseline").and_then(|x| x.as_str()),
+            Some("NO_BASELINE")
+        );
+        assert_eq!(
+            dl.get("previous_completed_session"),
+            Some(&json::Value::Null)
+        );
+        assert!(!orphan.contains("\"STABLE\""), "{orphan}");
         // Plain to_json stays valid with null blocks.
         let plain = to_json(&i, &c, "m", None, &[]);
         assert!(json::parse(&plain).is_some(), "{plain}");

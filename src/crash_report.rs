@@ -155,11 +155,10 @@ pub fn lkr_meaning(folder: &str, ru: bool) -> (String, bool) {
 pub fn lkr_groups(reports: &[LiveKernelReport], ru: bool) -> Vec<LkrGroup> {
     let mut out: Vec<LkrGroup> = Vec::new();
     for r in reports {
-        let folder = if r.folder.trim().is_empty() {
-            "LiveKernelReports".to_string()
-        } else {
-            r.folder.trim().to_string()
-        };
+        // v1.0 evidence fix: grouped by report KIND (first folder below
+        // LiveKernelReports), so `WATCHDOG\old\…` counts as WATCHDOG; each
+        // distinct object (path + size + time) is still counted once.
+        let folder = r.kind();
         match out
             .iter_mut()
             .find(|g| g.folder.eq_ignore_ascii_case(&folder))

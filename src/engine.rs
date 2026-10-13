@@ -4072,6 +4072,112 @@ mod expc_v044_tests {
         let s = script();
         assert!(s.contains("$label = '{0} — {1}×' -f $appName, $g.Count"));
         assert!(s.contains("$label += (' · Exception {0}' -f $exc)"));
+        assert!(s.contains("if ($appName -like 'UNRESOLVED#*')"));
+    }
+
+    /// v1.0 evidence fix: Application Summary restores the process from
+    /// EventData / WER parameters / .NET text (any UI language) and never
+    /// merges unidentified events into one group.
+    #[test]
+    fn application_summary_identity_from_eventdata_wer_dotnet() {
+        let s = script();
+        let f = between(
+            &s,
+            "function Get-ApplicationEventCategory {",
+            "function Convert-PcieCorrectableStatusToText {",
+        );
+        let ps = format!(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n\
+             function Ev([string]$p, [int]$id, [string]$msg, [string[]]$data, [int64]$rid) {{\n\
+               $o = [PSCustomObject]@{{ ProviderName = $p; Id = $id; Message = $msg; TimeCreated = (Get-Date '2026-10-09 10:00'); Data = $data; RecordId = $rid }}\n\
+               $o | Add-Member -MemberType ScriptMethod -Name ToXml -Value {{ $x = '<Event><EventData>'; foreach ($d in $this.Data) {{ $x += '<Data>' + [Security.SecurityElement]::Escape($d) + '</Data>' }}; $x + '</EventData></Event>' }}\n\
+               $o }}\n\
+             function Short-Message([string]$m, [int]$n = 400) {{ $m }}\n\
+             {f}\n\
+             $e = @(\n\
+               (Ev 'Application Error' 1000 'Имя сбойного приложения: x' @('chrome.exe','1.0','0','ntdll.dll','10.0','0','c0000005','0') 1),\n\
+               (Ev 'Application Error' 1000 'localized text without fields' @('chrome.exe','1.0','0','ntdll.dll','10.0','0','c0000005','0') 2),\n\
+               (Ev 'Application Hang' 1002 'Программа 1cv8.exe версии 8.3 прекратила взаимодействие' @('1cv8.exe','8.3','1a2c','01dc','-1') 3),\n\
+               (Ev 'Windows Error Reporting' 1001 'Имя события: APPCRASH' @('0','5','APPCRASH','Not available','0','TeamViewer.exe','15.0','0','KERNELBASE.dll','10.0','0','e0434352','0','0') 4),\n\
+               (Ev 'Windows Error Reporting' 1001 'Fault bucket, type 0' @('0','5','LiveKernelEvent','Not available','0','141','ffff','0','0','0','0','0','0','0') 5),\n\
+               (Ev '.NET Runtime' 1026 'x' @(\"Application: Updater.exe`nFramework Version: v4.0.30319`nDescription: unhandled`nException Info: System.IO.IOException\") 6),\n\
+               (Ev 'Windows Error Reporting' 1001 'no data' @() 7),\n\
+               (Ev 'Application Error' 1000 'no data either' @() 8),\n\
+               (Ev 'Windows Error Reporting' 1001 'BEX64' @('0','5','BEX64','Not available','0','conhost.exe','10.0','0','conhost.exe','10.0','0','000000000007286e','c0000409','0') 9),\n\
+               (Ev 'Windows Error Reporting' 1001 'MoBEX a' @('0','5','MoBEX','Not available','0','SystemSettings.exe','10.0','0','ucrtbase.dll','10.0','0','0000000000075a3e','c0000409','0') 10),\n\
+               (Ev 'Windows Error Reporting' 1001 'MoBEX b' @('0','5','MoBEX','Not available','0','Photos.exe','10.0','0','ucrtbase.dll','10.0','0','0000000000075a3e','c0000409','0') 11),\n\
+               (Ev 'Windows Error Reporting' 1001 'unknown schema' @('0','5','SomeNewKind','Not available','0','abc','1','0') 12),\n\
+               (Ev 'Windows Error Reporting' 1001 'unknown schema' @('0','5','SomeNewKind','Not available','0','abc','1','0') 13)\n\
+             )\n\
+             foreach ($x in $e) {{ Write-Output (Get-ApplicationIssueSignature -Event $x) }}\n\
+             $id = Get-ApplicationProcessIdentity -Event $e[0] -Message ''\n\
+             Write-Output ('SRC=' + $id.Source)\n"
+        );
+        let Some(out) = run("appident", &ps) else {
+            return;
+        };
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 14, "{out}");
+        assert_eq!(
+            lines[0],
+            "CrashHang|Application Error|1000|chrome.exe|ntdll.dll|0xc0000005"
+        );
+        assert_eq!(
+            lines[1], lines[0],
+            "same process from EventData, whatever the message language"
+        );
+        assert_eq!(lines[2], "CrashHang|Application Hang|1002|1cv8.exe|-|hang");
+        assert_eq!(
+            lines[3],
+            "CrashHang|Windows Error Reporting|1001|TeamViewer.exe|KERNELBASE.dll|0xe0434352"
+        );
+        assert_eq!(
+            lines[4],
+            "CrashHang|Windows Error Reporting|1001|WER:LiveKernelEvent|-|-"
+        );
+        assert_eq!(
+            lines[5],
+            "CrashHang|.NET Runtime|1026|Updater.exe|-|System.IO.IOException"
+        );
+        // Unidentified: one group per event, never a shared "-" group.
+        assert_eq!(
+            lines[6],
+            "CrashHang|Windows Error Reporting|1001|UNRESOLVED#7|-|-"
+        );
+        assert_eq!(
+            lines[7],
+            "CrashHang|Application Error|1000|UNRESOLVED#8|-|-"
+        );
+        // PR #3 review: BEX64 exception is P8 (P7 is the fault offset).
+        assert_eq!(
+            lines[8],
+            "CrashHang|Windows Error Reporting|1001|conhost.exe|conhost.exe|0xc0000409"
+        );
+        // Two MoBEX crashes of different processes stay two groups.
+        assert_eq!(
+            lines[9],
+            "CrashHang|Windows Error Reporting|1001|SystemSettings.exe|ucrtbase.dll|0xc0000409"
+        );
+        assert_eq!(
+            lines[10],
+            "CrashHang|Windows Error Reporting|1001|Photos.exe|ucrtbase.dll|0xc0000409"
+        );
+        // An unknown WER schema is never grouped by its event name.
+        assert_eq!(
+            lines[11],
+            "CrashHang|Windows Error Reporting|1001|UNRESOLVED#12|-|-"
+        );
+        assert_eq!(
+            lines[12],
+            "CrashHang|Windows Error Reporting|1001|UNRESOLVED#13|-|-"
+        );
+        assert!(!lines.iter().any(|l| l.contains("WER:MoBEX")), "{out}");
+        assert!(!lines.iter().any(|l| l.contains("|-|-|-")), "{out}");
+        assert_eq!(lines[13], "SRC=EventData");
     }
 }
 
