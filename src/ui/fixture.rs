@@ -89,6 +89,10 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
         controls_enabled: true,
         stop_enabled: false,
         crypto: CryptoVm::HashOk,
+        crypto_caption: Some(format!("{} · 16:05", d.origin_preflight_short)),
+        crypto_recheck_enabled: true,
+        drivers_caption: Some(format!("{} · 16:05", d.origin_preflight_short)),
+        drivers_check_enabled: true,
         computer_name: COMPUTER_NAME.into(),
         stages,
         overall: OverallVm {

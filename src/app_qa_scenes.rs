@@ -7,11 +7,27 @@
 
 use super::*;
 
+/// v1.1 QA: a fixed check time (deterministic captures).
+fn qa_stamp(origin: CheckOrigin, at: &str) -> CheckStamp {
+    CheckStamp {
+        at: at.to_string(),
+        origin,
+    }
+}
+
 /// Scenes that open a Details window (embedded viewports for the capture).
 pub(super) fn is_details_scene(scene: &str) -> bool {
     matches!(
         scene,
-        "sensor-details" | "stage-details" | "disk-details" | "crash-analyzer" | "windbg-install"
+        "sensor-details"
+            | "stage-details"
+            | "disk-details"
+            | "crash-analyzer"
+            | "windbg-install"
+            | "crypto-details"
+            | "crypto-rehash-confirm"
+            | "driver-details"
+            | "hardware-passport"
     )
 }
 
@@ -81,6 +97,31 @@ impl WinStateDiagApp {
                 .collect();
                 self.crash_details_open = true;
             }
+            // v1.1 QA: CryptoPro Details (preflight result with the real
+            // MSI inventory shape) and the ReHash confirmation.
+            "crypto-details" | "crypto-rehash-confirm" => {
+                self.seed_qa_crypto(scene == "crypto-rehash-confirm");
+            }
+            // v1.1 QA: Driver Audit Details with the check history.
+            "driver-details" => {
+                self.driver_checked = Some(qa_stamp(CheckOrigin::Manual, "2026-10-13 16:12:40"));
+                self.driver_history = vec![
+                    DriverHistoryEntry {
+                        stamp: qa_stamp(CheckOrigin::Preflight, "2026-10-13 16:05:12"),
+                        outcome: "OK (0 / 0)".into(),
+                    },
+                    DriverHistoryEntry {
+                        stamp: qa_stamp(CheckOrigin::Manual, "2026-10-13 16:12:40"),
+                        outcome: "OK (0 / 0)".into(),
+                    },
+                ];
+                self.drivers_open = true;
+            }
+            // v1.1 QA: Hardware Passport 2.0 (sanitized MSI collector JSON).
+            "hardware-passport" => {
+                self.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.to_string());
+                self.passport2_open = true;
+            }
             // v1.0 QA: sensor read in progress (spinner READ + real timer).
             "sensor-reading" => {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -90,6 +131,32 @@ impl WinStateDiagApp {
             }
             _ => {}
         }
+    }
+
+    /// v1.1 QA: CryptoPro preflight result (MSI inventory shape).
+    fn seed_qa_crypto(&mut self, confirm: bool) {
+        self.crypto_inventory = Some(cryptopro::Inventory {
+            product: Some(cryptopro::CspProduct {
+                name: "КриптоПро CSP".into(),
+                version: "5.0.13800".into(),
+                product_code: "{50F91F80-D397-437C-B0C8-62128DE3B55E}".into(),
+                license: cryptopro::LicenseKey::Installed {
+                    masked: "5050Z-*****".into(),
+                },
+                term: cryptopro::LicenseTerm::NotDetermined,
+            }),
+        });
+        self.crypto_detection = cryptopro::Detection::Installed(PathBuf::from(
+            "C:\\Program Files (x86)\\Crypto Pro\\CSP\\cpverify.exe",
+        ));
+        self.crypto = Some(if confirm {
+            cryptopro::HashState::NoHash
+        } else {
+            cryptopro::HashState::HashOk
+        });
+        self.crypto_checked = Some(qa_stamp(CheckOrigin::Preflight, "2026-10-13 16:05:09"));
+        self.crypto_rehash_confirm = confirm;
+        self.crypto_details_open = true;
     }
 
     /// v1.0 QA: the three NVMe disks of the reference machine as physical
@@ -529,7 +596,7 @@ Followup:     MachineOwner
 ---------
 "#;
 
-fn qa_analysis() -> crash_dump::DumpAnalysis {
+pub(super) fn qa_analysis() -> crash_dump::DumpAnalysis {
     let bc = qa_inventory().bugchecks.into_iter().next();
     crash_dump::DumpAnalysis::build(
         qa_dump(),

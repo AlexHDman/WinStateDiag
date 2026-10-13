@@ -160,12 +160,11 @@ fn startup_runs_no_diagnostic_and_starts_no_collector_in_both_languages() {
     assert_eq!(i18n::EN.curop_waiting_name, "Waiting to start");
 }
 
-/// v1.0: the automatic read-only CryptoPro inventory at launch reports
-/// presence / version / licence into the journal, requests no collector,
-/// starts no HASH check (no cpverify) and never offers ReHash; every other
-/// module stays IDLE.
+/// v1.1: the CryptoPro check reports the registry inventory (presence /
+/// version / licence) and the HASH state through ONE channel, records its
+/// origin and time, and never runs ReHash; other modules are untouched.
 #[test]
-fn startup_crypto_inventory_is_read_only_and_keeps_modules_idle() {
+fn crypto_check_reports_inventory_and_hash_with_origin_and_time() {
     let installed = cryptopro::Inventory {
         product: Some(cryptopro::CspProduct {
             name: "КриптоПро CSP".into(),
@@ -177,51 +176,62 @@ fn startup_crypto_inventory_is_read_only_and_keeps_modules_idle() {
             term: cryptopro::LicenseTerm::NotDetermined,
         }),
     };
-    for (inv, expected) in [
-        (installed, CryptoVm::NotChecked),
+    for (inv, state, expected) in [
+        (installed, cryptopro::HashState::HashOk, CryptoVm::HashOk),
         (
             cryptopro::Inventory { product: None },
+            cryptopro::HashState::NotInstalled,
             CryptoVm::NotInstalled,
         ),
     ] {
         let mut app = WinStateDiagApp::default();
+        app.start_preflight();
+        assert_eq!(app.crypto_origin, CheckOrigin::Preflight);
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(inv.clone()).unwrap();
-        app.crypto_inventory_rx = Some(rx);
+        tx.send(CryptoEvent::Inventory(inv.clone())).unwrap();
+        tx.send(CryptoEvent::Checked(
+            cryptopro::Detection::NotInstalled,
+            state.clone(),
+        ))
+        .unwrap();
+        app.crypto_rx = Some(rx);
         let ctx = headless_ctx();
         for _ in 0..3 {
             frame(&mut app, &ctx);
         }
         assert_eq!(app.crypto_inventory.as_ref(), Some(&inv));
-        assert!(app.crypto_inventory_rx.is_none());
-        assert!(
-            app.collector_requests.is_empty(),
-            "{:?}",
-            app.collector_requests
-        );
-        assert!(
-            app.crypto.is_none() && app.crypto_rx.is_none(),
-            "no HASH check"
-        );
-        assert!(matches!(app.state, RunState::Idle));
-        assert!(matches!(app.driver_audit, DriverAuditState::Idle));
-        assert!(app.sensors_rx.is_none() && app.crash_rx.is_none());
-        assert!(session(&app).is_none(), "no session / report");
+        assert_eq!(app.crypto, Some(state));
+        assert!(app.crypto_rx.is_none());
+        let stamp = app.crypto_checked.clone().expect("time + origin");
+        assert_eq!(stamp.origin, CheckOrigin::Preflight);
         let vm = app.build_vm(0.0, 0.0);
         assert_eq!(vm.crypto, expected);
+        assert!(
+            vm.crypto_caption
+                .as_deref()
+                .is_some_and(|c| c.starts_with(i18n::RU.origin_preflight_short)),
+            "{:?}",
+            vm.crypto_caption
+        );
+        assert!(vm.crypto_recheck_enabled);
+        assert!(session(&app).is_none(), "no session / report");
         let journal: Vec<String> = app.journal.iter().map(|e| e.message.clone()).collect();
         for line in inv.journal() {
             assert!(journal.contains(&line), "{line} missing from {journal:?}");
         }
-        assert!(!journal.iter().any(|l| l.contains("ReHash выполнен")));
+        assert!(
+            !app.collector_requests.contains(&"cryptopro_rehash"),
+            "never ReHash automatically"
+        );
     }
 }
 
-/// Source contract: the constructor (the launch) never starts a collector,
-/// a thread or a process — not even behind a "not under test" guard that
-/// the runtime checks above could not see.
+/// Source contract: the constructor (the launch) starts nothing itself but
+/// the disk selector and `start_preflight`; the preflight starts exactly
+/// the read-only Driver Audit, CryptoPro check and crash / WinDbg
+/// discovery — never an EXPC session, a report, an analysis or ReHash.
 #[test]
-fn the_launch_code_path_contains_no_collector_start() {
+fn the_launch_code_path_starts_only_the_read_only_preflight() {
     // Sources may be checked out with CRLF (core.autocrlf): slice on LF.
     let src = &include_str!("app.rs").replace("\r\n", "\n");
     let start = src
@@ -230,7 +240,6 @@ fn the_launch_code_path_contains_no_collector_start() {
     let end = start + src[start..].find("\nimpl WinStateDiagApp {").unwrap();
     let ctor = &src[start..end];
     for forbidden in [
-        "start_",
         "thread::spawn",
         "Command::new",
         "run_session",
@@ -240,35 +249,47 @@ fn the_launch_code_path_contains_no_collector_start() {
         "StartupLog",
         "WindowsTopologySource",
         "candidates_from",
+        "start_diagnostics",
+        "start_crash_analysis",
+        "start_crypto_rehash",
     ] {
         assert!(!ctor.contains(forbidden), "launch code calls `{forbidden}`");
     }
-    // Its only work: the disk selector, in the background, write-free —
-    // and the v1.0 read-only CryptoPro inventory (registry only).
     assert_eq!(ctor.matches("app.enumerate_disk_selector();").count(), 1);
-    assert_eq!(ctor.matches("app.read_crypto_inventory();").count(), 1);
-    let at = src
-        .find("    fn read_crypto_inventory(&mut self) {")
-        .unwrap();
-    let body = &src[at..at
-        + src[at..]
-            .find(
-                "
-    }
-",
-            )
-            .unwrap()];
-    assert!(body.contains("thread::spawn"), "never on the UI thread");
-    assert!(body.contains("cryptopro::inventory(&cryptopro::SystemRegistry)"));
-    for forbidden in [
-        "Command",
-        "HiddenRunner",
-        "check(",
-        "rehash",
-        "request_collector",
-        "contribute",
+    assert_eq!(ctor.matches("app.start_preflight();").count(), 1);
+    assert_eq!(
+        ctor.matches("app.start_").count(),
+        1,
+        "only start_preflight"
+    );
+    let at = src.find("    fn start_preflight(&mut self) {").unwrap();
+    let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
+    for needed in [
+        "self.driver_origin = CheckOrigin::Preflight;",
+        "self.driver_audit = start_driver_audit(self.new_driver_cancel());",
+        "self.start_crypto_check_as(CheckOrigin::Preflight);",
+        "self.start_crash_scan_as(CheckOrigin::Preflight);",
     ] {
-        assert!(!body.contains(forbidden), "inventory calls `{forbidden}`");
+        assert!(body.contains(needed), "preflight lacks `{needed}`");
+    }
+    for forbidden in [
+        "begin_operation",
+        "claim_package",
+        "contribute",
+        "offer(",
+        "run_crash_analysis",
+        "start_crash_analysis",
+        "start_crypto_rehash",
+        "start_sensor_read",
+        "start_passport",
+        "start_gpo_check",
+        "start_ata_scan",
+        "start_event_collection",
+        "start_hardware_view",
+        "run_session",
+        "install_analyzer",
+    ] {
+        assert!(!body.contains(forbidden), "preflight calls `{forbidden}`");
     }
     let at = src
         .find("    fn enumerate_disk_selector(&mut self) {")

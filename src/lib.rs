@@ -23,6 +23,7 @@ mod incidents;
 mod manifest;
 mod nvme_health;
 mod passport;
+mod passport2;
 mod power;
 mod ps_exec;
 mod report_package;
@@ -429,7 +430,7 @@ fn consistency_probe(out: Option<PathBuf>) -> i32 {
         format!("APP_VERSION={APP_VERSION}"),
         format!("PRODUCER_VERSION={}", manifest::PRODUCER_VERSION),
     ];
-    let mut ok = APP_VERSION == "1.0" && manifest::PRODUCER_VERSION == "1.0";
+    let mut ok = APP_VERSION == "1.1" && manifest::PRODUCER_VERSION == "1.1";
     // Storage: an ATA SMART health record through the shipped writers.
     let disk = storage_topology::PhysicalDiskInfo {
         index: 1,
@@ -532,12 +533,22 @@ fn run_renderer(args: &[String], mode: GraphicsMode, handshake: Option<PathBuf>)
     }
     // Initial size = reference canvas at 80%; the first frame fits it to the
     // monitor and the canvas then scales uniformly with the window.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(title.clone())
+        .with_inner_size([ui::tokens::CANVAS_W * 0.8, ui::tokens::CANVAS_H * 0.8])
+        .with_min_inner_size([640.0_f32, 516.0_f32])
+        .with_icon(window_icon());
+    // v1.1 offscreen QA: a visual-reference capture renders in a window
+    // placed outside the visible desktop that never takes focus and has no
+    // taskbar button — the user's desktop is not occupied.
+    if reference && args.iter().any(|a| a == "--qa-offscreen") {
+        viewport = viewport
+            .with_position([-30000.0_f32, -30000.0_f32])
+            .with_active(false)
+            .with_taskbar(false);
+    }
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(title.clone())
-            .with_inner_size([ui::tokens::CANVAS_W * 0.8, ui::tokens::CANVAS_H * 0.8])
-            .with_min_inner_size([640.0_f32, 516.0_f32])
-            .with_icon(window_icon()),
+        viewport,
         ..Default::default()
     };
     graphics_wgpu::configure(&mut options.wgpu_options, mode);
@@ -607,6 +618,10 @@ struct StartupGuard {
 }
 
 impl eframe::App for StartupGuard {
+    fn on_exit(&mut self) {
+        self.inner.on_exit();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.inner.logic(ctx, frame);
     }
@@ -639,8 +654,8 @@ mod consistency_probe_tests {
         let out = dir.join("c.txt");
         let code = super::consistency_probe(Some(out.clone()));
         let text = std::fs::read_to_string(&out).unwrap();
-        assert!(text.contains("TITLE=WinStateDiag — v1.0"), "{text}");
-        assert!(text.contains("PRODUCER_VERSION=1.0"), "{text}");
+        assert!(text.contains("TITLE=WinStateDiag — v1.1"), "{text}");
+        assert!(text.contains("PRODUCER_VERSION=1.1"), "{text}");
         assert!(
             text.contains(
                 "STORAGE_ATA health_status=OK correlation_state=OK correlation_health=OK -> PASS"

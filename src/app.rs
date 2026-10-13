@@ -1109,9 +1109,111 @@ fn report_attention(report_exists: bool, opened: bool) -> bool {
     report_exists && !opened
 }
 
+/// v1.1 Startup Orchestration: who started a module's check. A PREFLIGHT
+/// check runs automatically at launch (read-only, no session, no report)
+/// and is never presented as the result of a full diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckOrigin {
+    /// Automatic read-only check at launch.
+    Preflight,
+    /// The user's explicit re-check of this one module.
+    Manual,
+    /// Part of a full diagnostic session.
+    Session,
+}
+
+impl CheckOrigin {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            CheckOrigin::Preflight => "PREFLIGHT",
+            CheckOrigin::Manual => "MANUAL",
+            CheckOrigin::Session => "SESSION",
+        }
+    }
+
+    pub(crate) fn text(self, d: &i18n::Dict) -> &'static str {
+        match self {
+            CheckOrigin::Preflight => d.origin_preflight,
+            CheckOrigin::Manual => d.origin_manual,
+            CheckOrigin::Session => d.origin_session,
+        }
+    }
+}
+
+/// When and how a module's last result was produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckStamp {
+    /// Local wall-clock time, `YYYY-MM-DD HH:MM:SS`.
+    pub at: String,
+    pub origin: CheckOrigin,
+}
+
+impl CheckStamp {
+    pub(crate) fn now(origin: CheckOrigin) -> Self {
+        let t = sysinfo::local_time();
+        Self {
+            at: format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                t.year, t.month, t.day, t.hour, t.minute, t.second
+            ),
+            origin,
+        }
+    }
+
+    /// `HH:MM` for compact cards.
+    pub(crate) fn clock(&self) -> &str {
+        self.at.get(11..16).unwrap_or(&self.at)
+    }
+
+    /// «Предварительно · 10:42» — compact card caption.
+    pub(crate) fn caption(&self, d: &i18n::Dict) -> String {
+        let short = match self.origin {
+            CheckOrigin::Preflight => d.origin_preflight_short,
+            CheckOrigin::Manual => d.origin_manual_short,
+            CheckOrigin::Session => d.origin_session_short,
+        };
+        format!("{short} · {}", self.clock())
+    }
+
+    /// «Предварительная проверка · 2026-10-13 10:42:05» — Details.
+    pub(crate) fn full(&self, d: &i18n::Dict) -> String {
+        format!("{} · {}", self.origin.text(d), self.at)
+    }
+}
+
+/// v1.1: one line of the Driver Audit Details journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DriverHistoryEntry {
+    pub stamp: CheckStamp,
+    /// Localized one-line outcome (status, problems, warnings / error).
+    pub outcome: String,
+}
+
+/// v1.1: appends one Driver Audit history line (bounded, every attempt)
+/// and — for a SUCCESSFUL result only — records the time / origin of the
+/// result now shown (a failed attempt never re-stamps the previous one).
+fn record_check(
+    history: &mut Vec<DriverHistoryEntry>,
+    checked: &mut Option<CheckStamp>,
+    stamp: CheckStamp,
+    outcome: String,
+    success: bool,
+) {
+    history.push(DriverHistoryEntry {
+        stamp: stamp.clone(),
+        outcome,
+    });
+    if history.len() > 200 {
+        history.remove(0);
+    }
+    if success {
+        *checked = Some(stamp);
+    }
+}
+
 /// Driver Audit lifecycle: a read-only audit runs inside every diagnostic
-/// session (for the report) or when the user starts it from Details.
-/// v1.0 Startup Idle: never at start-up.
+/// session (for the report), when the user starts it, and (v1.1) once
+/// automatically at launch as a PREFLIGHT check that joins no report.
 enum DriverAuditState {
     /// Not run in this WinStateDiag session yet.
     Idle,
@@ -1271,13 +1373,19 @@ fn drivers_vm(report: &AuditReport, d: &i18n::Dict) -> DriversVm {
     }
 }
 
-fn start_driver_audit() -> DriverAuditState {
+fn start_driver_audit(cancel: Arc<AtomicBool>) -> DriverAuditState {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // One working folder per run: a cancelled run's cleanup never
+        // touches the files of the next one.
+        let run = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
         let work = std::env::temp_dir()
             .join("WinStateDiag")
-            .join(format!("driver-audit-{}", std::process::id()));
-        let result = driver_audit::run_audit(&work);
+            .join(format!("driver-audit-{}-{run}", std::process::id()));
+        let result = driver_audit::run_audit_with_cancel(&work, &cancel);
         let _ = std::fs::remove_dir_all(&work);
         let _ = tx.send(result);
     });
@@ -1742,6 +1850,8 @@ pub(crate) fn draw_hardware_progress(
 
 /// Background CryptoPro work: read-only check or confirmed ReHash.
 enum CryptoEvent {
+    /// v1.1: the registry inventory of the same check (sent first).
+    Inventory(cryptopro::Inventory),
     Checked(cryptopro::Detection, cryptopro::HashState),
     Rehashed(cryptopro::RehashOutcome),
 }
@@ -1753,6 +1863,17 @@ struct CrashState {
     /// v1.0 evidence fix: the SessionId whose scan collected `inventory`
     /// (a later analysis of the cached listing never re-labels it).
     inventory_session: Option<String>,
+    /// v1.1: origin of the RUNNING scan, and of / time of the inventory.
+    scan_origin: Option<CheckOrigin>,
+    inventory_checked: Option<CheckStamp>,
+    /// v1.1: a full diagnostic started while the preflight scan ran — a
+    /// fresh session scan follows it (the preflight listing never joins
+    /// a client report).
+    rescan_for_session: bool,
+    /// v1.1: the session package that asked for that fresh scan.
+    rescan_package: Option<SharedPackage>,
+    /// v1.1: the SessionId a running SESSION scan belongs to.
+    scan_session: Option<String>,
     analyses: Vec<crash_dump::DumpAnalysis>,
     busy: CrashBusy,
     /// v1.0 live stage of the running analysis.
@@ -2094,8 +2215,41 @@ pub struct WinStateDiagApp {
     /// v1.0: read-only startup inventory (presence / version / licence),
     /// registry only; the HASH check stays with the diagnostic.
     crypto_inventory: Option<cryptopro::Inventory>,
-    crypto_inventory_rx: Option<Receiver<cryptopro::Inventory>>,
+    /// v1.1: origin of the running / last CryptoPro check and its time.
+    crypto_origin: CheckOrigin,
+    crypto_checked: Option<CheckStamp>,
+    /// v1.1: a full diagnostic started while the preflight check was still
+    /// running — a fresh SESSION check follows it (never reused).
+    crypto_recheck_for_session: bool,
+    /// v1.1: the SessionId a running SESSION CryptoPro check belongs to.
+    crypto_op_session: Option<String>,
+    /// v1.1 CryptoPro Details window + ReHash confirmation dialog.
+    crypto_details_open: bool,
+    crypto_rehash_confirm: bool,
+    crypto_export_status: Option<ExportStatus>,
+    /// v1.1: the last ReHash outcome line (Details).
+    crypto_last_rehash: Option<String>,
     driver_audit: DriverAuditState,
+    /// v1.1: origin of the running / last Driver Audit and its time.
+    driver_origin: CheckOrigin,
+    driver_checked: Option<CheckStamp>,
+    /// v1.1: this UI's Driver Audit history (Details journal; clearing it
+    /// never touches Windows logs or saved reports).
+    driver_history: Vec<DriverHistoryEntry>,
+    driver_history_clear_confirm: bool,
+    /// v1.1: the last good result while a re-check runs.
+    driver_previous: Option<Box<AuditReport>>,
+    /// v1.1: cancel flag of the running app-side Driver Audit.
+    driver_cancel: Option<Arc<AtomicBool>>,
+    /// v1.1: a cancelled audit whose worker has not finished yet.
+    driver_draining: Option<Receiver<Result<AuditReport, String>>>,
+    /// v1.1: when the launch preflight started (None = not started).
+    preflight_started: Option<CheckStamp>,
+    /// v1.1 Hardware Passport 2.0: the collector JSON (built in the UI
+    /// language when drawn), window and export status.
+    passport2_json: Option<String>,
+    passport2_open: bool,
+    passport2_status: Option<ExportStatus>,
     drivers_open: bool,
     /// v0.4.4: active page (Diagnostics / Hardware).
     page: Page,
@@ -2279,8 +2433,26 @@ impl Default for WinStateDiagApp {
             crypto_detection: cryptopro::Detection::NotInstalled,
             crypto_rx: None,
             crypto_inventory: None,
-            crypto_inventory_rx: None,
+            crypto_origin: CheckOrigin::Session,
+            crypto_checked: None,
+            crypto_recheck_for_session: false,
+            crypto_op_session: None,
+            crypto_details_open: false,
+            crypto_rehash_confirm: false,
+            crypto_export_status: None,
+            crypto_last_rehash: None,
             driver_audit: DriverAuditState::Idle,
+            driver_origin: CheckOrigin::Session,
+            driver_checked: None,
+            driver_history: Vec::new(),
+            driver_history_clear_confirm: false,
+            driver_previous: None,
+            driver_cancel: None,
+            driver_draining: None,
+            preflight_started: None,
+            passport2_json: None,
+            passport2_open: false,
+            passport2_status: None,
             drivers_open: false,
             page: Page::Diagnostics,
             crash: CrashState::default(),
@@ -2341,17 +2513,17 @@ impl Default for WinStateDiagApp {
             Some("ru") => app.language = Language::Ru,
             _ => {}
         }
-        // v1.0 Startup Idle: a launch starts NO diagnostic collector (Driver
-        // Audit, CryptoPro, crash / sensor / passport / SMART reads, events)
-        // and creates no report or session; they run only after an explicit
-        // user action (Start, or a module's own button).
-        //
-        // The only launch work: the SSD/NVMe disk selector is filled in the
-        // background (see `enumerate_disk_selector`), and the read-only
-        // CryptoPro inventory (registry only: presence, version, licence;
-        // no process, no HASH check, never ReHash).
+        // v1.1 Startup Orchestration: a launch creates no report, session or
+        // ZIP and starts no EXPC diagnostic. In the background it fills the
+        // SSD/NVMe disk selector and runs the automatic read-only PREFLIGHT
+        // checks (Driver Audit, CryptoPro, WinDbg + crash / dump discovery —
+        // see `start_preflight`). Sensors, passport, SMART, events, GPO and
+        // the EXPC stages still run only after an explicit user action.
+        // (Unit tests drive the preflight explicitly.)
         app.enumerate_disk_selector();
-        app.read_crypto_inventory();
+        if !cfg!(test) {
+            app.start_preflight();
+        }
         if app.reference.is_some() {
             app.client_name = fixture::CLIENT_NAME.into();
             app.computer_name = fixture::COMPUTER_NAME.into();
@@ -3432,6 +3604,9 @@ impl WinStateDiagApp {
         // New run: the dashboard card starts empty; the session journal
         // (full viewer / Save / Copy) keeps every earlier line.
         self.journal.clear_view();
+        // v1.1: the session's engine runs its own Driver Audit — never a
+        // second one in parallel.
+        self.cancel_app_driver_audit();
         self.begin_operation(true);
         let session = self
             .session_identity()
@@ -3617,9 +3792,42 @@ impl WinStateDiagApp {
                     EngineEvent::ExpcChecks(checks) => self.expc_checks = checks,
                     EngineEvent::DriverAudit(result) => {
                         // Keep the earlier result if the in-session run failed.
+                        let d = i18n::t(self.language);
+                        let stamp = CheckStamp::now(CheckOrigin::Session);
                         match result {
-                            Ok(report) => self.driver_audit = DriverAuditState::Done(report),
+                            Ok(report) => {
+                                let summary = d
+                                    .driver_journal_summary_fmt
+                                    .replace("{status}", driver_status_label(d, report.overall))
+                                    .replace(
+                                        "{problems}",
+                                        &report.count(Severity::Problem).to_string(),
+                                    )
+                                    .replace(
+                                        "{warnings}",
+                                        &report.count(Severity::Warning).to_string(),
+                                    );
+                                // v1.1: the session's own audit supersedes a
+                                // preflight / manual result still running.
+                                self.driver_origin = CheckOrigin::Session;
+                                self.driver_previous = None;
+                                record_check(
+                                    &mut self.driver_history,
+                                    &mut self.driver_checked,
+                                    stamp,
+                                    summary,
+                                    true,
+                                );
+                                self.driver_audit = DriverAuditState::Done(report);
+                            }
                             Err(err) => {
+                                record_check(
+                                    &mut self.driver_history,
+                                    &mut self.driver_checked,
+                                    stamp,
+                                    format!("{}: {err}", d.driver_status_error),
+                                    false,
+                                );
                                 if !matches!(self.driver_audit, DriverAuditState::Done(_)) {
                                     self.driver_audit = DriverAuditState::Failed(err);
                                 }
@@ -3781,6 +3989,10 @@ impl WinStateDiagApp {
         if !self.is_running() {
             return;
         }
+        // v1.1: the stopped session no longer waits for its own checks.
+        self.crash.rescan_for_session = false;
+        self.crash.rescan_package = None;
+        self.crypto_recheck_for_session = false;
         if let Some(cancel) = &self.session_cancel {
             if !cancel.swap(true, Ordering::SeqCst) {
                 let msg = i18n::t(self.language).journal_stopping.to_string();
@@ -3884,6 +4096,12 @@ impl WinStateDiagApp {
                 let what = i18n::t(self.language).hw_journal_refreshed;
                 self.journal_hardware_result(what, result);
             }
+            // v1.1 Hardware Passport 2.0: the native single-page window.
+            HardwareEvent::Passport(json) => {
+                self.passport2_json = Some(json);
+                self.passport2_open = true;
+                self.passport2_status = None;
+            }
             HardwareEvent::Failed(err) => {
                 let hw = i18n::t(self.language).module_name_hardware;
                 push_journal(&mut self.journal, format!("[ERROR] {hw}: {err}"));
@@ -3929,40 +4147,56 @@ impl WinStateDiagApp {
     // CryptoPro (read-only check; ReHash only after confirmation)
     // -----------------------------------------------------------------
 
-    /// v1.0: automatic read-only CryptoPro inventory at launch. It is not a
-    /// diagnostic collector: registry reads only, no subprocess, no report.
-    fn read_crypto_inventory(&mut self) {
-        if self.reference.is_some() || cfg!(test) || self.crypto_inventory_rx.is_some() {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(cryptopro::inventory(&cryptopro::SystemRegistry));
-        });
-        self.crypto_inventory_rx = Some(rx);
-    }
-
-    fn poll_crypto_inventory(&mut self) {
-        let Some(rx) = &self.crypto_inventory_rx else {
-            return;
-        };
-        let Ok(inv) = rx.try_recv() else {
-            return;
-        };
-        self.crypto_inventory_rx = None;
-        for line in inv.journal() {
-            push_journal(&mut self.journal, line);
-        }
-        self.crypto_inventory = Some(inv);
-    }
-
+    /// The CryptoPro check that runs now: the user's ⟳ outside a session,
+    /// the session's own check during a diagnostic.
     fn start_crypto_check(&mut self) {
+        let origin = if self.is_running() {
+            CheckOrigin::Session
+        } else {
+            CheckOrigin::Manual
+        };
+        self.start_crypto_check_as(origin);
+    }
+
+    /// v1.1: one fresh READ-ONLY CryptoPro check: the registry inventory
+    /// (presence, version, licence key) and the `cpverify -rv` HASH state.
+    /// Never ReHash, never two at once; the previous result is cleared so a
+    /// stale state is never shown as current.
+    fn start_crypto_check_as(&mut self, origin: CheckOrigin) {
         self.request_collector("cryptopro");
-        if self.reference.is_some() || cfg!(test) || self.crypto_rx.is_some() {
+        if self.crypto_rx.is_some() {
+            // v1.1: whatever runs now (preflight, ⟳, a ReHash or the check
+            // of an EARLIER session), this session gets its own fresh check
+            // right after it.
+            if origin == CheckOrigin::Session
+                && (self.crypto_origin != CheckOrigin::Session
+                    || self.crypto_op_session != self.current_session_id())
+            {
+                self.crypto_recheck_for_session = true;
+            }
+            return;
+        }
+        self.crypto_origin = origin;
+        self.crypto_op_session = if origin == CheckOrigin::Session {
+            self.current_session_id()
+        } else {
+            None
+        };
+        self.crypto_export_status = None;
+        if self.reference.is_some() {
+            return;
+        }
+        // A fresh check never shows the previous result as current.
+        self.crypto = None;
+        self.crypto_inventory = None;
+        if cfg!(test) {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let _ = tx.send(CryptoEvent::Inventory(cryptopro::inventory(
+                &cryptopro::SystemRegistry,
+            )));
             let det = cryptopro::detect(&cryptopro::program_files_roots());
             let runner = cryptopro::HiddenRunner {
                 timeout: Duration::from_secs(120),
@@ -3970,8 +4204,13 @@ impl WinStateDiagApp {
             let state = cryptopro::check(&det, &runner);
             let _ = tx.send(CryptoEvent::Checked(det, state));
         });
-        self.crypto = None;
         self.crypto_rx = Some(rx);
+    }
+
+    /// v1.1: ReHash is offered only from NO HASH and never while a check or
+    /// another ReHash runs.
+    fn crypto_rehash_allowed(&self) -> bool {
+        self.crypto_rx.is_none() && self.crypto.as_ref().is_some_and(|s| s.rehash_available())
     }
 
     /// Runs the ReHash after the user confirmed it (only from NO HASH).
@@ -3984,6 +4223,15 @@ impl WinStateDiagApp {
         }
         let det = self.crypto_detection.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        self.crypto_origin = CheckOrigin::Manual;
+        // Unit tests never run cpverify: the request is recorded only.
+        if cfg!(test) {
+            self.request_collector("cryptopro_rehash");
+            std::mem::forget(tx);
+            self.crypto = None;
+            self.crypto_rx = Some(rx);
+            return;
+        }
         std::thread::spawn(move || {
             let runner = cryptopro::HiddenRunner {
                 timeout: Duration::from_secs(900),
@@ -3996,27 +4244,54 @@ impl WinStateDiagApp {
     }
 
     fn poll_crypto(&mut self) {
-        self.poll_crypto_inventory();
-        let Some(rx) = &self.crypto_rx else {
-            return;
-        };
-        let Ok(event) = rx.try_recv() else {
-            return;
-        };
-        self.crypto_rx = None;
-        match event {
-            CryptoEvent::Checked(det, state) => {
-                for line in cryptopro::journal_for(&state) {
-                    push_journal(&mut self.journal, line);
+        loop {
+            let Some(rx) = &self.crypto_rx else {
+                return;
+            };
+            let event = match rx.try_recv() {
+                Ok(event) => event,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.crypto_rx = None;
+                    return;
                 }
-                self.crypto_detection = det;
-                self.crypto = Some(state);
-            }
-            CryptoEvent::Rehashed(outcome) => {
-                for line in outcome.journal {
-                    push_journal(&mut self.journal, line);
+            };
+            match event {
+                CryptoEvent::Inventory(inv) => {
+                    for line in inv.journal() {
+                        push_journal(&mut self.journal, line);
+                    }
+                    self.crypto_inventory = Some(inv);
                 }
-                self.crypto = Some(outcome.state);
+                CryptoEvent::Checked(det, state) => {
+                    self.crypto_rx = None;
+                    for line in cryptopro::journal_for(&state) {
+                        push_journal(&mut self.journal, line);
+                    }
+                    self.crypto_detection = det;
+                    self.crypto = Some(state);
+                    self.crypto_checked = Some(CheckStamp::now(self.crypto_origin));
+                    // v1.1: a diagnostic started during this check gets its
+                    // own fresh session check (also when it already ended;
+                    // Stop / close cancel the request).
+                    if std::mem::take(&mut self.crypto_recheck_for_session) {
+                        self.start_crypto_check_as(CheckOrigin::Session);
+                    }
+                    return;
+                }
+                CryptoEvent::Rehashed(outcome) => {
+                    self.crypto_rx = None;
+                    self.crypto_last_rehash = outcome.journal.last().cloned();
+                    for line in outcome.journal {
+                        push_journal(&mut self.journal, line);
+                    }
+                    self.crypto = Some(outcome.state);
+                    self.crypto_checked = Some(CheckStamp::now(CheckOrigin::Manual));
+                    if std::mem::take(&mut self.crypto_recheck_for_session) {
+                        self.start_crypto_check_as(CheckOrigin::Session);
+                    }
+                    return;
+                }
             }
         }
     }
@@ -4042,46 +4317,115 @@ impl WinStateDiagApp {
     }
 
     fn poll_driver_audit(&mut self) {
+        if let Some(rx) = &self.driver_draining
+            && !matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+        {
+            // The cancelled audit's worker has finished (result discarded).
+            self.driver_draining = None;
+        }
         let DriverAuditState::Running(rx) = &self.driver_audit else {
             return;
         };
         let Ok(result) = rx.try_recv() else {
             return;
         };
+        let origin = self.driver_origin;
+        let stamp = CheckStamp::now(origin);
+        let d = i18n::t(self.language);
         match result {
             Ok(report) => {
-                let d = i18n::t(self.language);
+                let summary = d
+                    .driver_journal_summary_fmt
+                    .replace("{status}", driver_status_label(d, report.overall))
+                    .replace("{problems}", &report.count(Severity::Problem).to_string())
+                    .replace("{warnings}", &report.count(Severity::Warning).to_string());
                 push_journal(
                     &mut self.journal,
-                    d.driver_journal_summary_fmt
-                        .replace("{status}", driver_status_label(d, report.overall))
-                        .replace("{problems}", &report.count(Severity::Problem).to_string())
-                        .replace("{warnings}", &report.count(Severity::Warning).to_string()),
+                    if origin == CheckOrigin::Preflight {
+                        format!("{} — {summary}", d.origin_preflight)
+                    } else {
+                        summary.clone()
+                    },
                 );
-                // Automatic evidence: joins the session report as soon as
-                // one exists (a launch alone never creates a report folder).
-                let files = driver_audit_evidence(&report);
-                let offered = report_package::lock(&self.package_of("drivers")).offer(files);
-                match offered {
-                    Ok(Some(zip)) => push_journal(
-                        &mut self.journal,
-                        i18n::t(self.language)
-                            .driver_journal_added_fmt
-                            .replace("{path}", &display_report_path(&zip)),
-                    ),
-                    Ok(None) => {}
-                    Err(err) => push_journal(
-                        &mut self.journal,
-                        format!("[ERROR] Проверка драйверов: {err}"),
-                    ),
+                // v1.1: a PREFLIGHT audit belongs to no report (it is never
+                // offered, so it can never join a later client session).
+                // Other runs join their session report as soon as one
+                // exists (a launch alone never creates a report folder).
+                if origin != CheckOrigin::Preflight {
+                    let files = driver_audit_evidence(&report);
+                    let offered = report_package::lock(&self.package_of("drivers")).offer(files);
+                    match offered {
+                        Ok(Some(zip)) => push_journal(
+                            &mut self.journal,
+                            d.driver_journal_added_fmt
+                                .replace("{path}", &display_report_path(&zip)),
+                        ),
+                        Ok(None) => {}
+                        Err(err) => push_journal(
+                            &mut self.journal,
+                            format!("[ERROR] Проверка драйверов: {err}"),
+                        ),
+                    }
                 }
+                self.record_driver_check(stamp, summary, true);
+                self.driver_previous = None;
                 self.driver_audit = DriverAuditState::Done(Box::new(report));
             }
             Err(err) => {
                 push_journal(&mut self.journal, format!("[WARN] {err}"));
-                self.driver_audit = DriverAuditState::Failed(err);
+                self.record_driver_check(stamp, format!("{}: {err}", d.driver_status_error), false);
+                // A failed re-check never hides the last good result.
+                self.driver_audit = match self.driver_previous.take() {
+                    Some(previous) => DriverAuditState::Done(previous),
+                    None => DriverAuditState::Failed(err),
+                };
             }
         }
+    }
+
+    /// v1.1: time / origin of the latest Driver Audit result and one line
+    /// in this UI's Driver Audit history.
+    fn record_driver_check(&mut self, stamp: CheckStamp, outcome: String, success: bool) {
+        record_check(
+            &mut self.driver_history,
+            &mut self.driver_checked,
+            stamp,
+            outcome,
+            success,
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v1.1 Startup Orchestration (automatic read-only preflight)
+    // -----------------------------------------------------------------
+
+    /// v1.1: the automatic read-only checks at launch, in the background:
+    /// Driver Audit, CryptoPro (inventory + HASH check, never ReHash), and
+    /// the crash / dump discovery with WinDbg / cdb detection (never
+    /// `!analyze`, never symbols). No session, report or ZIP is created and
+    /// no preflight result joins a client report; every result carries its
+    /// origin and time. A collector that is already busy is not doubled.
+    fn start_preflight(&mut self) {
+        if self.reference.is_some() || self.preflight_started.is_some() {
+            return;
+        }
+        self.preflight_started = Some(CheckStamp::now(CheckOrigin::Preflight));
+        // A. Driver Audit.
+        if !matches!(self.driver_audit, DriverAuditState::Running(_))
+            && self.driver_draining.is_none()
+        {
+            self.driver_origin = CheckOrigin::Preflight;
+            self.request_collector("driver_audit");
+            #[cfg(not(test))]
+            {
+                self.driver_audit = start_driver_audit(self.new_driver_cancel());
+            }
+        }
+        // B. CryptoPro: registry inventory + read-only HASH check.
+        self.start_crypto_check_as(CheckOrigin::Preflight);
+        // C + D. WinDbg / cdb detection and the crash / dump discovery are
+        // one read-only inventory scan (no debugger execution).
+        self.start_crash_scan_as(CheckOrigin::Preflight);
     }
 
     /// Real target fraction for the overall ring (backend-derived).
@@ -4640,6 +4984,19 @@ impl WinStateDiagApp {
             controls_enabled: !running,
             stop_enabled: self.stop_enabled(),
             crypto: self.crypto_vm(),
+            crypto_caption: self
+                .crypto_checked
+                .as_ref()
+                .filter(|_| self.crypto_rx.is_none())
+                .map(|s| s.caption(i18n::t(self.language))),
+            crypto_recheck_enabled: self.crypto_rx.is_none(),
+            drivers_caption: self
+                .driver_checked
+                .as_ref()
+                .map(|s| s.caption(i18n::t(self.language))),
+            drivers_check_enabled: !matches!(self.driver_audit, DriverAuditState::Running(_))
+                && self.driver_draining.is_none()
+                && !self.is_running(),
             computer_name: self.computer_name.clone(),
             stages,
             overall,
@@ -4710,11 +5067,27 @@ impl WinStateDiagApp {
                 }
             }
             Action::Stop => self.request_stop(),
+            // v1.1: ReHash changes the system — the request only opens the
+            // warning / confirmation; it runs after the explicit «Yes».
             Action::CryptoRehashRequest => {
-                if self.crypto.as_ref().is_some_and(|s| s.rehash_available()) {
+                if self.crypto_rehash_allowed() {
+                    self.crypto_rehash_confirm = true;
+                }
+            }
+            Action::CryptoRehashConfirmed => {
+                self.crypto_rehash_confirm = false;
+                if self.crypto_rehash_allowed() {
                     self.start_crypto_rehash();
                 }
             }
+            Action::CryptoRehashCancelled => self.crypto_rehash_confirm = false,
+            Action::CryptoRecheck => {
+                if self.crypto_rx.is_none() {
+                    self.start_crypto_check();
+                }
+            }
+            Action::ShowCryptoDetails => self.crypto_details_open = true,
+            Action::CheckDrivers => self.request_driver_audit(),
             Action::SelectSsdDisk(index) => self.select_ssd_disk(index),
             Action::SetLanguage(lang) => {
                 if self.language != lang {
@@ -4855,186 +5228,230 @@ impl WinStateDiagApp {
         let d = i18n::t(self.language);
         let export_status = self.driver_export_status.as_ref().map(|s| s.text(d));
         let view = self.audit_view();
+        // v1.1: the check history (this UI only) and the last-check line.
+        let history = self.driver_history.clone();
+        let confirm_clear = self.driver_history_clear_confirm;
+        let has_report = view.is_some();
+        let last_check = self.driver_checked.as_ref().map(|s| {
+            d.driver_last_check_fmt
+                .replace("{origin}", s.origin.text(d))
+                .replace("{time}", &s.at)
+        });
+        let recheck_failed = history
+            .last()
+            .is_some_and(|e| e.outcome.starts_with(d.driver_status_error))
+            && matches!(self.driver_audit, DriverAuditState::Done(_));
+        let mut history_act: Option<v11::HistoryAct> = None;
         detail_window(
             ctx,
             "wsd_driver_details",
             d.driver_details_title,
             [980.0, 760.0],
             &mut open,
-            |ui| match &self.driver_audit {
-                DriverAuditState::Idle => {
-                    ui.label(d.driver_not_run);
-                    rerun = ui.button(d.driver_popup_run).clicked();
+            |ui| {
+                if let Some(line) = &last_check {
+                    ui.label(RichText::new(line).color(c::TEXT_MUTED));
                 }
-                DriverAuditState::Running(_) => {
-                    ui.label(d.driver_popup_running);
+                if recheck_failed {
+                    ui.label(RichText::new(d.driver_recheck_failed).color(c::YELLOW_WARNING));
                 }
-                DriverAuditState::Failed(msg) => {
-                    ui.colored_label(c::RED_ERROR, msg);
-                    rerun = ui.button(d.driver_popup_retry).clicked();
-                }
-                DriverAuditState::Done(base) => {
-                    let report: &AuditReport = view.as_deref().unwrap_or(base);
-                    // v0.4.1 summary header: application UI, not a log line
-                    // (no date/time); the rule text lives in the Info tip.
-                    let (header_rerun, header_export) =
-                        driver_summary_header(ui, d, report, export_status.as_ref());
-                    rerun = header_rerun;
-                    export = header_export;
-                    ui.add_space(4.0);
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("wsd_driver_details_scroll")
-                        .auto_shrink([false, false])
-                        .max_height((ui.available_height() - 50.0).max(120.0))
-                        .show(ui, |ui| {
-                            for (n, it) in report.items.iter().enumerate() {
-                                let col = match it.status {
-                                    Severity::Problem => c::RED_ERROR,
-                                    Severity::Warning => c::YELLOW_WARNING,
-                                    Severity::Ok => c::GREEN_SUCCESS,
-                                };
-                                egui::CollapsingHeader::new(
-                                    egui::RichText::new(format!(
-                                        "[{}]  {}  —  {}",
-                                        driver_status_label(d, it.status),
-                                        localized_driver_label(d, &it.label),
-                                        if it.version.is_empty() {
-                                            d.driver_na
-                                        } else {
-                                            &it.version
-                                        }
-                                    ))
-                                    .color(col),
-                                )
-                                .id_salt(("drv", n))
-                                .default_open(it.status != Severity::Ok)
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        d.driver_popup_device_fmt.replace("{device}", &it.device),
-                                    );
-                                    ui.label(
-                                        d.driver_popup_provider_fmt
-                                            .replace(
-                                                "{provider}",
-                                                if it.provider.is_empty() {
-                                                    d.driver_na
-                                                } else {
-                                                    &it.provider
-                                                },
-                                            )
-                                            .replace(
-                                                "{date}",
-                                                if it.date.is_empty() {
-                                                    d.driver_na
-                                                } else {
-                                                    &it.date
-                                                },
-                                            )
-                                            .replace(
-                                                "{inf}",
-                                                if it.inf.is_empty() {
-                                                    d.driver_na
-                                                } else {
-                                                    &it.inf
-                                                },
-                                            )
-                                            .replace(
-                                                "{service}",
-                                                if it.service.is_empty() {
-                                                    d.driver_na
-                                                } else {
-                                                    &it.service
-                                                },
-                                            ),
-                                    );
-                                    if !it.pnp_id.is_empty() {
+                match &self.driver_audit {
+                    DriverAuditState::Idle => {
+                        ui.label(d.driver_not_run);
+                        rerun = ui.button(d.driver_popup_run).clicked();
+                        history_act =
+                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report);
+                    }
+                    DriverAuditState::Running(_) => {
+                        ui.label(d.driver_popup_running);
+                        history_act =
+                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report);
+                    }
+                    DriverAuditState::Failed(msg) => {
+                        ui.colored_label(c::RED_ERROR, msg);
+                        rerun = ui.button(d.driver_popup_retry).clicked();
+                        history_act =
+                            v11::driver_history_section(ui, d, &history, confirm_clear, has_report);
+                    }
+                    DriverAuditState::Done(base) => {
+                        let report: &AuditReport = view.as_deref().unwrap_or(base);
+                        // v0.4.1 summary header: application UI, not a log line
+                        // (no date/time); the rule text lives in the Info tip.
+                        let (header_rerun, header_export) =
+                            driver_summary_header(ui, d, report, export_status.as_ref());
+                        rerun = header_rerun;
+                        export = header_export;
+                        ui.add_space(4.0);
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("wsd_driver_details_scroll")
+                            .auto_shrink([false, false])
+                            .max_height((ui.available_height() - 50.0).max(120.0))
+                            .show(ui, |ui| {
+                                for (n, it) in report.items.iter().enumerate() {
+                                    let col = match it.status {
+                                        Severity::Problem => c::RED_ERROR,
+                                        Severity::Warning => c::YELLOW_WARNING,
+                                        Severity::Ok => c::GREEN_SUCCESS,
+                                    };
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(format!(
+                                            "[{}]  {}  —  {}",
+                                            driver_status_label(d, it.status),
+                                            localized_driver_label(d, &it.label),
+                                            if it.version.is_empty() {
+                                                d.driver_na
+                                            } else {
+                                                &it.version
+                                            }
+                                        ))
+                                        .color(col),
+                                    )
+                                    .id_salt(("drv", n))
+                                    .default_open(it.status != Severity::Ok)
+                                    .show(ui, |ui| {
                                         ui.label(
-                                            egui::RichText::new(&it.pnp_id).color(c::TEXT_MUTED),
+                                            d.driver_popup_device_fmt
+                                                .replace("{device}", &it.device),
+                                        );
+                                        ui.label(
+                                            d.driver_popup_provider_fmt
+                                                .replace(
+                                                    "{provider}",
+                                                    if it.provider.is_empty() {
+                                                        d.driver_na
+                                                    } else {
+                                                        &it.provider
+                                                    },
+                                                )
+                                                .replace(
+                                                    "{date}",
+                                                    if it.date.is_empty() {
+                                                        d.driver_na
+                                                    } else {
+                                                        &it.date
+                                                    },
+                                                )
+                                                .replace(
+                                                    "{inf}",
+                                                    if it.inf.is_empty() {
+                                                        d.driver_na
+                                                    } else {
+                                                        &it.inf
+                                                    },
+                                                )
+                                                .replace(
+                                                    "{service}",
+                                                    if it.service.is_empty() {
+                                                        d.driver_na
+                                                    } else {
+                                                        &it.service
+                                                    },
+                                                ),
+                                        );
+                                        if !it.pnp_id.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&it.pnp_id)
+                                                    .color(c::TEXT_MUTED),
+                                            );
+                                        }
+                                        for e in &it.evidence {
+                                            ui.label(format!(
+                                                "• {} [{}{}]{}{}",
+                                                e.reason,
+                                                e.source,
+                                                e.event_id
+                                                    .map(|i| d
+                                                        .driver_popup_event_fmt
+                                                        .replace("{event_id}", &i.to_string()))
+                                                    .unwrap_or_default(),
+                                                if e.count > 1 {
+                                                    format!(" ×{}", e.count)
+                                                } else {
+                                                    String::new()
+                                                },
+                                                if e.last_seen.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    d.driver_popup_last_seen_fmt
+                                                        .replace("{last_seen}", &e.last_seen)
+                                                }
+                                            ));
+                                        }
+                                    });
+                                }
+                                // Engineering detail only: inactive-by-design drivers
+                                // (never counted, never on the card or in the TXT).
+                                if !report.expected_inactive.is_empty() {
+                                    ui.separator();
+                                    for e in &report.expected_inactive {
+                                        ui.label(
+                                            egui::RichText::new(format!("[INFO] {}", e.reason))
+                                                .color(c::TEXT_MUTED),
                                         );
                                     }
-                                    for e in &it.evidence {
+                                }
+                                if !report.software_findings.is_empty() {
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(d.driver_software_findings_title)
+                                            .strong()
+                                            .color(c::YELLOW_WARNING),
+                                    );
+                                    for e in &report.software_findings {
                                         ui.label(format!(
-                                            "• {} [{}{}]{}{}",
+                                            "• {} [{}{}] ×{} · {} … {}",
                                             e.reason,
                                             e.source,
                                             e.event_id
-                                                .map(|i| d
-                                                    .driver_popup_event_fmt
-                                                    .replace("{event_id}", &i.to_string()))
+                                                .map(|i| format!(" #{i}"))
                                                 .unwrap_or_default(),
-                                            if e.count > 1 {
-                                                format!(" ×{}", e.count)
-                                            } else {
-                                                String::new()
-                                            },
-                                            if e.last_seen.is_empty() {
-                                                String::new()
-                                            } else {
-                                                d.driver_popup_last_seen_fmt
-                                                    .replace("{last_seen}", &e.last_seen)
-                                            }
+                                            e.count,
+                                            e.first_seen.replace('T', " "),
+                                            e.last_seen.replace('T', " ")
                                         ));
                                     }
-                                });
-                            }
-                            // Engineering detail only: inactive-by-design drivers
-                            // (never counted, never on the card or in the TXT).
-                            if !report.expected_inactive.is_empty() {
-                                ui.separator();
-                                for e in &report.expected_inactive {
+                                }
+                                if !report.unattributed.is_empty() {
+                                    ui.separator();
                                     ui.label(
-                                        egui::RichText::new(format!("[INFO] {}", e.reason))
+                                        egui::RichText::new(d.driver_popup_unattributed_note)
                                             .color(c::TEXT_MUTED),
                                     );
+                                    for e in &report.unattributed {
+                                        ui.label(format!(
+                                            "• {} [{}] ×{}",
+                                            e.reason, e.source, e.count
+                                        ));
+                                    }
                                 }
-                            }
-                            if !report.software_findings.is_empty() {
-                                ui.separator();
-                                ui.label(
-                                    egui::RichText::new(d.driver_software_findings_title)
-                                        .strong()
-                                        .color(c::YELLOW_WARNING),
+                                if !report.errors.is_empty() {
+                                    ui.separator();
+                                    for e in &report.errors {
+                                        ui.colored_label(
+                                            c::YELLOW_WARNING,
+                                            d.driver_popup_collection_error_fmt
+                                                .replace("{error}", e),
+                                        );
+                                    }
+                                }
+                                ui.add_space(8.0);
+                                history_act = v11::driver_history_section(
+                                    ui,
+                                    d,
+                                    &history,
+                                    confirm_clear,
+                                    has_report,
                                 );
-                                for e in &report.software_findings {
-                                    ui.label(format!(
-                                        "• {} [{}{}] ×{} · {} … {}",
-                                        e.reason,
-                                        e.source,
-                                        e.event_id.map(|i| format!(" #{i}")).unwrap_or_default(),
-                                        e.count,
-                                        e.first_seen.replace('T', " "),
-                                        e.last_seen.replace('T', " ")
-                                    ));
-                                }
-                            }
-                            if !report.unattributed.is_empty() {
-                                ui.separator();
-                                ui.label(
-                                    egui::RichText::new(d.driver_popup_unattributed_note)
-                                        .color(c::TEXT_MUTED),
-                                );
-                                for e in &report.unattributed {
-                                    ui.label(format!("• {} [{}] ×{}", e.reason, e.source, e.count));
-                                }
-                            }
-                            if !report.errors.is_empty() {
-                                ui.separator();
-                                for e in &report.errors {
-                                    ui.colored_label(
-                                        c::YELLOW_WARNING,
-                                        d.driver_popup_collection_error_fmt.replace("{error}", e),
-                                    );
-                                }
-                            }
-                        });
-                    // v1.0 standard action bar (this module's text only).
-                    ui.separator();
-                    match details_action_bar(ui, d, true, None) {
-                        Some(DetailsAct::Copy) => export = Some(ExportAction::Copy),
-                        Some(DetailsAct::Save) => export = Some(ExportAction::Save),
-                        Some(DetailsAct::Close) => close_drivers = true,
-                        _ => {}
+                            });
+                        // v1.0 standard action bar (this module's text only).
+                        ui.separator();
+                        match details_action_bar(ui, d, true, None) {
+                            Some(DetailsAct::Copy) => export = Some(ExportAction::Copy),
+                            Some(DetailsAct::Save) => export = Some(ExportAction::Save),
+                            Some(DetailsAct::Close) => close_drivers = true,
+                            _ => {}
+                        }
                     }
                 }
             },
@@ -5043,6 +5460,9 @@ impl WinStateDiagApp {
             open = false;
         }
         self.drivers_open = open;
+        if let Some(act) = history_act {
+            self.apply_history_act(ctx, act);
+        }
         if let Some(action) = export {
             self.driver_issues_export(ctx, action);
         }
@@ -5051,26 +5471,89 @@ impl WinStateDiagApp {
         }
     }
 
-    /// Run / re-run of the Driver Audit from its Details window: a separate
-    /// module run in its own correctly identified session (nothing else is
-    /// started).
+    /// Run / re-run of the Driver Audit («Проверка» on the card or in its
+    /// Details window): a separate module run in its own correctly
+    /// identified session (nothing else is started; never two at once).
     fn request_driver_audit(&mut self) {
-        if matches!(self.driver_audit, DriverAuditState::Running(_)) {
+        // v1.1: never two audits — not while one runs, and not during a
+        // full diagnostic (its engine runs the session's own audit).
+        if matches!(self.driver_audit, DriverAuditState::Running(_))
+            || self.driver_draining.is_some()
+            || self.is_running()
+        {
             return;
         }
         self.driver_export_status = None;
         self.begin_operation(false);
         self.claim_package("drivers");
+        self.driver_origin = CheckOrigin::Manual;
         self.request_collector("driver_audit");
         // Unit tests never start the collector.
         #[cfg(not(test))]
         {
-            self.driver_audit = start_driver_audit();
+            let cancel = self.new_driver_cancel();
+            let previous = std::mem::replace(&mut self.driver_audit, start_driver_audit(cancel));
+            self.keep_previous_driver_result(previous);
         }
         #[cfg(test)]
         {
             let _ = start_driver_audit;
             self.driver_rerun_requests += 1;
+        }
+    }
+
+    /// v1.1: the SessionId of the current session package (if bound).
+    fn current_session_id(&self) -> Option<String> {
+        self.session_identity().map(|s| s.session_id)
+    }
+
+    /// v1.1: the user pressed Stop and the engine has not ended yet.
+    fn session_stopping(&self) -> bool {
+        self.session_cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::SeqCst))
+    }
+
+    /// v1.1: a fresh cancel flag for the app-side Driver Audit run.
+    fn new_driver_cancel(&mut self) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.driver_cancel = Some(Arc::clone(&cancel));
+        cancel
+    }
+
+    /// v1.1: a full diagnostic starts: an app-side Driver Audit (preflight
+    /// or manual) still running is cancelled — its process tree ends — so
+    /// the engine's session audit is the only one. The last good result
+    /// stays on the card until the session's audit replaces it.
+    fn cancel_app_driver_audit(&mut self) {
+        if !matches!(self.driver_audit, DriverAuditState::Running(_)) {
+            return;
+        }
+        if let Some(cancel) = self.driver_cancel.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        let restored = match self.driver_previous.take() {
+            Some(previous) => DriverAuditState::Done(previous),
+            None => DriverAuditState::Idle,
+        };
+        // The cancelled worker is drained until its process really ended;
+        // no new app-side audit starts before that.
+        if let DriverAuditState::Running(rx) = std::mem::replace(&mut self.driver_audit, restored) {
+            self.driver_draining = Some(rx);
+        }
+        let d = i18n::t(self.language);
+        push_journal(
+            &mut self.journal,
+            d.driver_cancelled_for_session.to_string(),
+        );
+    }
+
+    /// v1.1: the result shown before a re-check stays available until the
+    /// re-check SUCCEEDS (a failed re-check never replaces it).
+    #[cfg_attr(test, allow(dead_code))]
+    fn keep_previous_driver_result(&mut self, previous: DriverAuditState) {
+        if let DriverAuditState::Done(report) = previous {
+            self.driver_previous = Some(report);
         }
     }
 
@@ -6111,6 +6594,34 @@ impl WinStateDiagApp {
         }
     }
 
+    /// v1.1: the Driver Audit result a REPORT may use — never a launch
+    /// preflight result (that one is shown on the card only).
+    fn report_audit(&self) -> Option<&AuditReport> {
+        self.audit_report().filter(|_| {
+            !self
+                .driver_checked
+                .as_ref()
+                .is_some_and(|s| s.origin == CheckOrigin::Preflight)
+        })
+    }
+
+    /// v1.1: the crash inventory a REPORT may use — never the launch
+    /// preflight listing.
+    fn report_inventory(&self) -> Option<&crash_dump::Inventory> {
+        match &self.crash.inventory {
+            Some(Ok(inv))
+                if !self
+                    .crash
+                    .inventory_checked
+                    .as_ref()
+                    .is_some_and(|s| s.origin == CheckOrigin::Preflight) =>
+            {
+                Some(inv)
+            }
+            _ => None,
+        }
+    }
+
     /// v1.0 the Driver Audit as SHOWN: the base audit plus the dump-driven
     /// items for a probable third-party kernel module named by a crash dump
     /// (outside the normal audit scope when needed). Base audit unchanged.
@@ -6323,10 +6834,42 @@ impl WinStateDiagApp {
     }
 
     fn start_crash_scan(&mut self) {
+        let origin = if self.is_running() {
+            CheckOrigin::Session
+        } else {
+            CheckOrigin::Manual
+        };
+        self.start_crash_scan_as(origin);
+    }
+
+    /// v1.1: the read-only crash inventory scan (BugChecks, shutdowns,
+    /// dumps, LiveKernelReports, WinDbg / cdb detection) for `origin`.
+    /// Never two scans at once: a session that finds the PREFLIGHT scan
+    /// running gets its own fresh scan right after it.
+    fn start_crash_scan_as(&mut self, origin: CheckOrigin) {
         self.request_collector("crash_scan");
-        if self.crash_rx.is_none() {
+        if self.crash_rx.is_some() {
+            // A session gets its own scan after a preflight / manual scan or
+            // the scan of an EARLIER session that is still running.
+            if origin == CheckOrigin::Session
+                && (self.crash.scan_origin != Some(CheckOrigin::Session)
+                    || self.crash.scan_session != self.current_session_id())
+            {
+                self.crash.rescan_for_session = true;
+                self.crash.rescan_package = Some(Arc::clone(&self.package));
+            }
+            return;
+        }
+        // A preflight scan belongs to no session package.
+        if origin != CheckOrigin::Preflight {
             self.claim_package("crash");
         }
+        self.crash.scan_origin = Some(origin);
+        self.crash.scan_session = if origin == CheckOrigin::Session {
+            self.current_session_id()
+        } else {
+            None
+        };
         #[cfg(windows)]
         if self.reference.is_none() && !cfg!(test) && self.crash_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -6347,9 +6890,16 @@ impl WinStateDiagApp {
             return;
         }
         self.begin_operation(false);
-        if !matches!(self.crash.inventory, Some(Ok(_))) {
+        // v1.1: a preflight inventory is never analyzed into a report — the
+        // explicit analysis scans again for its own session first.
+        let preflight = self
+            .crash
+            .inventory_checked
+            .as_ref()
+            .is_some_and(|s| s.origin == CheckOrigin::Preflight);
+        if !matches!(self.crash.inventory, Some(Ok(_))) || preflight {
             self.crash_analyze_after_scan = true;
-            self.start_crash_scan();
+            self.start_crash_scan_as(CheckOrigin::Manual);
             return;
         }
         self.claim_package("crash");
@@ -6507,6 +7057,16 @@ impl WinStateDiagApp {
         // fully handled, analyze (when there is something to analyze and an
         // analyzer). Never inside the message loop above: its cleanup would
         // drop the NEW analysis channel.
+        // v1.1: the session's own scan after a preflight scan it found.
+        if self.crash_rx.is_none() && std::mem::take(&mut self.crash.rescan_for_session) {
+            // The scan belongs to the session that asked for it, even when
+            // that diagnostic has finished meanwhile.
+            let package = self.crash.rescan_package.take();
+            self.start_crash_scan_as(CheckOrigin::Session);
+            if let Some(package) = package {
+                self.op_packages.insert("crash", package);
+            }
+        }
         if self.crash_rx.is_none() && self.crash.inventory.is_some() {
             if std::mem::take(&mut self.crash_analyze_after_scan)
                 && matches!(self.crash.inventory, Some(Ok(_)))
@@ -6540,11 +7100,25 @@ impl WinStateDiagApp {
                 }
             }
             CrashMsg::Inventory(inv) => {
+                let origin = self.crash.scan_origin.take().unwrap_or(CheckOrigin::Manual);
                 self.crash.inventory = Some(inv);
-                // The scan reports into the package it claimed at start.
-                self.crash.inventory_session = report_package::lock(&self.package_of("crash"))
-                    .session()
-                    .map(|s| s.session_id.clone());
+                self.crash.inventory_checked = Some(CheckStamp::now(origin));
+                // The scan reports into the package it claimed at start; a
+                // preflight listing was observed by no session.
+                self.crash.inventory_session = if origin == CheckOrigin::Preflight {
+                    None
+                } else {
+                    report_package::lock(&self.package_of("crash"))
+                        .session()
+                        .map(|s| s.session_id.clone())
+                };
+                if origin == CheckOrigin::Preflight && self.is_running() && !self.session_stopping()
+                {
+                    // A diagnostic started meanwhile (and not stopped): its
+                    // report gets a fresh listing (after this channel).
+                    self.crash.rescan_for_session = true;
+                    self.crash.rescan_package = Some(Arc::clone(&self.package));
+                }
                 // v1.0 installer: winget said "installed" → the re-scan
                 // confirms the analyzer (or reports what is still missing).
                 if self.crash.install == InstallState::Verifying {
@@ -6573,8 +7147,12 @@ impl WinStateDiagApp {
                         .install_log
                         .push(format!("re-detect: {}", state.code()));
                 }
-                // The scan started with a diagnostic run joins its report.
-                if self.is_running() {
+                // The scan started with a diagnostic run joins its report
+                // (also when it finishes after the run); a preflight listing
+                // never does.
+                if origin == CheckOrigin::Session
+                    || (self.is_running() && origin != CheckOrigin::Preflight)
+                {
                     self.contribute_incidents();
                 }
             }
@@ -6601,7 +7179,11 @@ impl WinStateDiagApp {
         if let Some((_, v)) = verdicts.first() {
             push_journal(
                 &mut self.journal,
-                format!("{}: {}", d.module_incidents, v.headline()),
+                format!(
+                    "{}: {}",
+                    d.module_incidents,
+                    v.headline_localized(self.language == Language::Ru)
+                ),
             );
         }
         let name = format!(
@@ -6641,7 +7223,8 @@ impl WinStateDiagApp {
             } = item;
             // Confidence uses the BASE Driver Audit only: the dump-driven
             // item derived from this very dump never corroborates it.
-            let a = crash_dump::DumpAnalysis::build(dmp, bc, status, raw, self.audit_report())
+            // v1.1: a preflight audit never corroborates report evidence.
+            let a = crash_dump::DumpAnalysis::build(dmp, bc, status, raw, self.report_audit())
                 .with_module(module_info, resolution);
             let (txt, js, dmp_name) = crash_dump::evidence_names(&stamp, n + 1, &a.dump.name);
             let copied = bytes.map(|b| {
@@ -7084,7 +7667,7 @@ impl WinStateDiagApp {
                             .crash
                             .analyses
                             .first()
-                            .map(|a| a.confidence.code().to_string())
+                            .map(|a| a.confidence.label(ru))
                             .unwrap_or_else(|| d.crash_analysis_pending.to_string()),
                     ),
                     Tone::Warning,
@@ -7096,13 +7679,18 @@ impl WinStateDiagApp {
             Some(Err(e)) => crash_dump::DebuggerStatus::Error(e.clone()),
             None => crash_dump::DebuggerStatus::NotInstalled,
         };
-        let (dbg_text, dbg_tone) = match &debugger {
-            crash_dump::DebuggerStatus::Installed { .. } => (d.crash_dbg_installed, Tone::Success),
-            crash_dump::DebuggerStatus::PackageOnly { .. } => {
-                (d.crash_dbg_package_only, Tone::Warning)
+        // v1.1 WinDbg status: installed + backend ready / not found / needs
+        // a check — never "not installed" before any detection ran.
+        let (dbg_text, dbg_tone) = match (&self.crash.inventory, &debugger) {
+            (None, _) => (d.windbg_unknown, Tone::Idle),
+            (_, crash_dump::DebuggerStatus::Installed { .. }) => {
+                (d.windbg_backend_ready, Tone::Success)
             }
-            crash_dump::DebuggerStatus::NotInstalled => (d.crash_dbg_missing, Tone::Warning),
-            crash_dump::DebuggerStatus::Error(_) => (d.crash_dbg_error, Tone::Error),
+            (_, crash_dump::DebuggerStatus::PackageOnly { .. }) => {
+                (d.windbg_package_only, Tone::Warning)
+            }
+            (_, crash_dump::DebuggerStatus::NotInstalled) => (d.windbg_not_found, Tone::Warning),
+            (_, crash_dump::DebuggerStatus::Error(_)) => (d.windbg_unknown, Tone::Error),
         };
         let inventory_known = matches!(self.crash.inventory, Some(Ok(_)));
         let mut rows = Vec::new();
@@ -7137,12 +7725,12 @@ impl WinStateDiagApp {
                 ));
                 rows.push(InfoRow::new(
                     d.crash_row_process,
-                    a.parsed.process_name.clone().unwrap_or_else(|| "—".into()),
+                    process_name_text(a, ru),
                     Tone::Idle,
                 ));
                 rows.push(InfoRow::new(
                     d.crash_row_confidence,
-                    a.confidence.code(),
+                    a.confidence.label(ru),
                     match a.confidence {
                         crash_dump::Confidence::High => Tone::Warning,
                         _ => Tone::Idle,
@@ -7237,7 +7825,7 @@ impl WinStateDiagApp {
         {
             rows.push(InfoRow::new(
                 d.crash_row_incident,
-                v.headline(),
+                v.headline_localized(ru),
                 if v.hang_confirmed || v.bsod_registered {
                     Tone::Warning
                 } else {
@@ -7249,10 +7837,16 @@ impl WinStateDiagApp {
         let counts = match &self.crash.inventory {
             Some(Ok(inv)) => {
                 let c = crate::crash_report::Counters::of(inv);
-                d.crash_counts_fmt
+                let line = d
+                    .crash_counts_fmt
                     .replace("{s}", &c.unexpected_shutdowns.to_string())
                     .replace("{b}", &c.bugchecks.to_string())
-                    .replace("{d}", &c.dumps.to_string())
+                    .replace("{d}", &c.dumps.to_string());
+                // v1.1: every result says when / how it was produced.
+                match &self.crash.inventory_checked {
+                    Some(stamp) => format!("{line} · {}", stamp.caption(d)),
+                    None => line,
+                }
             }
             _ => String::new(),
         };
@@ -7757,18 +8351,18 @@ impl WinStateDiagApp {
     /// v1.0 machine-readable (system, hardware) state codes — two separate
     /// concepts: "Hardware state: OK" never means "computer healthy".
     fn state_codes(&self) -> (String, String) {
-        let inv = match &self.crash.inventory {
-            Some(Ok(inv)) => Some(inv),
-            _ => None,
-        };
+        // v1.1: the manifest states of a client report never come from the
+        // launch preflight (its results are display-only).
+        let inv = self.report_inventory();
         let hang = inv.is_some_and(|inv| {
             crash_dump::incident_verdicts(inv, &self.crash.analyses)
                 .iter()
                 .any(|(_, v)| v.hang_confirmed)
         });
-        let driver_problem = self
-            .audit_view()
-            .is_some_and(|r| r.overall == Severity::Problem);
+        let driver_problem = self.report_audit().is_some()
+            && self
+                .audit_view()
+                .is_some_and(|r| r.overall == Severity::Problem);
         let system = match inv {
             Some(inv) if !inv.bugchecks.is_empty() => "ATTENTION_BSOD",
             _ if hang => "ATTENTION_HANG",
@@ -8081,7 +8675,7 @@ impl WinStateDiagApp {
                                             "{} — {} — {}",
                                             a.dump.name,
                                             a.status.code(),
-                                            a.confidence.code()
+                                            a.confidence.label(ru)
                                         ),
                                     );
                                     egui::Grid::new(("wsd_crash_kv", n))
@@ -8089,7 +8683,7 @@ impl WinStateDiagApp {
                                         .spacing(vec2(14.0, 4.0))
                                         .striped(true)
                                         .show(ui, |ui| {
-                                            for (k, v) in crash_analysis_rows(a, d) {
+                                            for (k, v) in crash_analysis_rows(a, d, ru) {
                                                 ui.label(RichText::new(k).color(c::TEXT_SECONDARY));
                                                 ui.add(egui::Label::new(v).wrap());
                                                 ui.end_row();
@@ -8118,7 +8712,11 @@ impl WinStateDiagApp {
                                         );
                                         ui.add(
                                             egui::Label::new(
-                                                RichText::new(&m.raw).monospace().size(11.5),
+                                                RichText::new(crash_dump::without_debugger_noise(
+                                                    &m.raw,
+                                                ))
+                                                .monospace()
+                                                .size(11.5),
                                             )
                                             .wrap(),
                                         );
@@ -8179,7 +8777,7 @@ impl WinStateDiagApp {
                                 ui.label(RichText::new(d.crash_incident_none).color(c::TEXT_MUTED));
                             }
                             for (inc, v) in &verdicts {
-                                ui.label(RichText::new(v.headline()).strong().color(
+                                ui.label(RichText::new(v.headline_localized(ru)).strong().color(
                                     if v.hang_confirmed || v.bsod_registered {
                                         c::YELLOW_WARNING
                                     } else {
@@ -8338,13 +8936,13 @@ impl WinStateDiagApp {
                 o.push_str(&format!(
                     "{} · {}\r\n",
                     crash_dump::incident_line(&inc),
-                    v.headline()
+                    v.headline_localized(ru)
                 ));
             }
         }
         for a in &self.crash.analyses {
             o.push_str("\r\n------------------------------------------------------------\r\n");
-            for (k, v) in crash_analysis_rows(a, d) {
+            for (k, v) in crash_analysis_rows(a, d, ru) {
                 o.push_str(&format!("{k}: {v}\r\n"));
             }
             if !a.parsed.stack_text.is_empty() {
@@ -8354,7 +8952,13 @@ impl WinStateDiagApp {
                 }
             }
             if let Some(m) = &a.module_info {
-                o.push_str(&format!("lmvm {}:\r\n{}\r\n", m.module, m.raw));
+                // v1.1: debugger service noise stays in the raw evidence
+                // only (the RAW section below keeps every original line).
+                o.push_str(&format!(
+                    "lmvm {}:\r\n{}\r\n",
+                    m.module,
+                    crash_dump::without_debugger_noise(&m.raw)
+                ));
             }
             if let Some(r) = &a.resolution {
                 for l in crash_dump::resolution_lines(r, ru) {
@@ -9151,7 +9755,11 @@ fn disk_details_text(title: &str, sections: &[(String, Vec<(String, String)>)]) 
 }
 
 /// v1.0 key facts of one analyzed dump (Details grid and text export).
-fn crash_analysis_rows(a: &crash_dump::DumpAnalysis, d: &i18n::Dict) -> Vec<(String, String)> {
+fn crash_analysis_rows(
+    a: &crash_dump::DumpAnalysis,
+    d: &i18n::Dict,
+    ru: bool,
+) -> Vec<(String, String)> {
     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
     let mut rows = vec![
         (
@@ -9171,16 +9779,13 @@ fn crash_analysis_rows(a: &crash_dump::DumpAnalysis, d: &i18n::Dict) -> Vec<(Str
         ("FAILURE_BUCKET_ID".into(), opt(&a.parsed.failure_bucket_id)),
         ("MODULE_NAME".into(), opt(&a.parsed.module_name)),
         ("IMAGE_NAME".into(), opt(&a.parsed.image_name)),
-        ("PROCESS_NAME".into(), opt(&a.parsed.process_name)),
+        ("PROCESS_NAME".into(), process_name_text(a, ru)),
         (
             d.crash_row_module.to_string(),
             a.probable_module()
                 .unwrap_or_else(|| d.crash_not_determined.into()),
         ),
-        (
-            d.crash_row_confidence.to_string(),
-            a.confidence.code().to_string(),
-        ),
+        (d.crash_row_confidence.to_string(), a.confidence.label(ru)),
         (
             "Symbols".into(),
             a.parsed.symbol_status().code().to_string(),
@@ -9217,6 +9822,23 @@ fn crash_analysis_rows(a: &crash_dump::DumpAnalysis, d: &i18n::Dict) -> Vec<(Str
         ));
     }
     rows
+}
+
+/// v1.1: PROCESS_NAME as the dump states it; a name WinDbg itself cut to
+/// 14 characters is marked as such (the parser never shortens it).
+fn process_name_text(a: &crash_dump::DumpAnalysis, ru: bool) -> String {
+    match &a.parsed.process_name {
+        None => "—".into(),
+        Some(n) if a.parsed.process_name_truncated => format!(
+            "{n} ({})",
+            if ru {
+                "имя сокращено WinDbg до 14 символов"
+            } else {
+                "name shortened by WinDbg to 14 characters"
+            }
+        ),
+        Some(n) => n.clone(),
+    }
 }
 
 /// UI label of a canonical sensor role (identity stays in `Role`).
@@ -9301,7 +9923,30 @@ fn gpo_text(i: &gpo_admx::GpoInputs, r: &gpo_admx::GpoResult) -> Vec<u8> {
     out
 }
 
+impl WinStateDiagApp {
+    /// v1.1: the application closes — every background check is cancelled
+    /// (its process tree ends) and a running diagnostic is stopped. Nothing
+    /// is started any more and nothing new is written.
+    pub(crate) fn shutdown(&mut self, flag: &std::sync::atomic::AtomicBool) {
+        engine::request_shutdown(flag);
+        if let Some(cancel) = &self.driver_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if let Some(cancel) = &self.session_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        self.crash_analyze_after_scan = false;
+        self.crash.rescan_for_session = false;
+        self.crash.rescan_package = None;
+        self.crypto_recheck_for_session = false;
+    }
+}
+
 impl eframe::App for WinStateDiagApp {
+    fn on_exit(&mut self) {
+        self.shutdown(&engine::SHUTDOWN);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let viewports = ctx.input(|i| i.raw.viewports.len());
         self.window_icons.update(viewports);
@@ -9325,7 +9970,6 @@ impl eframe::App for WinStateDiagApp {
         }
         if self.is_running()
             || self.crypto_rx.is_some()
-            || self.crypto_inventory_rx.is_some()
             || matches!(self.hardware, HardwareViewState::Collecting { .. })
             || self.benchmark_is_running()
             || self.nvme_rx.is_some()
@@ -9420,6 +10064,8 @@ impl eframe::App for WinStateDiagApp {
         }
         self.raw_passes_window(&ctx);
         self.drivers_window(&ctx);
+        self.crypto_details_window(&ctx);
+        self.passport2_window(&ctx);
         self.journal_window(&ctx);
         self.expc_details_window(&ctx);
         self.stage_details_window(&ctx);
@@ -10796,12 +11442,17 @@ mod session_package_tests {
             app.crypto = Some(state);
             app.crypto_rx = None;
             assert_eq!(app.build_vm(0.0, 0.0).crypto, vm);
+            // v1.1: the request only opens the warning; nothing runs yet.
             app.apply(Action::CryptoRehashRequest);
+            assert!(app.crypto_rx.is_none(), "{vm:?}: no ReHash on request");
+            assert_eq!(app.crypto_rehash_confirm, starts_rehash);
+            app.apply(Action::CryptoRehashConfirmed);
             assert_eq!(
                 app.crypto_rx.is_some(),
                 starts_rehash,
-                "{vm:?}: ReHash must start only from NO HASH"
+                "{vm:?}: ReHash must start only from NO HASH, after confirmation"
             );
+            assert!(!app.crypto_rehash_confirm);
             // Drain so the next iteration starts clean.
             app.crypto_rx = None;
         }
@@ -13377,6 +14028,13 @@ mod storage_correlation_tests {
 
 #[path = "app_qa_scenes.rs"]
 mod qa_scenes;
+
+#[path = "app_v11.rs"]
+mod v11;
+
+#[cfg(test)]
+#[path = "app_v11_tests.rs"]
+mod v11_tests;
 
 #[cfg(test)]
 #[path = "app_v10_tests.rs"]
