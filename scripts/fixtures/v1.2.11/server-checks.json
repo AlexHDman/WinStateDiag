@@ -1,0 +1,40 @@
+{
+  "CASE-A": {
+    "Checks": [
+      {
+        "Check": "SFC",
+        "Status": "ATTENTION",
+        "Detail": "SFC /verifyonly обнаружил признаки нарушения целостности."
+      },
+      {
+        "Check": "DISM",
+        "Status": "ATTENTION",
+        "Detail": "Хранилище компонентов повреждено, но подлежит восстановлению."
+      },
+      {
+        "Check": "CHKDSK",
+        "Status": "OK",
+        "Detail": "Windows проверила файловую систему и не обнаружила проблем."
+      }
+    ]
+  },
+  "CASE-B": {
+    "Checks": [
+      {
+        "Check": "SFC",
+        "Status": "ATTENTION",
+        "Detail": "SFC /verifyonly обнаружил признаки нарушения целостности."
+      },
+      {
+        "Check": "DISM",
+        "Status": "OK",
+        "Detail": "Повреждение хранилища компонентов не обнаружено."
+      },
+      {
+        "Check": "CHKDSK",
+        "Status": "OK",
+        "Detail": "Windows проверила файловую систему и не обнаружила проблем."
+      }
+    ]
+  }
+}
