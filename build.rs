@@ -8,10 +8,10 @@ const APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="y
   <assemblyIdentity
     version="1.2.0.0"
     processorArchitecture="*"
-    name="WinStateDiag"
+    name="WinDiag"
     type="win32"
   />
-  <description>WinStateDiag - Windows State Diagnostics</description>
+  <description>EXPC WinDiag - Windows Diagnostics</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -190,6 +190,10 @@ fn main() {
     // VERSIONINFO numbers stay the full 1.0.0.0 from Cargo.
     res.set("FileVersion", &display);
     res.set("ProductVersion", &display);
+    res.set("ProductName", "EXPC WinDiag");
+    res.set("FileDescription", "EXPC WinDiag");
+    res.set("InternalName", "WinDiag");
+    res.set("OriginalFilename", "WinDiag.exe");
     if let Err(e) = res.compile() {
         // Do not hard-fail cargo check on non-Windows-resource-capable hosts
         // (e.g. cross-compilation sanity checks); a real Windows release

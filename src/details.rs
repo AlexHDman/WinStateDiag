@@ -20,7 +20,7 @@ use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 /// `WinStateDiag_<kind>_YYYY-MM-DD_HH-MM-SS.txt`
 pub fn export_file_name(kind: &str, t: LocalTime) -> String {
     format!(
-        "WinStateDiag_{kind}_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.txt",
+        "WinDiag_{kind}_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.txt",
         t.year, t.month, t.day, t.hour, t.minute, t.second
     )
 }
@@ -81,6 +81,7 @@ pub fn driver_issues_text(r: &AuditReport, d: &Dict, label: &dyn Fn(&str) -> Str
     let s = driver_summary(r);
     let mut o = String::new();
     push_line(&mut o, d.driver_export_title);
+    push_line(&mut o, &r.scope_summary());
     push_line(
         &mut o,
         &format!(
@@ -302,12 +303,16 @@ pub fn step_of_key(key: &str) -> Option<usize> {
         "storage" => 2,
         "pnp devices" => 3,
         "system event log" | "smart card / ccid" => 4,
-        "vss shadow storage" => 5,
+        "vss shadow storage"
+        | "vss services/providers"
+        | "vss snapshot creation"
+        | "vss coverage"
+        | "vss collection" => 5,
         "whea" => 6,
         "stability / bsod" => 7,
         "applications" => 8,
         "memory diagnostic" => 9,
-        "defender" => 10,
+        "defender" | "defender threats" | "defender coverage" | "defender collection" => 10,
         "sfc" => 11,
         "dism" => 12,
         "chkdsk" => 13,
@@ -380,6 +385,14 @@ pub fn build_stage_details(
                             .map(|c| state_of_status(&c.status))
                             .min_by_key(|s| s.rank())
                             .unwrap_or(StageState::Unknown);
+                        // A successful subcheck cannot conceal missing coverage in the same stage.
+                        if !matches!(d.state, StageState::Problem | StageState::Attention)
+                            && mine
+                                .iter()
+                                .any(|c| state_of_status(&c.status) == StageState::Unknown)
+                        {
+                            d.state = StageState::Unknown;
+                        }
                         for c in &mine {
                             if c.detail.is_empty() {
                                 continue;
@@ -504,7 +517,7 @@ pub fn explain(detail: &StageDetail, d: &Dict, system_drive: &str) -> StageExpla
 pub fn expc_details_text(details: &[StageDetail], d: &Dict, system_drive: &str) -> String {
     let n = expc_counts(details);
     let mut o = String::new();
-    push_line(&mut o, &format!("WinStateDiag — {}", d.expc_details_title));
+    push_line(&mut o, &format!("WinDiag — {}", d.expc_details_title));
     push_line(
         &mut o,
         &format!("{}: {}", d.expc_details_summary, expc_summary_line(&n, d)),
@@ -790,11 +803,11 @@ pub(crate) mod tests {
         };
         assert_eq!(
             export_file_name("DriverIssues", t),
-            "WinStateDiag_DriverIssues_2026-09-30_07-05-09.txt"
+            "WinDiag_DriverIssues_2026-09-30_07-05-09.txt"
         );
         assert_eq!(
             export_file_name("EXPC_Results", t),
-            "WinStateDiag_EXPC_Results_2026-09-30_07-05-09.txt"
+            "WinDiag_EXPC_Results_2026-09-30_07-05-09.txt"
         );
     }
 
@@ -868,6 +881,62 @@ pub(crate) mod tests {
         let det = build_stage_details(&all_done(), true, &[], &deep);
         assert_eq!(det[10].state, StageState::Unknown);
         assert_eq!(det[11].state, StageState::Skipped);
+    }
+
+    #[test]
+    fn v1213_subchecks_reach_gui_and_keep_threats_and_coverage_visible() {
+        let checks = vec![
+            chk("Defender", "OK", "protection enabled"),
+            chk(
+                "Defender threats",
+                "ATTENTION",
+                "active with successful action",
+            ),
+            chk("Defender coverage", "UNKNOWN", "conflicting evidence"),
+            chk("VSS Shadow Storage", "INFO", "detection context"),
+            chk("VSS collection", "ERROR", "query failed"),
+        ];
+        let det = build_stage_details(&all_done(), true, &checks, &[]);
+        assert_eq!(det[9].state, StageState::Attention);
+        assert!(
+            det[9]
+                .findings
+                .iter()
+                .any(|s| s.contains("conflicting evidence"))
+        );
+        assert_eq!(det[4].state, StageState::Problem);
+        let limited = build_stage_details(
+            &all_done(),
+            true,
+            &[
+                chk("Defender", "OK", "protection enabled"),
+                chk("Defender threats", "UNKNOWN", "unavailable"),
+            ],
+            &[],
+        );
+        assert_eq!(limited[9].state, StageState::Unknown);
+        let state = crate::diag_state::aggregate("OK", &checks);
+        assert!(state.code.starts_with("ATTENTION"));
+        assert!(state.reasons.iter().any(|s| s.contains("Defender threats")));
+    }
+
+    #[test]
+    fn v1214_sfc_damage_survives_clean_dism_and_a5_context_is_not_healthy() {
+        let checks = vec![
+            chk("SFC", "ATTENTION", "integrity violations"),
+            chk("DISM", "OK", "clean store"),
+        ];
+        let state = crate::diag_state::aggregate("OK", &checks);
+        assert!(state.code.starts_with("ATTENTION"));
+        let mut r = report();
+        r.items.truncate(1);
+        r.items[0].status = Severity::Ok;
+        r.items[0].pnp_error_code = Some(45);
+        assert_eq!(r.items[0].status_code(), "NOT_PRESENT");
+        assert_eq!(r.count(Severity::Ok), 0);
+        assert!(r.scope_summary().contains("NOT TESTED"));
+        assert!(crate::driver_audit::to_json(&r).contains("scope_summary"));
+        assert!(crate::driver_audit::to_text(&r).contains("Code Integrity:"));
     }
 
     #[test]
@@ -958,7 +1027,7 @@ pub(crate) mod tests {
         let det = build_stage_details(&all_done(), true, &checks, &deep);
         for d in [&RU, &EN] {
             let t = expc_details_text(&det, d, "C:");
-            assert!(t.starts_with(&format!("WinStateDiag — {}", d.expc_details_title)));
+            assert!(t.starts_with(&format!("WinDiag — {}", d.expc_details_title)));
             assert!(t.contains(&format!("{}: 1", d.expc_sum_attention)));
             assert!(t.contains(&format!(
                 "[{}] 12 — {}",

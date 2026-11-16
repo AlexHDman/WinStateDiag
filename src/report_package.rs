@@ -54,7 +54,7 @@ fn rc4_zip_contract() {
     );
     for (client, pc, expected) in [
         ("ExampleClient", "MSI", "ExampleClient-MSI-20.10.26-08.30"),
-        ("ExampleOrg", "SERVER", "ExampleOrg-SERVER-20.10.26-08.30"),
+        ("DEMO", "SERVER", "DEMO-SERVER-20.10.26-08.30"),
         (" ", "MSI", "MSI-20.10.26-08.30"),
         ("Клиент", "ПК", "Клиент-ПК-20.10.26-08.30"),
     ] {
@@ -65,7 +65,21 @@ fn rc4_zip_contract() {
     }
 }
 
+fn flatten_repair_history(name: &str) -> String {
+    name.replace('%', "%25")
+        .replace('_', "%5F")
+        .replace('/', "__")
+}
 fn archive_name(name: &str) -> String {
+    if name.starts_with("RepairHistory__") {
+        return name
+            .replace("__", "/")
+            .replace("%5F", "_")
+            .replace("%25", "%");
+    }
+    if name.starts_with("Repair__") {
+        return name.replace("__", "/");
+    }
     if let Some(parts) = servicing_parts(name) {
         return parts.join("/");
     }
@@ -371,6 +385,7 @@ pub struct SessionPackage {
     /// nor bound to a session: joins it when the first module creates it.
     pending: Vec<EvidenceFile>,
     zip_ready: bool,
+    last_error: Option<String>,
     /// Desktop orchestration publishes only after all workers are idle.
     deferred: bool,
     startup_offset: usize,
@@ -402,6 +417,7 @@ impl SessionPackage {
             completed: BTreeSet::new(),
             pending: Vec::new(),
             zip_ready: false,
+            last_error: None,
             deferred: false,
             startup_offset: 0,
             template,
@@ -627,8 +643,11 @@ impl SessionPackage {
     /// Final verified ZIP of this session, if the last update succeeded.
     pub fn final_zip(&self) -> Option<PathBuf> {
         let id = self.identity.as_ref()?;
-        (self.zip_ready && !(self.deferred && self.needs_finalize) && id.zip_path.is_file())
-            .then(|| id.zip_path.clone())
+        (self.last_error.is_none()
+            && self.zip_ready
+            && !(self.deferred && self.needs_finalize)
+            && id.zip_path.is_file())
+        .then(|| id.zip_path.clone())
     }
 
     pub fn pending_publication(&self, path: &Path) -> bool {
@@ -682,14 +701,38 @@ impl SessionPackage {
         date: &str,
         files: Vec<EvidenceFile>,
     ) -> Result<(PathBuf, Vec<String>), String> {
+        let result = self.contribute_named_inner(client, computer, date, files);
+        if let Err(e) = &result {
+            self.record_packaging_failure(e);
+        }
+        result
+    }
+    fn contribute_named_inner(
+        &mut self,
+        client: &str,
+        computer: &str,
+        date: &str,
+        files: Vec<EvidenceFile>,
+    ) -> Result<(PathBuf, Vec<String>), String> {
+        let files = files
+            .into_iter()
+            .map(|mut file| {
+                if !safe_archive_name(&file.name) {
+                    return Err("Invalid evidence path; source preserved".to_string());
+                }
+                if file.name.starts_with("RepairHistory/") {
+                    file.name = flatten_repair_history(&file.name);
+                } else if file.name.starts_with("Repair/") && !file.name.contains("__") {
+                    file.name = file.name.replace('/', "__");
+                } else if file.name.contains('/') {
+                    return Err("Unsupported nested evidence path; source preserved".into());
+                }
+                Ok(file)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let wanted: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
-        let id = match self.resolve(client, computer, date) {
-            Ok(id) => id,
-            Err(error) => {
-                self.pending.extend(files);
-                return Err(error);
-            }
-        };
+        self.pending.extend(files);
+        let id = self.resolve(client, computer, date)?;
         self.verify_owner(&id)?;
         let evidence_dir = id.evidence_dir();
         fs::create_dir_all(&evidence_dir).map_err(|e| {
@@ -698,8 +741,8 @@ impl SessionPackage {
                 id.report_dir.display()
             )
         })?;
-        let mut all = std::mem::take(&mut self.pending);
-        all.extend(files);
+        let all = std::mem::take(&mut self.pending);
+
         // Earlier evidence that lives only in the (cleaned) ZIP comes back
         // first; if the ZIP cannot be read, the new evidence is still kept
         // as loose files and the existing ZIP is left untouched.
@@ -784,15 +827,115 @@ impl SessionPackage {
     /// finalized. Unverified/new loose evidence is an error, never a silent
     /// success. Errors never remove anything further.
     pub fn finalize(&mut self) -> Result<Vec<String>, String> {
+        let result = self.finalize_with_receipt();
+        if let Err(e) = &result {
+            self.record_packaging_failure(e);
+        }
+        result
+    }
+
+    pub fn record_packaging_failure(&mut self, error: &str) {
+        self.last_error = Some(error.into());
+        let directory = logs_dir(&self.reports_root).join("Packaging");
+        if fs::create_dir_all(&directory).is_ok() {
+            let session = self
+                .session
+                .as_ref()
+                .map(|s| s.session_id.as_str())
+                .unwrap_or("unbound");
+            let _ = fs::write(
+                directory.join(format!("{}-{}.txt", session, crate::repair::operation_id())),
+                format!("packaging_status=ERROR\nsession={session}\n{error}\n"),
+            );
+        }
+    }
+
+    fn finalize_with_receipt(&mut self) -> Result<Vec<String>, String> {
         // One attempt per verified rebuild: after any outcome (also an
         // error) the next attempt waits for the next successful update, so
         // a problem is reported once and never retried every frame.
         let result = self.finalize_once();
         self.needs_finalize = false;
+        self.last_error = result.as_ref().err().cloned();
+        if let Some(error) = &self.last_error {
+            let directory = logs_dir(&self.reports_root).join("Packaging");
+            let _ = fs::create_dir_all(&directory);
+            let session = self
+                .session
+                .as_ref()
+                .map(|s| s.session_id.as_str())
+                .unwrap_or("unbound");
+            let body =
+                format!("stage=finalize\npackaging_status=ERROR\nsession={session}\n{error}\n");
+            let _ = fs::write(
+                directory.join(format!("{session}-{}.txt", crate::repair::operation_id())),
+                body,
+            );
+        }
+        if result.is_ok()
+            && let Some(path) = self.final_zip()
+        {
+            let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+            let entries = parse_zip(&bytes)?;
+            let directory = logs_dir(&self.reports_root).join("ZipVerification");
+            fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+            let name = format!(
+                "{}-{:08x}.txt",
+                path.file_stem().unwrap_or_default().to_string_lossy(),
+                crc32(&bytes)
+            );
+            let text = format!(
+                "WinDiag {}\nVerifiedAt={}\nZIP={}\nBytes={}\nArchiveCRC32={:08X}\nEntries={}\nPackagingStatus=PUBLISHED_VERIFIED\nCRC_ALL_ENTRIES=PASS\nCOMPLETENESS=PASS\nScope=archive inventory only; diagnostic execution and coverage are independent\nAtomic publication completed. This receipt is external and was written after verification; it is not embedded in the verified ZIP.\n",
+                crate::APP_VERSION,
+                crate::repair::timestamp(),
+                path.display(),
+                bytes.len(),
+                crc32(&bytes),
+                entries.len()
+            );
+            let receipt = directory.join(name);
+            if !receipt.exists() {
+                write_new_file(&receipt, text.as_bytes())?;
+            }
+        }
         result
     }
 
+    pub fn packaging_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+    pub fn retry_export(&mut self) -> Result<Vec<String>, String> {
+        // Explicit retry only, at idle. Original loose/runtime files survive failure.
+        if self.zip_ready
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(|id| !id.report_dir.exists())
+        {
+            return self.finalize(); // Publication succeeded; retry the external receipt.
+        }
+        if !self.pending.is_empty() {
+            self.contribute(
+                "",
+                "",
+                &identity_date(crate::ui::sysinfo::local_time()),
+                Vec::new(),
+            )?;
+        } else {
+            if let Some(id) = &self.identity {
+                restore_loose(id)?;
+            }
+            self.rebuild()?;
+        }
+        self.finalize()
+    }
+
     fn finalize_once(&mut self) -> Result<Vec<String>, String> {
+        if !self.pending.is_empty() {
+            return Err(
+                "stage=finalize: unpersisted pending evidence; retry export required".into(),
+            );
+        }
         let id = self.identity.clone().ok_or("Отчёт сессии ещё не создан.")?;
         self.verify_owner(&id)?;
         if self.deferred && self.needs_finalize {
@@ -813,6 +956,7 @@ impl SessionPackage {
             }
             let candidate = id.report_dir.join(".session-ready.zip");
             let entries = read_zip(&candidate)?;
+            validate_manifest_inventory(&entries)?;
             if self.session.as_ref().map(|s| s.session_id.as_str())
                 != zip_session_id(&candidate).as_deref()
             {
@@ -820,7 +964,7 @@ impl SessionPackage {
                     "ERROR: candidate session identity mismatch; workspace preserved".into(),
                 );
             }
-            for path in list_files(&id.report_dir) {
+            for path in list_files_checked(&id.report_dir)? {
                 let mut evidence = EvidenceFile::read(&path)?;
                 evidence.name = archive_name(&evidence.name);
                 if !entries.contains(&evidence) {
@@ -852,9 +996,20 @@ impl SessionPackage {
                 "В итоговом ZIP нет корректного manifest.json — файлы отчёта сохранены.".into(),
             );
         }
+        validate_manifest_inventory(&packaged)?;
         // 2. Every loose file must be packaged byte for byte; anything newer
         //    (not yet in the ZIP) means this is not a final state.
-        let loose = list_files(&id.report_dir);
+        let loose = match fs::metadata(&id.report_dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(), // Verified published archive, already cleaned.
+            Err(e) => {
+                return Err(format!(
+                    "stage=enumerate path={} os_code={:?}: {e}",
+                    id.report_dir.display(),
+                    e.raw_os_error()
+                ));
+            }
+            Ok(_) => list_files_checked(&id.report_dir)?,
+        };
         for path in &loose {
             let mut file = EvidenceFile::read(path)?;
             file.name = archive_name(&file.name);
@@ -875,6 +1030,13 @@ impl SessionPackage {
                 &crate::ssd_history::parse_history(&text),
             )
             .map_err(|e| format!("История SSD не сохранена ({e}) — файлы отчёта сохранены."))?;
+        }
+        if self
+            .execution_override
+            .as_deref()
+            .is_some_and(|s| matches!(s, "ERROR" | "CANCELLED"))
+        {
+            return Ok(Vec::new()); // Emergency package keeps original working evidence as well.
         }
         // 4. Remove exactly those loose files (the ZIP is never touched).
         let mut removed = Vec::new();
@@ -963,6 +1125,13 @@ impl SessionPackage {
     /// Rebuilds the ZIP from all persisted evidence. On any failure the
     /// previous final ZIP stays exactly as it was.
     pub fn rebuild(&mut self) -> Result<PathBuf, String> {
+        let result = self.rebuild_inner();
+        if let Err(e) = &result {
+            self.record_packaging_failure(e);
+        }
+        result
+    }
+    fn rebuild_inner(&mut self) -> Result<PathBuf, String> {
         self.needs_finalize = false;
         let id = self.identity.clone().ok_or("Отчёт сессии ещё не создан.")?;
         self.verify_owner(&id)?;
@@ -980,12 +1149,16 @@ impl SessionPackage {
         }
         let mut entries: Vec<EvidenceFile> = Vec::new();
         let mut names: BTreeSet<String> = BTreeSet::new();
-        for path in list_files(&id.evidence_dir()) {
+        for path in list_files_checked(&id.evidence_dir())? {
             let file = EvidenceFile::read(&path)?;
             // The manifest is generated, never taken from the folder.
             if matches!(
                 file.name.as_str(),
-                crate::manifest::MANIFEST_FILE | "State_Summary.json" | "State_Summary.txt"
+                crate::manifest::MANIFEST_FILE
+                    | "State_Summary.json"
+                    | "State_Summary.txt"
+                    | "EXPC_User_Report_V3.json"
+                    | "EXPC_User_Report_V3.txt"
             ) {
                 continue;
             }
@@ -1008,16 +1181,21 @@ impl SessionPackage {
             let execution = self.execution_override.as_deref().unwrap_or_else(|| {
                 crate::diag_state::execution_status(system, hardware, &self.state_reasons)
             });
-            let coverage = crate::diag_state::coverage_status(
-                if matches!(execution, "ERROR" | "CANCELLED") {
-                    execution
-                } else {
-                    system
-                },
-                hardware,
-                &self.state_reasons,
-            );
+            let coverage = if entries.iter().any(|e| e.name == "Session_Execution.json") {
+                "LIMITED"
+            } else {
+                crate::diag_state::coverage_status(
+                    if matches!(execution, "ERROR" | "CANCELLED") {
+                        execution
+                    } else {
+                        system
+                    },
+                    hardware,
+                    &self.state_reasons,
+                )
+            };
             let findings = crate::diag_state::findings_status(system, hardware);
+            let repair = crate::diag_state::repair_status(&self.state_reasons);
             let reasons_json = self
                 .state_reasons
                 .iter()
@@ -1027,7 +1205,7 @@ impl SessionPackage {
             entries.push(EvidenceFile::new(
                 "State_Summary.json",
                 format!(
-                    "{{\"system\":{},\"hardware\":{},\"execution_status\":\"{execution}\",\"coverage_status\":\"{coverage}\",\"findings_status\":\"{findings}\",\"producer_version\":\"{}\",\"reason\":{},\"reasons\":[{reasons_json}]}}\n",
+                    "{{\"system\":{},\"hardware\":{},\"execution_status\":\"{execution}\",\"coverage_status\":\"{coverage}\",\"findings_status\":\"{findings}\",\"repair_status\":\"{repair}\",\"packaging_status\":\"CONTENT_VERIFIED\",\"producer_version\":\"{}\",\"reason\":{},\"reasons\":[{reasons_json}]}}\n",
                     crate::deep_checks::json::string(system),
                     crate::deep_checks::json::string(hardware),
                     crate::APP_VERSION,
@@ -1037,7 +1215,7 @@ impl SessionPackage {
             ));
             entries.push(EvidenceFile::new(
                 "State_Summary.txt",
-                format!("System: {system}\r\nHardware: {hardware}\r\nExecution: {execution}\r\nCoverage: {coverage}\r\nFindings: {findings}\r\nWinStateDiag: {}\r\n{note}\r\n", crate::APP_VERSION).into_bytes(),
+                format!("System: {system}\r\nHardware: {hardware}\r\nExecution: {execution}\r\nCoverage: {coverage}\r\nFindings: {findings}\r\nRepair: {repair}\r\nPackaging: CONTENT_VERIFIED (publication: external receipt)\r\nWinDiag: {}\r\n{note}\r\n", crate::APP_VERSION).into_bytes(),
             ));
         }
         let (windows_product, windows_build) = crate::ui::sysinfo::windows_edition_and_full_build();
@@ -1109,6 +1287,9 @@ impl SessionPackage {
             windows_product,
             windows_build,
         };
+        if let Some(report) = crate::report_v3::build(&ctx, &entries) {
+            entries.extend(report);
+        }
         entries.push(EvidenceFile::new(
             crate::manifest::MANIFEST_FILE,
             crate::manifest::build(&ctx, &entries),
@@ -1237,6 +1418,15 @@ fn restore_loose(id: &PackageIdentity) -> Result<(), String> {
             "History/ssd_benchmark_history.log"
             | "WinStateDiagStorageHistory.json"
             | "StorageHistory_Export.json" => continue,
+            _ if e.name.starts_with("RepairHistory/") && safe_archive_name(&e.name) => {
+                flatten_repair_history(&e.name)
+            }
+            _ if e.name.starts_with("Repair/")
+                && !e.name.contains("__")
+                && safe_archive_name(&e.name) =>
+            {
+                e.name.replace('/', "__")
+            }
             _ if e.name.contains('/') => {
                 return Err("Unexpected nested archive evidence; preserved".into());
             }
@@ -1244,7 +1434,11 @@ fn restore_loose(id: &PackageIdentity) -> Result<(), String> {
         };
         if matches!(
             e.name.as_str(),
-            crate::manifest::MANIFEST_FILE | "State_Summary.json" | "State_Summary.txt"
+            crate::manifest::MANIFEST_FILE
+                | "State_Summary.json"
+                | "State_Summary.txt"
+                | "EXPC_User_Report_V3.json"
+                | "EXPC_User_Report_V3.txt"
         ) {
             continue;
         }
@@ -1302,21 +1496,31 @@ fn split_name(name: &str) -> (&str, &str) {
 
 /// The report folder's artifacts: regular, non-hidden files except ZIPs
 /// (the package itself), sorted by name. This is exactly what the ZIP holds.
+#[cfg(test)]
 pub fn list_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().to_lowercase();
-                    !n.starts_with('.') && !n.ends_with(".zip")
-                })
-                .map(|e| e.path())
-                .collect()
-        })
-        .unwrap_or_default();
+    list_files_checked(dir).unwrap_or_default()
+}
+fn list_files_checked(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let error = |e: std::io::Error| {
+        format!(
+            "stage=enumerate path={} os_code={:?}: {e}",
+            dir.display(),
+            e.raw_os_error()
+        )
+    };
+    let mut files = Vec::new();
+    for item in fs::read_dir(dir).map_err(error)? {
+        let item = item.map_err(error)?;
+        let name = item.file_name().to_string_lossy().to_lowercase();
+        if item.file_type().map_err(error)?.is_file()
+            && !name.starts_with('.')
+            && !name.ends_with(".zip")
+        {
+            files.push(item.path());
+        }
+    }
     files.sort();
-    files
+    Ok(files)
 }
 
 // ---------------------------------------------------------------------
@@ -1330,11 +1534,10 @@ fn publish_archive(source: &Path, target: &Path, replace: bool) -> std::io::Resu
     // AppData and the portable Reports folder may be on different volumes.
     // Copy into an exclusively-created, non-final destination, flush and verify
     // it before the same-volume atomic rename. A failure never exposes a ZIP.
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pending = target.with_file_name(format!(".wsd-{}-{stamp}.partial", std::process::id()));
+    // Parallel publishers can share the same wall-clock tick. The existing
+    // operation ID includes an atomic counter and prevents staging collisions.
+    let ticket = crate::repair::operation_id();
+    let pending = target.with_file_name(format!(".wsd-{ticket}.partial"));
     let mut out = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1358,7 +1561,7 @@ fn publish_archive(source: &Path, target: &Path, replace: bool) -> std::io::Resu
 }
 
 #[cfg(windows)]
-fn rename_archive(source: &Path, target: &Path, replace: bool) -> std::io::Result<()> {
+pub(crate) fn rename_archive(source: &Path, target: &Path, replace: bool) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     // canonicalize supplies extended-length Windows paths, including Unicode.
     let source = fs::canonicalize(source)?;
@@ -1390,7 +1593,7 @@ fn rename_archive(source: &Path, target: &Path, replace: bool) -> std::io::Resul
 }
 
 #[cfg(not(windows))]
-fn rename_archive(source: &Path, target: &Path, replace: bool) -> std::io::Result<()> {
+pub(crate) fn rename_archive(source: &Path, target: &Path, replace: bool) -> std::io::Result<()> {
     if replace {
         fs::rename(source, target)
     } else {
@@ -1670,6 +1873,38 @@ pub fn parse_zip(data: &[u8]) -> Result<Vec<EvidenceFile>, String> {
     Ok(out)
 }
 
+/// Manifest references must resolve inside this exact CRC-verified archive.
+fn validate_manifest_inventory(entries: &[EvidenceFile]) -> Result<(), String> {
+    use crate::deep_checks::json;
+    let manifest = entries
+        .iter()
+        .find(|e| e.name == "manifest.json")
+        .ok_or("stage=verify: missing manifest")?;
+    let value = json::parse(&String::from_utf8_lossy(&manifest.bytes))
+        .ok_or("stage=verify: invalid manifest")?;
+    let names: BTreeSet<_> = entries.iter().map(|e| e.name.as_str()).collect();
+    if names.len() != entries.len() {
+        return Err("stage=verify: duplicate archive names".into());
+    }
+    if let Some(json::Value::Arr(modules)) = value.get("modules") {
+        for module in modules {
+            for field in ["evidence", "latest_evidence"] {
+                if let Some(json::Value::Arr(files)) = module.get(field) {
+                    for file in files {
+                        let name = file
+                            .as_str()
+                            .ok_or("stage=verify: invalid evidence reference")?;
+                        if !names.contains(name) {
+                            return Err(format!("stage=verify: manifest evidence missing: {name}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The candidate must contain exactly `expected`, byte for byte.
 pub fn validate_zip(path: &Path, expected: &[EvidenceFile]) -> Result<(), String> {
     let got = read_zip(path)?;
@@ -1924,7 +2159,7 @@ mod tests {
 
     #[test]
     fn rc2_session_client_and_owned_workspace_cleanup() {
-        for (client, computer) in [("ExampleClient", "MSI"), ("ExampleOrg", "SERVER")] {
+        for (client, computer) in [("ExampleClient", "MSI"), ("DEMO", "SERVER")] {
             let exe = scratch(&format!("rc2-cleanup-{computer}"));
             let root = exe.join("Reports");
             fs::create_dir_all(&root).unwrap();
@@ -1972,7 +2207,7 @@ mod tests {
     fn rc2_unexpected_workspace_data_is_preserved() {
         let exe = scratch("rc2-unknown-workspace");
         let mut p = SessionPackage::for_exe_dir(&exe);
-        p.bind_session(SessionIdentity::new("owned", "ExampleOrg", "SERVER"));
+        p.bind_session(SessionIdentity::new("owned", "DEMO", "SERVER"));
         let zip = p.contribute("", "", "20-10-26", hw()).unwrap();
         let workspace = p.identity().unwrap().report_dir.clone();
         fs::write(workspace.join(".unexpected"), b"recover-me").unwrap();
@@ -2036,11 +2271,7 @@ mod tests {
         fs::write(storage_history_path(&reports), b"[]").unwrap();
         for seq in 0..2 {
             let mut p = SessionPackage::for_exe_dir(&exe);
-            p.bind_session(SessionIdentity::new(
-                &format!("s{seq}"),
-                "ExampleOrg",
-                "SERVER",
-            ));
+            p.bind_session(SessionIdentity::new(&format!("s{seq}"), "DEMO", "SERVER"));
             p.archive_time = "08-36-00".into();
             let zip = p.contribute("", "", "20-10-26", hw()).unwrap();
             p.finalize().unwrap();
@@ -2066,16 +2297,8 @@ mod tests {
                 .iter()
                 .all(|e| e.path().extension().is_some_and(|ext| ext == "zip"))
         );
-        assert!(
-            reports
-                .join("ExampleOrg-SERVER-20.10.26-08.36.zip")
-                .exists()
-        );
-        assert!(
-            reports
-                .join("ExampleOrg-SERVER-20.10.26-08.36 (2).zip")
-                .exists()
-        );
+        assert!(reports.join("DEMO-SERVER-20.10.26-08.36.zip").exists());
+        assert!(reports.join("DEMO-SERVER-20.10.26-08.36 (2).zip").exists());
         fs::remove_dir_all(exe).unwrap();
     }
 
@@ -2228,6 +2451,80 @@ mod tests {
     }
 
     #[test]
+    fn repair_history_nested_evidence_exports_in_main_and_full_session_without_loss() {
+        for full in [false, true] {
+            let root = scratch(if full { "history-full" } else { "history-main" });
+            let history = root.join("history");
+            let op = history.join("synthetic-operation");
+            fs::create_dir_all(op.join("вложенный_каталог")).unwrap();
+            let original = br#"{"computer":"SYNTHETIC-PC","check":"SFC","status":"STARTED"}"#;
+            fs::write(op.join("operation.json"), original).unwrap();
+            let relative = "вложенный_каталог/result__100%.log";
+            fs::write(
+                op.join(relative),
+                "Final verification: CLEAN\nNo actual repair was run",
+            )
+            .unwrap();
+            let files = crate::repair_history::collect(&[history], "SYNTHETIC-PC");
+            let mut package = if full {
+                SessionPackage::for_exe_dir(&root)
+            } else {
+                SessionPackage::new(root.join("Reports"), None)
+            };
+            package.bind_session(SessionIdentity::new(
+                "synthetic-session",
+                "SYNTHETIC",
+                "SYNTHETIC-PC",
+            ));
+            let zip = package.contribute("", "", "16-11-26", files).unwrap();
+            package.finalize().unwrap();
+            assert!(package.packaging_error().is_none());
+            let name = format!("RepairHistory/synthetic-operation/{relative}");
+            let entries = read_zip(&zip).unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.name == name && String::from_utf8_lossy(&e.bytes).contains("CLEAN"))
+            );
+            let before = fs::read(&zip).unwrap();
+            for _ in 0..2 {
+                let export = crate::ai_export::export(
+                    &crate::ai_export::Input::zip(zip.clone()),
+                    &root.join("Reports"),
+                )
+                .unwrap();
+                let text = crate::ai_export::exported_text(export.path);
+                assert!(text.contains("Final verification: CLEAN"));
+                assert_eq!(before, fs::read(&zip).unwrap());
+            }
+            // Late BIOS contribution must restore the history from the already published ZIP.
+            package
+                .contribute(
+                    "",
+                    "",
+                    "16-11-26",
+                    vec![EvidenceFile::new(
+                        "BIOS_Update.txt",
+                        b"CHECK_FAILED: HTTP 403".to_vec(),
+                    )],
+                )
+                .unwrap();
+            package.finalize().unwrap();
+            assert!(read_zip(&zip).unwrap().iter().any(|e| e.name == name));
+            assert_eq!(fs::read(op.join("operation.json")).unwrap(), original);
+            assert!(
+                package
+                    .contribute(
+                        "",
+                        "",
+                        "16-11-26",
+                        vec![EvidenceFile::new("RepairHistory/../../escape.log", vec![])]
+                    )
+                    .is_err()
+            );
+        }
+    }
+    #[test]
     fn deferred_publication_rejects_changed_evidence_and_keeps_workspace() {
         let exe = scratch("deferred-error");
         let mut p = SessionPackage::for_exe_dir(&exe);
@@ -2295,6 +2592,36 @@ mod tests {
         assert_eq!(fs::read(&id.zip_path).unwrap(), b"another publisher");
         assert!(fs::read_dir(&id.report_dir).unwrap().next().is_none());
         let _ = fs::remove_dir_all(exe);
+    }
+
+    #[test]
+    fn parallel_archive_transfer_keeps_every_owners_bytes() {
+        let root = scratch("parallel-transfer");
+        let target = root.join("Reports");
+        fs::create_dir_all(&target).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let mut workers = Vec::new();
+        for i in 0..24 {
+            let source_dir = root.join(format!("source-{i}"));
+            fs::create_dir_all(&source_dir).unwrap();
+            let source = source_dir.join("candidate.zip");
+            let contents = vec![EvidenceFile::new(
+                "owner.txt",
+                format!("owner-{i}").into_bytes(),
+            )];
+            fs::write(&source, build_zip(&contents, now()).unwrap()).unwrap();
+            let dest = target.join(format!("report-{i}.zip"));
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                publish_archive(&source, &dest, false).unwrap();
+                assert_eq!(read_zip(&dest).unwrap(), contents);
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 24);
     }
 
     #[test]
@@ -2400,6 +2727,7 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.contains("os error 5"), "{error}");
         assert_eq!(fs::read(&zip).unwrap(), before);
+
         assert!(
             pkg.identity()
                 .unwrap()
@@ -2488,7 +2816,7 @@ mod tests {
     fn hardware_only_session_creates_the_package() {
         let exe = scratch("a");
         let mut pkg = package(&exe, None);
-        let zip = pkg.contribute("Клиент", "MSI", "24-09-26", hw()).unwrap();
+        let zip = pkg.contribute("Алексей", "MSI", "24-09-26", hw()).unwrap();
         let dir = exe.join("Reports");
         assert_eq!(zip.parent(), Some(dir.as_path()));
         assert!(dir.is_dir() && zip.is_file());
@@ -2829,13 +3157,13 @@ mod tests {
         // Session 1: client A. The live values a caller passes later
         // (a stale or edited input field) are ignored once bound.
         let mut a = package(&exe, None);
-        a.bind_session(SessionIdentity::new("S-1", "  Клиент ", "MSI"));
+        a.bind_session(SessionIdentity::new("S-1", "  Алексей ", "MSI"));
         let zip_a = a.contribute("STALE", "OTHER-PC", "24-09-26", hw()).unwrap();
-        let dir_a = reports.join("Клиент - MSI - 24-09-26");
+        let dir_a = reports.join("Алексей - MSI - 24-09-26");
         assert_eq!(zip_a.parent(), Some(reports.as_path()));
         assert_eq!(
             manifest_session(&zip_a),
-            ("S-1".into(), "Клиент".into(), "MSI".into())
+            ("S-1".into(), "Алексей".into(), "MSI".into())
         );
         assert!(names(&zip_a).contains(&archive_name(STARTUP_LOG_FILE)));
         // The client-less folder is untouched.
@@ -2848,7 +3176,7 @@ mod tests {
         // Session 2: another client on the same PC and date: own folder.
         let mut b = package(&exe, None);
         b.bind_session(SessionIdentity::new("S-2", "Боб", "MSI"));
-        let zip_b = b.contribute("Клиент", "MSI", "24-09-26", hw()).unwrap();
+        let zip_b = b.contribute("Алексей", "MSI", "24-09-26", hw()).unwrap();
         assert_eq!(zip_b.parent(), Some(reports.as_path()));
         assert_eq!(
             manifest_session(&zip_b),
@@ -2873,7 +3201,7 @@ mod tests {
         // the first session's report is left exactly as it was.
         let zip_a_bytes = fs::read(&zip_a).unwrap();
         let mut a2 = package(&exe, None);
-        a2.bind_session(SessionIdentity::new("S-4", "Клиент", "MSI"));
+        a2.bind_session(SessionIdentity::new("S-4", "Алексей", "MSI"));
         let zip_a2 = a2.contribute("", "", "24-09-26", hw()).unwrap();
         assert_eq!(zip_a2.parent(), Some(reports.as_path()));
         assert_eq!(manifest_session(&zip_a2).0, "S-4");
@@ -2921,7 +3249,7 @@ mod tests {
 
         // Unbound (legacy) lookups reuse only exactly their own folder.
         assert_eq!(
-            find_or_new_report_dir(&reports, "Клиент", "MSI", "24-09-26"),
+            find_or_new_report_dir(&reports, "Алексей", "MSI", "24-09-26"),
             dir_a
         );
         assert_eq!(
@@ -3001,7 +3329,7 @@ mod finalize_tests {
         let exe = scratch("only");
         let mut pkg = package(&exe);
         pkg.contribute(
-            "Клиент",
+            "Алексей",
             "MSI",
             "28-09-26",
             vec![f("EXPC_a.txt", "E"), f("EXPC_a.json", "{}")],
@@ -3024,6 +3352,18 @@ mod finalize_tests {
         assert_eq!(loose(&dir), Vec::<String>::new());
         // The ZIP itself is untouched and complete (evidence + manifest).
         assert_eq!(fs::read(&zip).unwrap(), before);
+        let receipts = logs_dir(&pkg.reports_root).join("ZipVerification");
+        let receipt = fs::read_dir(receipts)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            fs::read_to_string(receipt)
+                .unwrap()
+                .contains("CRC_ALL_ENTRIES=PASS")
+        );
         let names = zip_names(&zip);
         for n in [
             "EXPC_a.txt",
@@ -3170,14 +3510,14 @@ mod finalize_tests {
         let exe = scratch("sameday");
         let mut first = package(&exe);
         let zip1 = first
-            .contribute("Клиент", "MSI", "28-09-26", vec![f("EXPC_a.txt", "A")])
+            .contribute("Алексей", "MSI", "28-09-26", vec![f("EXPC_a.txt", "A")])
             .unwrap();
         first.finalize().unwrap();
         let before = fs::read(&zip1).unwrap();
         let mut second = package(&exe);
         let zip2 = second
             .contribute(
-                "Клиент",
+                "Алексей",
                 "MSI",
                 "28-09-26",
                 vec![f("EXPC_a.txt", "B"), f("EXPC_c.txt", "C")],
@@ -3280,7 +3620,7 @@ mod finalize_tests {
         let mut pkg = package(&exe);
         pkg.set_states("OK", "OK");
         let zip = pkg
-            .contribute("Клиент", "MSI", "28-09-26", vec![f("EXPC_a.txt", "E")])
+            .contribute("Алексей", "MSI", "28-09-26", vec![f("EXPC_a.txt", "E")])
             .unwrap();
         pkg.finalize().unwrap();
         let manifest = |zip: &Path| {
@@ -3457,4 +3797,136 @@ fn rc9_empty_name_segments_and_invalid_time_do_not_abort() {
         );
     }
     assert!(diagnostic_zip_base("", "PC", "27-10-26", "bad-30").contains("unknown"));
+}
+
+#[cfg(test)]
+mod fieldfix_tests {
+    use super::*;
+    fn package() -> SessionPackage {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/fieldfix-package")
+            .join(crate::repair::operation_id());
+        let mut p = SessionPackage::for_exe_dir(&root);
+        p.bind_session(SessionIdentity::new(
+            &crate::repair::operation_id(),
+            "Тест",
+            "SYNTHETIC",
+        ));
+        p.set_states("OK", "OK");
+        p
+    }
+    fn evidence() -> Vec<EvidenceFile> {
+        vec![EvidenceFile::new("EXPC_test.json", br#"{"Checks":[],"GeneratedAt":"2026-11-09"}"#.to_vec()),EvidenceFile::new("Hardware_test.json",br#"{"Cpu":{},"Ram":{"Intelligence":{"Status":"ATTENTION","Recommendation":"Check profile","CurrentMTs":2666,"XmpActive":"UNKNOWN"}}}"#.to_vec()),EvidenceFile::new("DriverAudit_test.json", b"{}".to_vec())]
+    }
+    #[test]
+    fn fieldfix_retry_keeps_modules_and_all_status_dimensions() {
+        let mut p = package();
+        p.fail_next_replace = true;
+        assert!(p.contribute("", "", "09-11-26", evidence()).is_err());
+        assert!(p.packaging_error().is_some());
+        assert!(p.final_zip().is_none());
+        p.retry_export().unwrap();
+        assert!(p.packaging_error().is_none());
+        let entries = read_zip(&p.final_zip().unwrap()).unwrap();
+        for e in evidence() {
+            assert!(entries.contains(&e));
+        }
+        let j = |name: &str| {
+            crate::deep_checks::json::parse(&String::from_utf8_lossy(
+                &entries.iter().find(|e| e.name == name).unwrap().bytes,
+            ))
+            .unwrap()
+        };
+        let summary = j("State_Summary.json");
+        let manifest = j("manifest.json");
+        let v3 = j("EXPC_User_Report_V3.json");
+        assert_eq!(manifest.get("modules").unwrap().as_arr().unwrap().len(), 3);
+        for key in [
+            "execution_status",
+            "coverage_status",
+            "findings_status",
+            "packaging_status",
+            "repair_status",
+        ] {
+            assert_eq!(summary.get(key), manifest.get(key), "{key}");
+            assert_eq!(summary.get(key), v3.get(key), "{key}");
+        }
+        assert!(
+            String::from_utf8_lossy(
+                &entries
+                    .iter()
+                    .find(|e| e.name == "EXPC_User_Report_V3.txt")
+                    .unwrap()
+                    .bytes
+            )
+            .contains("RAM configuration")
+        );
+    }
+    #[test]
+    fn fieldfix_late_file_never_silently_dropped_and_retry_collects_it() {
+        let mut p = package();
+        p.contribute("", "", "09-11-26", evidence()).unwrap();
+        let dir = p.identity().unwrap().report_dir.clone();
+        fs::write(dir.join("Hardware_delayed.txt"), b"late collector result").unwrap();
+        assert!(p.finalize().unwrap_err().contains("unarchived"));
+        assert!(dir.join("Hardware_delayed.txt").is_file());
+        p.retry_export().unwrap();
+        assert!(
+            read_zip(&p.final_zip().unwrap())
+                .unwrap()
+                .iter()
+                .any(|e| e.bytes == b"late collector result")
+        );
+    }
+    #[test]
+    fn fieldfix_crc_valid_but_manifest_missing_file_rejected_before_publish() {
+        let mut p = package();
+        p.contribute("", "", "09-11-26", evidence()).unwrap();
+        let dir = p.identity().unwrap().report_dir.clone();
+        let candidate = dir.join(".session-ready.zip");
+        let mut entries = read_zip(&candidate).unwrap();
+        entries.retain(|e| e.name != "Hardware_test.json");
+        fs::write(
+            &candidate,
+            build_zip(&entries, crate::ui::sysinfo::local_time()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            p.finalize()
+                .unwrap_err()
+                .contains("manifest evidence missing")
+        );
+        assert!(p.final_zip().is_none());
+        assert!(dir.join("Hardware_test.json").is_file());
+        p.retry_export().unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn fieldfix_sharing_violation_preserves_source_and_explicit_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut p = package();
+        p.contribute("", "", "09-11-26", evidence()).unwrap();
+        let dir = p.identity().unwrap().report_dir.clone();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join(".session-ready.zip"))
+            .unwrap();
+        let error = p.finalize().unwrap_err();
+        assert!(error.contains("os error 32"), "{error}");
+        assert!(p.final_zip().is_none());
+        assert!(dir.join("Hardware_test.json").is_file());
+        drop(locked);
+        p.retry_export().unwrap();
+        assert!(p.final_zip().is_some());
+    }
+    #[test]
+    fn fieldfix_enumeration_failure_is_not_empty_success() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/fieldfix-package")
+            .join(crate::repair::operation_id());
+        let error = list_files_checked(&root).unwrap_err();
+        assert!(error.contains("stage=enumerate"));
+        assert!(error.contains("os_code="));
+    }
 }

@@ -219,7 +219,14 @@ Audit-Progress 'System drivers / signatures'
 $sysDrivers = @{}
 try {
     foreach ($s in @(Get-CimInstance -ClassName Win32_SystemDriver -ErrorAction Stop)) {
-        Emit @('SYS', $s.Name, $s.DisplayName, $s.PathName, $s.State, $s.StartMode, $s.ServiceType)
+        $componentEnabled=''
+        if($s.Name -eq 'luafv') {
+            try {
+                $lua=Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -ErrorAction Stop
+                if($lua -in @(0,1)){$componentEnabled=[string]([int]$lua -eq 1)}
+            }catch { Emit @('ERR','luafv.EnableLUA',$_.Exception.Message) }
+        }
+        Emit @('SYS', $s.Name, $s.DisplayName, $s.PathName, $s.State, $s.StartMode, $s.ServiceType, $componentEnabled)
         $sysDrivers[[string]$s.Name] = $s
     }
 } catch { Emit @('ERR', 'Win32_SystemDriver', $_.Exception.Message) }
@@ -338,6 +345,7 @@ try {
         }
     }
 } catch {}
+foreach($name in @('luafv','wesp')) { if($sysDrivers.ContainsKey($name)){$names7026[$name]=$name} }
 foreach ($key in @($names7026.Keys)) {
     $svc = $sysDrivers[$names7026[$key]]
     if (-not $svc) { foreach ($k in $sysDrivers.Keys) { if ($k.ToLowerInvariant() -eq $key) { $svc = $sysDrivers[$k] } } }

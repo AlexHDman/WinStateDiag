@@ -535,7 +535,7 @@ fn group_policy_not_applicable_is_amber_and_distinct_from_no_data_and_errors() {
 // ---------------- 5. journal «Папка» ----------------
 
 #[test]
-fn journal_folder_button_uses_the_header_tab_violet_in_every_state() {
+fn a6_ai_action_uses_violet_and_original_reports_remain_secondary() {
     use crate::ui::paint::{ButtonKind, button_colors};
     use crate::ui::tokens::color as c;
     let normal = button_colors(ButtonKind::Nav, true, false, false);
@@ -568,7 +568,14 @@ fn journal_folder_button_uses_the_header_tab_violet_in_every_state() {
     let folder = &src[src
         .rfind("\"open_folder\",\n        d.report_row_folder")
         .unwrap()..];
-    assert!(folder[..300].contains("ButtonKind::Nav"));
+    assert!(folder[..300].contains("ButtonKind::Secondary"));
+    let ai = &src[src.find("fn ai_report_button").unwrap()..];
+    let ai = &ai[..ai.find("let label =").unwrap()];
+    assert!(ai.contains("ButtonKind::Nav"));
+    assert_ne!(
+        button_colors(ButtonKind::Secondary, true, false, false).0,
+        normal.0
+    );
 }
 
 // ---------------- 6. passport palette ----------------
@@ -701,6 +708,94 @@ fn finished_run_is_green_only_when_the_states_say_ok() {
     };
     let ring = app.build_vm(0.0, 0.0).overall;
     assert_eq!(ring.tone, Tone::Warning);
-    assert_eq!(ring.status_text, d.overall_status_done_attention);
+    assert_eq!(ring.status_text, "Диагностика завершена");
+    cleanup(&exe);
+}
+
+#[test]
+fn v1213_retest_countdown_ceil_and_saturate() {
+    let now = Instant::now();
+    for (millis, expected) in [(17001, 18), (17000, 17), (1, 1), (0, 0)] {
+        assert_eq!(
+            retest_seconds_left(now + Duration::from_millis(millis), now),
+            expected
+        );
+    }
+    assert_eq!(retest_seconds_left(now, now + Duration::from_secs(1)), 0);
+    assert_eq!(
+        i18n::RU.ssd_retest_waiting_fmt.replace("{s}", "17"),
+        "Повтор через 17 сек"
+    );
+}
+
+#[test]
+fn v1213_retest_waiting_caption_renders_countdown() {
+    let (mut app, exe) = app_in("v1213-countdown");
+    let vm = app.build_vm(0.0, 0.0);
+    let ctx = egui::Context::default();
+    crate::ui::fonts::install(&ctx);
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::ui::pages::draw_test_block_pair(
+            ui.painter(),
+            Rect::from_min_size(egui::pos2(20.0, 20.0), vec2(600.0, 200.0)),
+            &vm,
+            &[
+                TestBlockVm::Waiting(None),
+                TestBlockVm::Waiting(Some("Повтор через 17 сек".into())),
+            ],
+            true,
+        );
+    });
+    out.textures_delta.clear();
+    let texts = out
+        .shapes
+        .iter()
+        .filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(texts.iter().any(|s| s == "Повтор через 17 сек"));
+    assert!(
+        !texts
+            .iter()
+            .any(|s| s.contains("confirming the result") || s.contains("подтверждение результата"))
+    );
+    cleanup(&exe);
+}
+
+#[test]
+fn fieldfix_a8_execution_is_distinct_from_package_failure() {
+    let (mut app, exe) = app_in("fieldfix-dimensions");
+    app.state = RunState::Done {
+        zip_path: exe.join("Reports/synthetic.zip"),
+    };
+    app.mode = engine::DiagnosticMode::Standard;
+    app.expc_checks = vec![deep_checks::ExpcCheck {
+        key: "SFC".into(),
+        status: "SKIPPED".into(),
+        detail: "Not selected".into(),
+    }];
+    assert!(
+        app.build_vm(0.0, 0.0)
+            .overall
+            .detail
+            .contains("не выбирались")
+    );
+    app.mode = engine::DiagnosticMode::Full;
+    app.expc_checks[0].status = "ERROR".into();
+    assert!(app.build_vm(0.0, 0.0).overall.detail.contains("не удались"));
+    report_package::lock(&app.package)
+        .record_packaging_failure("stage=publish os_code=112 synthetic");
+    let vm = app.build_vm(0.0, 0.0);
+    assert_eq!(vm.overall.status_text, "Ошибка формирования отчёта");
+    assert!(vm.overall.retry_export);
+    assert_eq!(vm.overall.modules[2].state, ModuleState::Error);
+    assert_eq!(app.done_verdict(&i18n::RU).1, Tone::Error);
+    assert!(vm.operation.subtitle.contains("отчёт не подтверждён"));
+    assert!(
+        matches!(app.state, RunState::Done { .. }),
+        "packaging does not erase diagnostic result"
+    );
     cleanup(&exe);
 }

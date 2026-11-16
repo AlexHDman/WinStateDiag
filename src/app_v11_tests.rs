@@ -537,8 +537,8 @@ fn inventory(debugger: crash_dump::DebuggerStatus) -> crash_dump::Inventory {
     crash_dump::Inventory {
         bugchecks: Vec::new(),
         dumps: vec![crash_dump::DumpFile {
-            path: "C:\\Windows\\Minidump\\010100-00001-01.dmp".into(),
-            name: "010100-00001-01.dmp".into(),
+            path: "C:\\Windows\\Minidump\\100326-9500-01.dmp".into(),
+            name: "100326-9500-01.dmp".into(),
             size: 1024,
             modified: "2026-10-03T00:34:41".into(),
             kind: crash_dump::DumpKind::Mini,
@@ -1236,7 +1236,14 @@ fn driver_history_clear_needs_confirmation_and_touches_nothing_else() {
     match &app.driver_export_status {
         Some(ExportStatus::Saved(p)) => {
             let text = std::fs::read_to_string(p).unwrap();
-            assert!(text.contains(&driver_audit::to_text(&audit())[..40]));
+            assert!(
+                text.contains(
+                    &driver_audit::to_text(&audit())
+                        .chars()
+                        .take(40)
+                        .collect::<String>()
+                )
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -1887,7 +1894,7 @@ fn dump_cause_confidence_is_localized_in_the_headline() {
         confidence: incidents::Confidence::Low,
         signals: Vec::new(),
         dump_cause: Some(incidents::DumpCause {
-            dump: "010100-00001-01.dmp".into(),
+            dump: "100326-9500-01.dmp".into(),
             bugcheck: "0x00000139".into(),
             module: "RvNetMP60.sys".into(),
             owner: Some(("Radmin VPN".into(), true)),
@@ -2039,10 +2046,9 @@ fn v1210_gui_execution_and_raw_journal_contract() {
         detail: "unrecognized".into(),
     }];
     let vm = app.build_vm(0.0, 0.0);
-    assert!(vm.operation.subtitle.contains("Выполнение завершено"));
+    assert!(vm.operation.subtitle.contains("Диагностика завершена"));
     assert!(
-        vm.operation.subtitle.contains("Покрытие ограничено")
-            || vm.operation.subtitle.contains("Нет данных")
+        vm.operation.subtitle.contains("частично") || vm.operation.subtitle.contains("Нет данных")
     );
     app.driver_audit = DriverAuditState::Done(Box::new(AuditReport {
         complete: true,
@@ -2051,11 +2057,7 @@ fn v1210_gui_execution_and_raw_journal_contract() {
         ..Default::default()
     }));
     let vm = app.build_vm(0.0, 0.0);
-    assert!(
-        vm.operation
-            .subtitle
-            .contains("Завершено с ошибками выполнения")
-    );
+    assert!(vm.operation.subtitle.contains("Ошибка диагностики"));
     assert_eq!(app.audit_report().unwrap().overall, Severity::Ok);
     assert!(
         app.state_reasons()
@@ -2069,11 +2071,7 @@ fn v1210_gui_execution_and_raw_journal_contract() {
         detail: "exception".into(),
     });
     let vm = app.build_vm(0.0, 0.0);
-    assert!(
-        vm.operation
-            .subtitle
-            .contains("Завершено с ошибками выполнения")
-    );
+    assert!(vm.operation.subtitle.contains("Ошибка диагностики"));
     assert_eq!(vm.operation.tone, Tone::Error);
     let original = "A5_PROGRESS|Native date fallback: 48/53; 31.0 s";
     let mut journal = SessionJournal::default();
@@ -2182,7 +2180,12 @@ fn v1211_repair_request_gate_and_immutable_zip_evidence() {
     assert!(app.build_vm(0.0, 0.0).stages[10].repair_available);
     assert!(!app.build_vm(0.0, 0.0).stages[11].repair_available);
     app.apply(Action::RequestRepair(10));
-    assert!(app.repair_ui.pending.is_some());
+    assert!(app.repair_ui.pending.is_none());
+    assert!(
+        app.repair_ui
+            .message
+            .contains("Native Repair отключён в тестах")
+    );
     assert!(!app.repair_busy());
     let (tx, rx) = std::sync::mpsc::channel();
     app.repair_ui.rx = Some(rx);
@@ -2205,7 +2208,7 @@ fn v1211_repair_request_gate_and_immutable_zip_evidence() {
     let report = repair::Report {
         id: "fake-success".into(),
         plan: repair::plan(&original, "C:").unwrap(),
-        status: "SUCCESS".into(),
+        status: "SUCCESS_VERIFIED".into(),
         message: "Повторная проверка чистая".into(),
         repair: Some(repair::Output {
             code: Some(0),
@@ -2219,6 +2222,7 @@ fn v1211_repair_request_gate_and_immutable_zip_evidence() {
         }),
         verified: Some(CheckResult::Ok),
         reboot: false,
+        completed_at: "2026-11-05T00:00:00".into(),
     };
     app.accept_repair_report(report);
     assert_eq!(
@@ -2265,7 +2269,7 @@ fn v1211_repair_request_gate_and_immutable_zip_evidence() {
     )
     .unwrap();
     assert!(manifest.contains("\"repairs\""));
-    assert!(manifest.contains("SUCCESS"));
+    assert!(manifest.contains("SUCCESS_VERIFIED"));
     assert!(manifest.contains("Repair_fake-success.json"));
 }
 #[test]
@@ -2303,7 +2307,7 @@ fn v1211_firmware_actual_font_width_at_windows_scales() {
 }
 
 #[test]
-fn v1211_a9_repair_button_hit_test_only_requests_confirmation() {
+fn v13_a9_repair_button_hit_test_dispatches_once_without_second_confirmation() {
     let (mut app, _exe) = app_in("v1211_hit");
     app.state = RunState::Done {
         zip_path: "test.zip".into(),
@@ -2332,7 +2336,7 @@ fn v1211_a9_repair_button_hit_test_only_requests_confirmation() {
         );
         point = native_texts(&output)
             .into_iter()
-            .find(|(text, _)| text == "Repair")
+            .find(|(text, _)| text == "Исправить")
             .map(|(_, rect)| rect.center());
         output.textures_delta.clear();
     }
@@ -2364,6 +2368,98 @@ fn v1211_a9_repair_button_hit_test_only_requests_confirmation() {
     for action in actions {
         app.apply(action);
     }
-    assert!(app.repair_ui.pending.is_some());
+    assert!(app.repair_ui.pending.is_none());
+    assert!(
+        app.repair_ui
+            .message
+            .contains("Native Repair отключён в тестах")
+    );
     assert!(!app.repair_busy());
+}
+
+#[test]
+fn v1212_repair_window_scroll_confirmation_and_progress_are_headless() {
+    // Exercise the actual rendering callback without creating an OS window or a repair worker.
+    for size in [vec2(780.0, 850.0), vec2(420.0, 300.0)] {
+        let mut app = WinStateDiagApp::default();
+        app.repair_ui.open = true;
+        let finding = DeepCheckOutcome {
+            check: DeepCheck::Chkdsk,
+            result: CheckResult::Attention,
+            detail: "Windows found problems".into(),
+            source: deep_checks::ResultSource::ExpcJson,
+        };
+        app.repair_ui.pending = crate::repair::plan(&finding, "C:");
+        let ctx = egui::Context::default();
+        crate::ui::fonts::install(&ctx);
+        let mut seen = std::collections::BTreeSet::new();
+        for frame in 0..18 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(frame as f64 / 10.0),
+                    events: if frame > 2 {
+                        vec![
+                            egui::Event::PointerMoved(egui::pos2(140.0, 130.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: vec2(0.0, -160.0),
+                                phase: egui::TouchPhase::Move,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                },
+                |_| app.repair_window(&ctx),
+            );
+            for (text, _) in native_texts(&output) {
+                seen.insert(text);
+            }
+            output.textures_delta.clear();
+            assert!(!app.repair_busy());
+        }
+        assert!(
+            seen.iter()
+                .any(|s| s.contains("Подтверждаю исправление и возможное планирование")),
+            "{size:?}: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|s| s.contains("Продолжить к подтверждению"))
+        );
+        assert!(app.repair_ui.pending.is_some());
+        app.repair_ui.pending = None;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.repair_ui.rx = Some(rx);
+        *app.repair_ui.progress.lock().unwrap() = crate::repair::Progress {
+            check: Some(DeepCheck::Chkdsk),
+            phase: "Повторная проверка (только чтение)".into(),
+            percent: Some(25.5),
+            latest: "Проверка выполняется".into(),
+        };
+        let mut progress_texts = Vec::new();
+        for frame in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(2.0 + frame as f64 / 10.0),
+                    ..Default::default()
+                },
+                |_| app.repair_window(&ctx),
+            );
+            progress_texts.extend(native_texts(&output));
+            output.textures_delta.clear();
+        }
+        assert!(
+            progress_texts
+                .iter()
+                .any(|(s, _)| s.contains("Исправление выполняется")),
+            "{size:?}: {progress_texts:?}"
+        );
+        assert!(!app.repair_ui.cancel.load(Ordering::SeqCst));
+    }
 }

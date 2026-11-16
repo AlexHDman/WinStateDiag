@@ -5,9 +5,13 @@
 // (src/main.rs) only owns `windows_subsystem` and the UAC manifest (build.rs),
 // so `cargo test` exercises this crate without requiring elevation.
 
+mod ai_export;
 mod app;
 mod app_paths;
 mod ata_smart;
+mod bios;
+mod bios_net;
+mod bios_sources;
 mod crash_dump;
 mod crash_report;
 mod cryptopro;
@@ -19,6 +23,7 @@ mod events;
 mod gpo_admx;
 mod graphics_startup;
 mod graphics_wgpu;
+mod hardware_support;
 pub mod i18n;
 mod incidents;
 mod manifest;
@@ -28,7 +33,10 @@ mod passport2;
 mod power;
 mod ps_exec;
 mod repair;
+mod repair_center;
+mod repair_history;
 mod report_package;
+mod report_v3;
 mod sensors;
 pub mod ssd_history;
 pub mod storage_benchmark;
@@ -36,8 +44,11 @@ mod storage_health;
 mod storage_history;
 pub mod storage_topology;
 mod ui;
+mod vss_repair;
 mod win_dialog;
 mod win_icon;
+mod window_placement;
+mod winsxs;
 
 use graphics_startup::{GraphicsMode, Role, StartupLog};
 use std::path::PathBuf;
@@ -67,6 +78,9 @@ pub fn run() -> ! {
     // startup_graphics.log; the process still aborts as before (no restart,
     // nothing hidden).
     install_panic_logger();
+    if args.first().map(String::as_str) == Some("--repair-elevated") {
+        std::process::exit(repair::elevated_worker(&args));
+    }
     // v0.4.5 validation hook (no GUI): one read-only sensor sampling window
     // written as Hardware_Sensors JSON. Used for the AIDA64 comparison.
     if args.first().map(String::as_str) == Some("--sensor-probe") {
@@ -113,7 +127,7 @@ pub fn run() -> ! {
             let log = StartupLog::open("startup");
             log.line(&format!("invalid arguments: {err}"));
             graphics_startup::show_native_error(&format!(
-                "WinStateDiag: {err}\n\nЖурнал запуска: {}",
+                "WinDiag: {err}\n\nР–СѓСЂРЅР°Р» Р·Р°РїСѓСЃРєР°: {}",
                 log.path().display()
             ));
             graphics_startup::EXIT_INVALID_MODE
@@ -423,12 +437,12 @@ fn incident_probe(out: Option<PathBuf>) -> i32 {
 /// Renderer process: runs the GUI in `mode`. Never starts another process.
 /// The main window title (also reported by `--consistency-probe`).
 pub fn base_window_title() -> String {
-    format!("WinStateDiag — v{APP_VERSION}")
+    format!("EXPC WinDiag — v{APP_VERSION}")
 }
 
 /// v1.0 release-gate hook (no GUI, read-only): version strings of the
 /// shipped binary + cross-view consistency of the normalized records
-/// (storage health → manifest / correlation; crash counters card ↔
+/// (storage health в†’ manifest / correlation; crash counters card в†”
 /// report on the REAL crash inventory of this machine).
 fn consistency_probe(out: Option<PathBuf>) -> i32 {
     let out = out.unwrap_or_else(|| PathBuf::from("Consistency_probe.txt"));
@@ -437,8 +451,8 @@ fn consistency_probe(out: Option<PathBuf>) -> i32 {
         format!("APP_VERSION={APP_VERSION}"),
         format!("PRODUCER_VERSION={}", manifest::PRODUCER_VERSION),
     ];
-    let mut ok =
-        APP_VERSION == env!("CARGO_PKG_VERSION") && manifest::PRODUCER_VERSION == APP_VERSION;
+    let mut ok = format!("{APP_VERSION}.0") == env!("CARGO_PKG_VERSION")
+        && manifest::PRODUCER_VERSION == APP_VERSION;
     // Storage: an ATA SMART health record through the shipped writers.
     let disk = storage_topology::PhysicalDiskInfo {
         index: 1,
@@ -535,7 +549,7 @@ const STAGE_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 static STAGE_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const STAGE_MAX_LINES: u32 = 300;
 
-/// Records one startup stage ("stage +12.3s: …") in startup_graphics.log
+/// Records one startup stage ("stage +12.3s: вЂ¦") in startup_graphics.log
 /// during the first 10 minutes of a launch (at most 300 lines). No-op in
 /// tests, probes and before the renderer started.
 pub(crate) fn startup_stage(text: &str) {
@@ -551,7 +565,7 @@ pub(crate) fn startup_stage(text: &str) {
     log.line(&format!("stage +{:.1}s: {text}", up.as_secs_f32()));
 }
 
-/// Panic → one line in startup_graphics.log (thread, location, message,
+/// Panic в†’ one line in startup_graphics.log (thread, location, message,
 /// uptime), then the default hook; `panic = "abort"` then ends the process
 /// exactly as before.
 fn install_panic_logger() {
@@ -604,7 +618,7 @@ fn run_renderer(args: &[String], mode: GraphicsMode, handshake: Option<PathBuf>)
         title.push_str("  [VISUAL REFERENCE]");
     }
     if mode == GraphicsMode::Safe {
-        title.push_str("  [безопасный графический режим]");
+        title.push_str("  [Р±РµР·РѕРїР°СЃРЅС‹Р№ РіСЂР°С„РёС‡РµСЃРєРёР№ СЂРµР¶РёРј]");
     }
     // Initial size = reference canvas at 80%; the first frame fits it to the
     // monitor and the canvas then scales uniformly with the window.
@@ -615,7 +629,7 @@ fn run_renderer(args: &[String], mode: GraphicsMode, handshake: Option<PathBuf>)
         .with_icon(window_icon());
     // v1.1 offscreen QA: a visual-reference capture renders in a window
     // placed outside the visible desktop that never takes focus and has no
-    // taskbar button — the user's desktop is not occupied.
+    // taskbar button вЂ” the user's desktop is not occupied.
     if reference && args.iter().any(|a| a == "--qa-offscreen") {
         viewport = viewport
             .with_position([-30000.0_f32, -30000.0_f32])
@@ -650,10 +664,13 @@ fn run_renderer(args: &[String], mode: GraphicsMode, handshake: Option<PathBuf>)
             }
             creator_log.line(&format!("renderer initialised: adapter {adapter}"));
             let mut inner = app::WinStateDiagApp::default();
+            if cc.storage.and_then(|s| s.get_string("window")).is_some() {
+                inner.preserve_restored_window_position();
+            }
             if mode == GraphicsMode::Safe {
                 inner.push_notice(
-                    "WinStateDiag запущен в безопасном графическом режиме. \
-                     Обнаружена проблема инициализации стандартного графического режима."
+                    "WinDiag Р·Р°РїСѓС‰РµРЅ РІ Р±РµР·РѕРїР°СЃРЅРѕРј РіСЂР°С„РёС‡РµСЃРєРѕРј СЂРµР¶РёРјРµ. \
+                     РћР±РЅР°СЂСѓР¶РµРЅР° РїСЂРѕР±Р»РµРјР° РёРЅРёС†РёР°Р»РёР·Р°С†РёРё СЃС‚Р°РЅРґР°СЂС‚РЅРѕРіРѕ РіСЂР°С„РёС‡РµСЃРєРѕРіРѕ СЂРµР¶РёРјР°."
                         .into(),
                 );
             }
@@ -680,7 +697,7 @@ fn run_renderer(args: &[String], mode: GraphicsMode, handshake: Option<PathBuf>)
             if !supervised {
                 // Started by hand (no supervisor): report directly.
                 graphics_startup::show_native_error(&format!(
-                    "WinStateDiag: не удалось запустить графический режим «{}».\n\n{err}\n\nЖурнал запуска: {}",
+                    "WinDiag: РЅРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РіСЂР°С„РёС‡РµСЃРєРёР№ СЂРµР¶РёРј В«{}В».\n\n{err}\n\nР–СѓСЂРЅР°Р» Р·Р°РїСѓСЃРєР°: {}",
                     mode.name(),
                     log.path().display()
                 ));
@@ -716,7 +733,7 @@ impl eframe::App for StartupGuard {
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // A close request names who closed the window: the OS / user
-        // (WM_CLOSE, exit code 0) — as opposed to an abort (0xC0000409).
+        // (WM_CLOSE, exit code 0) вЂ” as opposed to an abort (0xC0000409).
         if !self.close_logged && ctx.input(|i| i.viewport().close_requested()) {
             self.close_logged = true;
             startup_stage(&format!(
@@ -761,7 +778,7 @@ impl eframe::App for StartupGuard {
 #[cfg(test)]
 mod consistency_probe_tests {
     /// v1.0 release-gate hook: the shipped binary's version strings and the
-    /// ATA health → correlation path agree (crash counters need Windows).
+    /// ATA health в†’ correlation path agree (crash counters need Windows).
     #[test]
     fn consistency_probe_passes_storage_and_version_checks() {
         let dir = std::env::temp_dir().join(format!("wsd-consistency-{}", std::process::id()));
@@ -769,8 +786,8 @@ mod consistency_probe_tests {
         let out = dir.join("c.txt");
         let code = super::consistency_probe(Some(out.clone()));
         let text = std::fs::read_to_string(&out).unwrap();
-        assert!(text.contains("TITLE=WinStateDiag — v1.2.11"), "{text}");
-        assert!(text.contains("PRODUCER_VERSION=1.2.11"), "{text}");
+        assert!(text.contains("TITLE=EXPC WinDiag — v1.6"), "{text}");
+        assert!(text.contains("PRODUCER_VERSION=1.6"), "{text}");
         assert!(
             text.contains(
                 "STORAGE_ATA health_status=OK correlation_state=OK correlation_health=OK -> PASS"
@@ -793,3 +810,12 @@ pub mod diag_state;
 mod rc9_tests;
 
 mod user_log;
+
+#[cfg(test)]
+mod v13_tests;
+
+#[cfg(test)]
+mod v14_tests;
+
+#[cfg(test)]
+mod hardware_support_native_tests;

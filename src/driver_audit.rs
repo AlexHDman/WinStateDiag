@@ -115,6 +115,8 @@ pub struct RawSysDriver {
     pub start_mode: String,
     /// "Kernel Driver", "File System Driver", ...
     pub service_type: String,
+    /// Optional component policy; currently EnableLUA for luafv, never inferred from name.
+    pub component_enabled: Option<bool>,
 }
 
 /// One `DRVFILE` record: read-only facts about the image of a driver named
@@ -383,7 +385,53 @@ pub const EVENT_SOURCES: &[&str] = &[
     "CIM Win32_PnPEntity, Win32_PnPSignedDriver, Win32_SystemDriver; Get-WindowsDriver",
 ];
 
+pub fn generic_absent(item: &AuditItem) -> bool {
+    let name = item.device.to_lowercase();
+    item.status_code() == "NOT_PRESENT"
+        && item.status == Severity::Ok
+        && (name.contains("generic software device")
+            || name.contains("универсальное программное устройство"))
+}
 impl AuditReport {
+    pub fn scope_counts(&self) -> (usize, usize, usize) {
+        let context = self
+            .items
+            .iter()
+            .filter(|i| matches!(i.status_code(), "NOT_PRESENT" | "NOT_APPLICABLE"))
+            .count();
+        let ci = self
+            .items
+            .iter()
+            .flat_map(|i| &i.evidence)
+            .chain(&self.software_findings)
+            .chain(&self.unattributed)
+            .filter(|e| e.kind == EvidenceKind::CodeIntegrity && e.severity >= Severity::Warning)
+            .count();
+        let pnp = self
+            .items
+            .iter()
+            .filter(|i| {
+                i.evidence
+                    .iter()
+                    .any(|e| e.kind == EvidenceKind::PnpError && e.severity >= Severity::Warning)
+            })
+            .count();
+        (pnp, ci, context)
+    }
+    pub fn context_summary(&self) -> String {
+        format!(
+            "Generic software device NOT_PRESENT: {}; здоровье NOT TESTED. Полные идентификаторы и исходные доказательства — в DriverAudit JSON.",
+            self.items.iter().filter(|i| generic_absent(i)).count()
+        )
+    }
+    pub fn scope_summary(&self) -> String {
+        let (pnp, ci, context) = self.scope_counts();
+        format!(
+            "PnP: устройств с ошибками {pnp}; записи драйверов: проблем {}, предупреждений {}; Code Integrity: групп предупреждений {ci}; отсутствуют/не применимо: {context} (здоровье NOT TESTED)",
+            self.count(Severity::Problem),
+            self.count(Severity::Warning)
+        )
+    }
     pub fn package_inventory_status(&self) -> &'static str {
         if self
             .errors
@@ -585,6 +633,7 @@ pub fn parse_collector_output(text: &str) -> RawAudit {
                 state: get(4),
                 start_mode: get(5),
                 service_type: get(6),
+                component_enabled: parse_bool(&get(7)),
             }),
             Some("DRVFILE") => raw.driver_files.push(RawDriverFile {
                 service: get(1),
@@ -1393,14 +1442,32 @@ fn expected_inactive_check(
     ev: &RawEvent,
 ) -> Result<String, Vec<String>> {
     let mut failed = Vec::new();
-    if ev.level != Some(4) {
-        failed.push("событие 7026 не информационное".to_string());
-    }
     let stem = file_stem_lower(name);
     let Some(sd) = ctx.sys_driver(name) else {
         return Err(vec!["служба драйвера не найдена".into()]);
     };
-    if !sd.service_type.eq_ignore_ascii_case("Kernel Driver") {
+    let disabled = sd.start_mode.eq_ignore_ascii_case("Disabled")
+        || (sd.name.eq_ignore_ascii_case("luafv") && sd.component_enabled == Some(false));
+    // The service name alone never suppresses an error. A policy-disabled luafv
+    // needs both the current policy and the expected load-blocked error (1275).
+    let policy_block = |e: &RawEvent| {
+        e.tag == "SCM7000"
+            && sd.name.eq_ignore_ascii_case("luafv")
+            && sd.component_enabled == Some(false)
+            && e.props
+                .iter()
+                .any(|p| matches!(p.trim(), "%%1275" | "1275" | "0x000004fb"))
+    };
+    let blocked_by_policy = policy_block(ev);
+    if !(ev.tag == "SCM7026" && (ev.level == Some(4) || disabled)
+        || ev.tag == "SCM7000" && blocked_by_policy)
+    {
+        failed.push("нет подтверждения штатного неактивного состояния".to_string());
+    }
+    if !matches!(
+        sd.service_type.to_ascii_lowercase().as_str(),
+        "kernel driver" | "file system driver"
+    ) {
         failed.push(format!("тип службы «{}»", sd.service_type));
     }
     let image = file_name(&sd.path).to_lowercase();
@@ -1447,14 +1514,14 @@ fn expected_inactive_check(
     if ctx
         .events
         .iter()
-        .any(|e| (e.tag == "SCM7000" || e.tag == "SCMERR") && mentions(e))
+        .any(|e| (e.tag == "SCM7000" || e.tag == "SCMERR") && mentions(e) && !policy_block(e))
     {
         failed.push("есть ошибки запуска службы (SCM 7000/7001/7009)".into());
     }
     if ctx
         .events
         .iter()
-        .any(|e| e.tag == "SCM7026" && e.level != Some(4) && mentions(e))
+        .any(|e| e.tag == "SCM7026" && e.level != Some(4) && mentions(e) && !disabled)
     {
         failed.push("есть неинформационные события 7026".into());
     }
@@ -1464,6 +1531,12 @@ fn expected_inactive_check(
         } else {
             sd.display_name.clone()
         };
+        if disabled {
+            return Ok(format!(
+                "{label}: компонент отключён текущей конфигурацией (StartMode={}, EnableLUA={:?}); событие сохранено как контекст. Файл и подпись Microsoft проверены; работоспособность отключённого компонента не проверялась.",
+                sd.start_mode, sd.component_enabled
+            ));
+        }
         Ok(format!(
             "{label}: драйвер сейчас неактивен (ожидаемо); файл, конфигурация и цифровая подпись Microsoft в порядке. Исправление не требуется."
         ))
@@ -1633,6 +1706,23 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
             let Some(sd) = ctx.sys_driver(&display).cloned() else {
                 return;
             };
+            if let Ok(detail) = expected_inactive_check(ctx, &sd.name, ev) {
+                let mut e = Evidence::from_event(
+                    EvidenceKind::ExpectedInactive,
+                    Severity::Ok,
+                    ev,
+                    "System / Service Control Manager",
+                    detail,
+                );
+                e.module = sd.name.clone();
+                let mut targets = ctx.by_driver_name(&sd.name);
+                if targets.is_empty() {
+                    targets.push(ctx.kernel_item(&sd.name));
+                }
+                ctx.attach(&targets, &e);
+                ctx.expected_inactive_note(e);
+                return;
+            }
             let running = sd.state.eq_ignore_ascii_case("running");
             let mut e = Evidence::from_event(
                 EvidenceKind::BootDriverLoadFailure,
@@ -2050,6 +2140,13 @@ fn evidence_json(e: &Evidence, ind: &str) -> String {
 pub fn to_json(r: &AuditReport) -> String {
     let mut o = String::new();
     o.push_str("{\n");
+    let (pnp, ci, context) = r.scope_counts();
+    let _ = writeln!(
+        o,
+        "  \"scope_counts\": {{\"pnp_issue_devices\": {pnp}, \"code_integrity_warning_groups\": {ci}, \"not_present_or_not_applicable\": {context}}},"
+    );
+
+    let _ = writeln!(o, "  \"scope_summary\": {},", json_str(&r.scope_summary()));
     let _ = writeln!(o, "  \"schema\": {},", json_str(SCHEMA));
     let _ = writeln!(
         o,
@@ -2236,6 +2333,7 @@ pub fn to_text(r: &AuditReport) -> String {
         "WinStateDiag {} — Проверка драйверов",
         crate::APP_VERSION
     );
+    let _ = writeln!(o, "{}", r.scope_summary());
     let _ = writeln!(o, "Сформировано: {}", r.generated);
     let _ = writeln!(
         o,
@@ -2266,7 +2364,8 @@ pub fn to_text(r: &AuditReport) -> String {
         o,
         "Правило: статус ставится только по конкретным признакам; возраст драйвера сам по себе не считается проблемой.\n"
     );
-    for it in &r.items {
+    let _ = writeln!(o, "{}", r.context_summary());
+    for it in r.items.iter().filter(|i| !generic_absent(i)) {
         let _ = writeln!(
             o,
             "[{}] {} — {}",
@@ -2564,11 +2663,11 @@ mod tests {
             return;
         };
         for (machine, expected) in [
-            ("CASE-C", 37),
-            ("CASE-D", 17),
-            ("CASE-E", 33),
-            ("CASE-B", 72),
-            ("CASE-F", 80),
+            ("CRE-SERVER", 37),
+            ("LAB-B-SRV", 17),
+            ("LAB-A-SRV", 33),
+            ("DEMO-SERVER", 72),
+            ("LAB-S2", 80),
         ] {
             let text = std::fs::read_to_string(
                 std::path::Path::new(&root)
@@ -2847,6 +2946,7 @@ mod tests {
                 state: "Stopped".into(),
                 start_mode: "Boot".into(),
                 service_type: "Kernel Driver".into(),
+                component_enabled: None,
             }],
             driver_files: vec![],
             events,
@@ -3730,6 +3830,7 @@ mod tests {
                 state: "Stopped".into(),
                 start_mode: "System".into(),
                 service_type: sys_type.into(),
+                component_enabled: None,
             }],
             driver_files: vec![file],
             events,
@@ -3737,6 +3838,94 @@ mod tests {
             sig_checks: Vec::new(),
             packages: Vec::new(),
         })
+    }
+
+    #[test]
+    fn v1212_component_policy_is_evidence_not_name_allowlist() {
+        for (name, start, policy, tag, code, expected) in [
+            (
+                "luafv",
+                "Auto",
+                Some(false),
+                "SCM7000",
+                "%%1275",
+                Severity::Ok,
+            ),
+            (
+                "luafv",
+                "Auto",
+                Some(true),
+                "SCM7000",
+                "%%1275",
+                Severity::Warning,
+            ),
+            (
+                "luafv",
+                "Auto",
+                None,
+                "SCM7000",
+                "%%1275",
+                Severity::Warning,
+            ),
+            (
+                "luafv",
+                "System",
+                Some(false),
+                "SCM7000",
+                "%%2",
+                Severity::Problem,
+            ),
+            ("wesp", "Disabled", None, "SCM7026", "", Severity::Ok),
+            ("wesp", "System", None, "SCM7026", "", Severity::Problem),
+        ] {
+            let mut sd = vbox_sys("Stopped");
+            sd.name = name.into();
+            sd.display_name = name.into();
+            sd.path = format!("C:\\Windows\\System32\\drivers\\{name}.sys");
+            sd.start_mode = start.into();
+            sd.component_enabled = policy;
+            if name == "luafv" {
+                sd.service_type = "File System Driver".into();
+            }
+            let mut f = dam_file();
+            f.service = name.into();
+            f.path = sd.path.clone();
+            let mut e = evt(
+                tag,
+                if tag == "SCM7000" { 7000 } else { 7026 },
+                "2026-10-12T08:00:00",
+                &[name, code],
+            );
+            e.level = Some(2);
+            let mut repeated = e.clone();
+            repeated.time = "2026-10-12T08:01:00".into();
+            let mut raw = raw_with(vec![sd], vec![e, repeated]);
+            raw.driver_files = vec![f];
+            let r = classify(&raw);
+            assert_eq!(
+                r.overall,
+                expected,
+                "{name}/{start}/{policy:?}/{code}: {}",
+                to_text(&r)
+            );
+            assert!(to_json(&r).contains(name));
+            if expected == Severity::Ok {
+                raw.driver_files[0].signature = "HashMismatch".into();
+                assert_ne!(
+                    classify(&raw).overall,
+                    Severity::Ok,
+                    "invalid file must not be suppressed"
+                );
+                raw.driver_files[0].signature = "Valid".into();
+                raw.events.push(evt(
+                    "CI",
+                    3004,
+                    "2026-10-12T08:00:00",
+                    &[&format!("{name}.sys")],
+                ));
+                assert_ne!(classify(&raw).overall, Severity::Ok, "CI remains visible");
+            }
+        }
     }
 
     fn dam_file() -> RawDriverFile {
@@ -3884,6 +4073,7 @@ mod tests {
             state: state.into(),
             start_mode: "System".into(),
             service_type: "Kernel Driver".into(),
+            component_enabled: None,
         }
     }
 

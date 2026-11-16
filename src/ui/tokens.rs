@@ -218,7 +218,7 @@ pub mod layout {
     pub const RESULT_BUTTON_FOLDER: R = [425.0, 1011.0, 113.0, 40.0];
 
     /// v0.4.4: Start Diagnostics lives in the common header.
-    pub const START_BUTTON: R = [600.0, 50.0, 330.0, 40.0];
+    pub const START_BUTTON: R = [560.0, 50.0, 460.0, 40.0];
 
     // ---- Right column ----
     pub const OVERALL_CARD: R = [571.0, 121.0, 788.0, 245.0];

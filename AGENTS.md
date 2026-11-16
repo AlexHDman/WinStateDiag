@@ -1,4 +1,8 @@
-# WinStateDiag contributor instructions
-Preserve the existing diagnostic architecture and read-only defaults. Repair requires explicit user confirmation. Do not run repair, hardware stress or interactive desktop tests as incidental validation.
-Use fmt, check, clippy, Rust tests and PowerShell regression tests for scoped changes. Keep LIVE acceptance distinct from automated evidence.
-Publish only synthetic/anonymized fixtures. Never commit customer reports, local logs, credentials or generated binaries. Existing releases and user data must be preserved. No force push or history rewrite without explicit authorization.
+# WinStateDiag — Codex RC workspace
+
+Read `C:\AI\AGENTS.md` and `C:\AI\EXPC_DEVELOPMENT_PROTOCOL.md` before work.
+Maintain `docs/EXPC_CHECKPOINT.md` and `docs/PROJECT_REGISTRY.md`.
+Current developer/auditor roles and boundaries are in `docs/AGENT_HANDOVER.md`.
+Do not mistake historical test claims for current LIVE acceptance.
+Phase 01 permits one local checkpoint only: no push, PR, merge, tag or release.
+GUI tests are guest-only; never automate host input or stop an unowned Sandbox.

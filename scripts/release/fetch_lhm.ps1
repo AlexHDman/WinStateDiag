@@ -1,4 +1,4 @@
-# WinStateDiag - populate third_party\LibreHardwareMonitorLib-<ver>\ from
+﻿# WinStateDiag - populate third_party\LibreHardwareMonitorLib-<ver>\ from
 # the OFFICIAL nuget.org packages (LibreHardwareMonitorLib + its .NET
 # Framework dependencies), then verify every file against the pinned
 # hashes in scripts\release\lhm_bundle.sha256.

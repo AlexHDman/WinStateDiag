@@ -2,11 +2,11 @@
 $root=Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Test-V1210Regression.ps1')
 Load-Functions (Join-Path $root 'embedded/EXPC-Diagnostic/EXPC-Diagnostic.ps1') @('Get-PnpIssueClass')
-foreach($machine in @('CASE-A','CASE-B')){
- $raw=Get-Content -LiteralPath (Join-Path $PSScriptRoot "fixtures/v1.2.11/$machine-writers.txt") -Raw -Encoding UTF8
+foreach($machine in @('SYNTHETIC-A','SYNTHETIC-B')){
+ $raw=Get-Content -LiteralPath (Join-Path $PSScriptRoot "fixtures/repair-synthetic/$machine-writers.txt") -Raw -Encoding UTF8
  $r=ConvertFrom-VssWriters $raw 0
- if($machine -eq 'CASE-A'){Eq $r.Count 11 'CaseA synthetic count';Eq $r.Stable 11 'CaseA stable';Eq $r.Status OK 'CaseA parsed'}
- else {Eq $r.Count 10 'CaseB synthetic count';Eq $r.Waiting 2 'CaseB System and WMI waiting';Eq $r.Failed 0 'waiting not failed';Eq $r.Status WAITING 'CaseB parsed';Eq @($r.Writers|Where-Object {$_.Name -eq 'System Writer' -and $_.StateCode -eq 5 -and $_.State -eq 'WAITING'}).Count 1 'System Writer state 5'}
+ if($machine -eq 'SYNTHETIC-A'){Eq $r.Count 11 'synthetic A count';Eq $r.Stable 11 'synthetic A stable';Eq $r.Status OK 'synthetic A parsed'}
+ else {Eq $r.Count 10 'synthetic B count';Eq $r.Waiting 2 'synthetic B System and WMI waiting';Eq $r.Failed 0 'waiting not failed';Eq $r.Status WAITING 'synthetic B parsed';Eq @($r.Writers|Where-Object {$_.Name -eq 'System Writer' -and $_.StateCode -eq 5 -and $_.State -eq 'WAITING'}).Count 1 'System Writer state 5'}
  Eq $r.Coverage COMPLETE "$machine complete records"
  Eq @($r.Writers|Where-Object {!$_.WriterId -or !$_.InstanceId}).Count 0 "$machine GUIDs retained"
  $en=$raw.Replace('Имя компонента записи','Writer name').Replace('Id экземпляра компонента записи','Writer Instance Id').Replace('Id компонента записи','Writer Id').Replace('Состояние','State').Replace('Последняя ошибка','Last error').Replace('Нет ошибок','No error')

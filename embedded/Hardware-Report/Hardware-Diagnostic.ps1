@@ -83,6 +83,15 @@ function New-HardwareReportLines {
         $lines.Add('Note: SMBIOS may not reflect full physical topology (soldered/onboard RAM, incomplete SMBIOS). An unpopulated physical slot is not confirmed.')
     }
     foreach ($reason in @($Passport.Ram.Reasons)) { $lines.Add("Reason: $reason") }
+    if ($Passport.Ram.PSObject.Properties['Intelligence']) {
+        $ri=$Passport.Ram.Intelligence
+        $lines.Add("RAM configuration: $($ri.Status) / $($ri.Color)")
+        foreach($key in @('CurrentMTs','ProfileMTs','CpuOfficialMTs','BoardOfficialMTs','PreviousMTs')) { $value=$ri.$key; if($null -eq $value){$value='UNKNOWN'}; $lines.Add("${key}: $value") }
+        $lines.Add("SPD source: $($ri.SpdAvailability); XMP active: UNKNOWN; stability: NOT_TESTED")
+        if($null -ne $ri.TransferRateChangePercent){$lines.Add("Data rate change: $($ri.TransferRateChangePercent)%; performance change: NOT_MEASURED")}
+        $lines.Add("Sources: $($ri.Sources -join '; ')")
+        $lines.Add("Recommendation: $($ri.Recommendation)")
+    }
     foreach ($ctx in @($Passport.Ram.Context)) { $lines.Add("Context (INFO): $ctx") }
     foreach ($module in @($Passport.Ram.Modules)) { $lines.Add("- $($module.DeviceLocator): $($module.Manufacturer) $($module.PartNumber), $($module.Capacity) $($module.Type), rated $(Format-HardwareMemoryRate $module.RatedSpeedMHz), configured $(Format-HardwareMemoryRate $module.ConfiguredClockMHz) (SMBIOS-reported data rate, not measured)") }
     $lines.Add('')
@@ -442,6 +451,7 @@ Write-Host ''
 
 try {
     $passport = New-HardwarePassport
+    Update-HardwareRamHistory -Passport $passport -Directory (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "EXPC\WinStateDiag")
     if (-not (Test-Path -LiteralPath $OutputDirectory)) { [void](New-Item -ItemType Directory -Path $OutputDirectory -Force) }
     $allocation=Get-UniqueWinDiagReportBaseName -Prefix Hardware -RunStartedAt $runStarted -Directory $OutputDirectory -Extensions @('.txt','.json','.html')
     $baseName=$allocation.BaseName

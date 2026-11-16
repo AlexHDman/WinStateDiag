@@ -664,6 +664,16 @@ pub fn vss_category(e: &RawEvent) -> &'static str {
         match e.id {
             8193 | 8194 | 12289 | 12293 | 12298 | 13 => "vss_operation_failure",
             // VSS service shutting down after its idle timeout: normal.
+            8231 if e
+                .message
+                .to_lowercase()
+                .contains("snapshot creation initiated")
+                || (e.message.to_lowercase().contains("создани")
+                    && (e.message.to_lowercase().contains("начат")
+                        || e.message.to_lowercase().contains("иници"))) =>
+            {
+                "vss_snapshot_initiated"
+            }
             8224 => "vss_idle_shutdown",
             // VSS service stopped by the SCM shutdown event: normal.
             8225 => "vss_scm_shutdown",
@@ -1001,6 +1011,10 @@ pub fn aggregate(
         }
         let group = group_of(e);
         let (mut key, mut category) = key_of(group, e);
+        if e.provider == "WinStateDiag.HistoryCoverage" {
+            key = e.data.clone();
+            category = "collection_coverage".into();
+        }
         if group == Group::Vss && category == "vss_operation_failure" {
             if let Some(context) = confirmed_vss_shutdown(e, events) {
                 category = "vss_shutdown_context".into();
@@ -1335,6 +1349,7 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                     "ci_audit_only" | "ci_catalog_not_loaded" => FindingClass::Informational,
                     _ => FindingClass::Security,
                 };
+                title.push_str(" · блокировка загрузки не доказывает заражение; текущее состояние подписи и устройства проверяется отдельно в A5");
                 out.push(base(class, title));
             }
             Group::Tpm => {
@@ -1420,7 +1435,7 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                 out.push(base(
                     class,
                     format!(
-                        "Windows Update 20 — {}{}×{}",
+                        "Windows Update 20 — {}{}×{} · {} · {} · текущие драйвер/PnP: отдельная проверка A5",
                         if kb.is_empty() {
                             String::new()
                         } else {
@@ -1430,7 +1445,9 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                         match key_val(a, "HRESULT") {
                             "" => String::new(),
                             h => format!(" · {h}"),
-                        }
+                        },
+                        key_val(a, "Title"),
+                        if a.wu_resolved == Some(true) {"последующая установка того же обновления подтверждена"} else {"последующая установка того же обновления не подтверждена"}
                     ),
                 ));
             }
@@ -1443,7 +1460,7 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                         FindingClass::Historical,
                         "ошибка VSS с shutdown-текстом без независимого подтверждения; причина и результат backup не установлены; ошибка сохранена",
                     ),
-                    "vss_operation_failure" if a.count >= RECURRENCE_MIN => (
+                    "vss_operation_failure" if a.count_last_7_days >= RECURRENCE_MIN => (
                         FindingClass::SoftwareRecurring,
                         "подтверждённая операционная ошибка VSS",
                     ),
@@ -1478,6 +1495,10 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                     "restore_point_eviction_quota" => (
                         FindingClass::Informational,
                         "старая теневая копия удалена по квоте — штатно",
+                    ),
+                    "vss_snapshot_initiated" => (
+                        FindingClass::Informational,
+                        "начато создание снимка; завершение не подтверждено этим событием",
                     ),
                     "vss_idle_shutdown" => (
                         FindingClass::Informational,
@@ -1572,7 +1593,7 @@ pub fn raw_json(events: &[RawEvent]) -> String {
 /// Evidence JSON (`Event_Evidence_<stamp>.json`).
 pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &str) -> String {
     let items: Vec<String> = aggs
-        .iter()
+        .iter().filter(|a|a.provider!="WinStateDiag.HistoryCoverage")
         .map(|a| {
             let key: Vec<String> = a
                 .key
@@ -1626,12 +1647,14 @@ pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &s
             )
         })
         .collect();
-    format!(
+    let base = format!(
         "{{\n  \"format\": \"winstatediag.event_evidence/1\",\n  \"status\": {},\n  \"collected_at\": {},\n  \"window_days\": {WINDOW_DAYS},\n  \"scope\": {},\n  \"principle\": \"Event count alone does not determine severity; every counter is verifiable here.\",\n  \"windows_update_failure_historical\": {},\n  \"actionable_groups\": [\n{}\n  ],\n  \"aggregate_count\": {},\n  \"aggregates\": [\n{}\n  ]\n}}\n",
         json::string(
             if aggs
                 .iter()
-                .any(|a| a.provider == "WinStateDiag.CollectionError")
+                .any(|a| a.provider == "WinStateDiag.CollectionError"
+                    || (a.provider == "WinStateDiag.HistoryCoverage"
+                        && a.latest.iter().any(|m| m.contains("\"Complete\":false"))))
             {
                 "PARTIAL"
             } else {
@@ -1645,8 +1668,23 @@ pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &s
             None => "null".into(),
         },
         groups.join(",\n"),
-        aggs.len(),
+        aggs.iter()
+            .filter(|a| a.provider != "WinStateDiag.HistoryCoverage")
+            .count(),
         items.join(",\n")
+    );
+    let coverage = aggs
+        .iter()
+        .filter(|a| a.provider == "WinStateDiag.HistoryCoverage")
+        .flat_map(|a| &a.latest)
+        .map(|s| json::string(s))
+        .collect::<Vec<_>>()
+        .join(",");
+    let base = base.trim_end();
+    format!(
+        "{},\"history_coverage\":[{}],\"absence_proves_resolution\":false}}\n",
+        &base[..base.len() - 1],
+        coverage
     )
 }
 
@@ -1678,10 +1716,18 @@ $queries = @(
     @{ LogName = 'Application'; ProviderName = '.NET Runtime'; Id = 1026 }
 )
 $svcNames = New-Object System.Collections.Generic.HashSet[string]
+$logRanges=@{}
+foreach($log in @($queries|ForEach-Object {$_.LogName}|Sort-Object -Unique)){
+    try{$old=Get-WinEvent -LogName $log -Oldest -MaxEvents 1 -ErrorAction Stop;$logRanges[$log]=$old.TimeCreated}catch{$logRanges[$log]=$null}
+}
 foreach ($q in $queries) {
     $q.StartTime = $since
+    $queryOk=$true
     try { $queried=@(Get-WinEvent -FilterHashtable $q -MaxEvents 1500 -ErrorAction Stop) }
-    catch { if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { 'WSD_EV_ERROR ' + $q.ProviderName + ': ' + $_.Exception.Message }; $queried=@() }
+    catch { if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { $queryOk=$false; 'WSD_EV_ERROR ' + $q.ProviderName + ': ' + $_.Exception.Message }; $queried=@() }
+    $oldest=$logRanges[$q.LogName]
+    $coverage=[ordered]@{Log=$q.LogName;Provider=$q.ProviderName;RequestedFrom=$since.ToString('s');RequestedTo=(Get-Date).ToString('s');OldestAvailable=$(if($oldest){$oldest.ToString('s')}else{$null});FirstReturned=$(if($queried.Count){($queried|Sort-Object TimeCreated|Select-Object -First 1).TimeCreated.ToString('s')}else{$null});LastReturned=$(if($queried.Count){$queried[0].TimeCreated.ToString('s')}else{$null});Returned=$queried.Count;QuerySucceeded=$queryOk;PossiblyTruncated=($queried.Count -ge 1500);Complete=($queryOk -and $null -ne $oldest -and $oldest -le $since -and $queried.Count -lt 1500);AbsenceDoesNotProveResolution=$true}
+    'WSD_EV '+([ordered]@{log='Coverage';p='WinStateDiag.HistoryCoverage';id=0;t=(Get-Date).ToString('s');lvl=4;corr='';m=($coverage|ConvertTo-Json -Compress);d=@([pscustomobject]@{k='Query';v=($q.LogName+'/'+$q.ProviderName)})}|ConvertTo-Json -Compress -Depth 5)
     foreach ($e in $queried) {
         $data = @()
         try {
@@ -1961,6 +2007,39 @@ mod tests {
     }
 
     /// Collection time of the test fixtures.
+    #[test]
+    fn v1214_vss_initiation_is_context_not_snapshot_success() {
+        let e = ev(
+            "VSS",
+            8231,
+            "2026-10-04T12:00:00",
+            "Snapshot creation initiated for Snapshot Set {synthetic}",
+            &[],
+        );
+        assert_eq!(vss_category(&e), "vss_snapshot_initiated");
+        let a = aggregate(&[e], &[], NOW);
+        assert_eq!(actionable(&a)[0].class, FindingClass::Informational);
+        assert!(
+            actionable(&a)[0]
+                .title
+                .contains("завершение не подтверждено")
+        );
+    }
+
+    #[test]
+    fn v1212_old_vss_recurrence_is_historical_but_recent_failures_survive() {
+        for (time, expected) in [
+            ("2026-09-12T12:00:00", FindingClass::Historical),
+            ("2026-10-04T12:00:00", FindingClass::SoftwareRecurring),
+        ] {
+            let events = vec![ev("VSS", 8193, time, "backup failed access denied", &[]); 4];
+            let a = aggregate(&events, &[], NOW);
+            assert_eq!(actionable(&a)[0].class, expected);
+            assert_eq!(a[0].count, 4);
+            assert!(to_json(&a, None, NOW).contains("8193"));
+        }
+    }
+
     const NOW: &str = "2026-10-06T10:00:00";
 
     fn ev(provider: &str, id: u32, time: &str, message: &str, data: &[(&str, &str)]) -> RawEvent {

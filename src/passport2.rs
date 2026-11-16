@@ -17,6 +17,7 @@ pub enum Kind {
     Config,
     Measured,
     Unconfirmed,
+    Attention,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -384,7 +385,6 @@ pub fn build(text: &str, t: &Texts<'_>) -> Option<Passport> {
                 .map(bytes_text),
             text_of(m.get("Type")).filter(|s| !is_unconfirmed(s)),
             num_of(m.get("ConfiguredSpeedMTs"))
-                .or_else(|| num_of(m.get("RatedSpeedMTs")))
                 .filter(|n| *n > 0.0)
                 .map(|n| format!("{} MT/s", num_text(n))),
             text_of(m.get("Manufacturer")).filter(|s| !is_unconfirmed(s)),
@@ -408,7 +408,6 @@ pub fn build(text: &str, t: &Texts<'_>) -> Option<Passport> {
         .iter()
         .filter_map(|m| {
             num_of(m.get("ConfiguredSpeedMTs"))
-                .or_else(|| num_of(m.get("RatedSpeedMTs")))
                 .filter(|n| *n > 0.0)
                 .map(|n| format!("{} MT/s", num_text(n)))
         })
@@ -416,6 +415,59 @@ pub fn build(text: &str, t: &Texts<'_>) -> Option<Passport> {
     speeds.dedup();
     if !speeds.is_empty() {
         rows.insert(2, plain(d.pp_speed, speeds.join(" / "), Kind::Config));
+    }
+    if let Some(i) = get(&v, &["Ram", "Intelligence"]) {
+        let attention = text_of(i.get("Status")).as_deref() == Some("ATTENTION");
+        let kind = if attention {
+            Kind::Attention
+        } else {
+            Kind::Config
+        };
+        rows.push(plain(
+            "Настройка RAM",
+            text_of(i.get("Recommendation")).unwrap_or_else(|| "Нет данных".into()),
+            kind,
+        ));
+        for (key, label) in [
+            ("CurrentMTs", "Текущая скорость (SMBIOS)"),
+            ("ProfileMTs", "Профиль SPD/XMP"),
+            ("CpuOfficialMTs", "Официальный лимит CPU"),
+            ("BoardOfficialMTs", "Плата: без разгона"),
+            ("PreviousMTs", "Предыдущая сессия"),
+        ] {
+            rows.push(b.config(
+                ram_title,
+                label,
+                num_of(i.get(key)).map(|n| format!("{} MT/s", num_text(n))),
+            ));
+        }
+        rows.push(plain(
+            "Активность XMP / стабильность",
+            "Не определена / не проверялась".into(),
+            Kind::Unconfirmed,
+        ));
+        if let Some(change) = num_of(i.get("TransferRateChangePercent")) {
+            rows.push(plain(
+                "Изменение MT/s",
+                format!("{change:+.1}% · изменение производительности не измерено"),
+                Kind::Config,
+            ));
+        }
+        for note in list_of(i.get("Notes")) {
+            if let Some(note) = text_of(Some(note)) {
+                rows.push(plain("", note, kind));
+            }
+        }
+        rows.push(plain(
+            "Источник SPD",
+            if text_of(i.get("SpdAvailability")).as_deref() == Some("IMPORTED") {
+                "Импортированный DDR4 SPD; совпадение серийного номера и Part Number"
+            } else {
+                "Недоступен; XMP не определён"
+            }
+            .into(),
+            Kind::Unconfirmed,
+        ));
     }
     for note in list_of(get(&v, &["Ram", "Context"])) {
         if let Some(n) = text_of(Some(note)) {
@@ -696,6 +748,7 @@ pub fn summary_text(p: &Passport, d: &crate::i18n::Dict) -> String {
             let mark = match r.kind {
                 Kind::Config => "",
                 Kind::Measured => " *",
+                Kind::Attention => " !",
                 Kind::Unconfirmed => " ?",
             };
             match (r.label.is_empty(), r.value.is_empty()) {
@@ -719,12 +772,12 @@ pub fn summary_text(p: &Passport, d: &crate::i18n::Dict) -> String {
     out
 }
 
-/// v1.1 QA fixture: anonymized hardware collector example (serials / MAC
+/// v1.1 QA fixture: sanitized real MSI collector output (serials / MAC
 /// replaced) for the `hardware-passport` scene and the tests.
 pub(crate) const QA_PASSPORT_JSON: &str = r#"{
   "Tool": "EXPC Hardware Diagnostics", "SchemaVersion": 1,
   "GeneratedAt": "2026-10-13T13:06:12.0075273+03:00", "ReadOnly": true, "OverallState": "OK",
-  "System": {"Manufacturer": "Micro-Star International Co., Ltd.", "Model": "MS-7E34", "Hostname": "QA-PC",
+  "System": {"Manufacturer": "Micro-Star International Co., Ltd.", "Model": "MS-7E34", "Hostname": "MSI",
              "SystemType": "x64-based PC", "WindowsEdition": "Microsoft Windows 11 Pro", "WindowsBuild": "26300",
              "WindowsArchitecture": "64-bit", "ProductId": "Default string"},
   "Motherboard": {"Manufacturer": "Micro-Star International Co., Ltd.", "Product": "PRO Z890-P WIFI (MS-7E34)", "Version": "1.0", "Serial": "SERIAL"},

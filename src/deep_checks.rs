@@ -276,8 +276,21 @@ pub fn chkdsk_finding(text: &str) -> Option<ChkdskFinding> {
 
 /// SFC semantic result shared by all Rust consumers; parity fixtures cover PowerShell.
 pub fn sfc_semantic_result(text: &str, cbs_violation: bool, exit: Option<i32>) -> &'static str {
-    let normalized = text
+    // This parser accepts console output, never historical timestamped CBS records.
+    let console = text
         .replace('\0', "")
+        .lines()
+        .filter(|line| {
+            let b = line.trim_start().as_bytes();
+            !(b.len() > 19
+                && b[0..4].iter().all(u8::is_ascii_digit)
+                && b[4] == b'-'
+                && b[7] == b'-'
+                && b[13] == b':')
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = console
         .replace('ё', "е")
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -286,12 +299,9 @@ pub fn sfc_semantic_result(text: &str, cbs_violation: bool, exit: Option<i32>) -
     if has(
         text,
         &[
-            "system repair pending",
-            "ожидается восстановление системы",
+            "there is a system repair pending which requires reboot to complete",
             "восстановление системы, для завершения которого требуется перезагрузка",
-            "ожидающее восстановления",
             "требуется перезагрузка для завершения восстановления",
-            "требуется перезагрузка",
         ],
     ) {
         "REBOOT_PENDING"
@@ -314,44 +324,65 @@ pub fn sfc_semantic_result(text: &str, cbs_violation: bool, exit: Option<i32>) -
         ],
     ) {
         "ERROR"
-    } else if cbs_violation
-        || has(
+    } else if exit.is_some_and(|n| n != 0) {
+        "ERROR"
+    } else {
+        let clean = has(
+            text,
+            &[
+                "did not find any integrity violations",
+                "не обнаружила нарушений целостности",
+                "нарушений целостности не обнаружила",
+            ],
+        );
+        let bad = has(
             text,
             &[
                 "found integrity violations",
                 "found corrupt files",
                 "обнаружила нарушения целостности",
                 "обнаружила поврежденные файлы",
-                "обнаружила повреждённые файлы",
             ],
-        )
-    {
-        "INTEGRITY_VIOLATIONS"
-    } else if exit.is_some_and(|n| n != 0) {
-        "ERROR"
-    } else if has(
-        text,
-        &[
-            "did not find any integrity violations",
-            "не обнаружила нарушений целостности",
-            "нарушений целостности не обнаружила",
-        ],
-    ) {
-        "CLEAN"
-    } else {
-        "UNKNOWN"
+        );
+        if clean && (bad || cbs_violation) {
+            "UNKNOWN"
+        } else if bad || cbs_violation {
+            "INTEGRITY_VIOLATIONS"
+        } else if clean {
+            "CLEAN"
+        } else {
+            "UNKNOWN"
+        }
     }
 }
 
+/// Public SFC evidence classification; legacy semantic codes remain readable.
+pub fn sfc_classification(
+    text: &str,
+    cbs: bool,
+    exit: Option<i32>,
+    completed: bool,
+) -> &'static str {
+    if !completed {
+        return "INCOMPLETE";
+    }
+    match sfc_semantic_result(text, cbs, exit) {
+        "CLEAN" => "PASS",
+        "INTEGRITY_VIOLATIONS" => "ATTENTION",
+        "ERROR" | "SERVICE_ERROR" => "EXECUTION_FAILED",
+        "REBOOT_PENDING" => "INCOMPLETE",
+        _ => "UNKNOWN",
+    }
+}
 /// Classifies the console output of a deep check. Only explicit, known
 /// result sentences decide OK / ATTENTION; a failed execution is ERROR;
 /// anything ambiguous is UNKNOWN (never an inferred fault).
 pub fn classify_output(check: DeepCheck, text: &str, exit_code: Option<i32>) -> CheckResult {
     match check {
-        DeepCheck::Sfc => match sfc_semantic_result(text, false, exit_code) {
-            "CLEAN" => CheckResult::Ok,
-            "REBOOT_PENDING" | "INTEGRITY_VIOLATIONS" => CheckResult::Attention,
-            "SERVICE_ERROR" | "ERROR" => CheckResult::Error,
+        DeepCheck::Sfc => match sfc_classification(text, false, exit_code, true) {
+            "PASS" => CheckResult::Ok,
+            "INCOMPLETE" | "ATTENTION" => CheckResult::Attention,
+            "EXECUTION_FAILED" => CheckResult::Error,
             _ => CheckResult::Unknown,
         },
         DeepCheck::Dism => {
@@ -1361,5 +1392,84 @@ mod tests {
         let c = ps.find("} elseif ($problem) {").expect("problem branch");
         assert!(a < b && b < c);
         assert!(ps.contains("FindingClass=REPAIRED"));
+    }
+}
+
+#[cfg(test)]
+mod v1212_sfc_tests {
+    use super::*;
+    #[test]
+    fn v1212_json_txt_and_summary_agree_for_pending_and_service_error() {
+        for (status, expected) in [
+            ("REBOOT_PENDING", CheckResult::Attention),
+            ("SERVICE_ERROR", CheckResult::Error),
+            ("OK", CheckResult::Ok),
+        ] {
+            let json = format!(
+                "{{\"Checks\":[{{\"Check\":\"SFC\",\"Status\":\"{status}\",\"Detail\":\"evidence\"}}]}}"
+            );
+            let txt = format!("[11] SFC — /verifyonly\nResult: {status} — evidence\n[12] DISM\n");
+            assert_eq!(from_expc_json(json.as_bytes())[0].result, expected);
+            assert_eq!(from_expc_txt(txt.as_bytes())[0].result, expected);
+            let checks = expc_checks_from_json(json.as_bytes());
+            let a = crate::diag_state::aggregate("OK", &checks);
+            if status == "REBOOT_PENDING" {
+                assert_eq!(a.code, "ATTENTION_DIAG");
+                assert_eq!(
+                    crate::diag_state::coverage_status(&a.code, "OK", &a.reasons),
+                    "LIMITED"
+                );
+                assert_eq!(
+                    crate::diag_state::execution_status(&a.code, "OK", &a.reasons),
+                    "COMPLETED"
+                );
+            }
+        }
+    }
+    #[test]
+    fn sfc_pending_requires_current_explicit_result() {
+        for (text, expected) in [
+            ("Требуется перезагрузка: нет", "UNKNOWN"),
+            (
+                "Windows Resource Protection did not find any integrity violations.\n2026-10-01 12:00:00, Info CBS There is a system repair pending which requires reboot to complete.",
+                "CLEAN",
+            ),
+            (
+                "2026-10-01 12:00:00, Info CBS There is a system repair pending which requires reboot to complete.",
+                "UNKNOWN",
+            ),
+            (
+                "There is a system repair pending which requires reboot to complete. Restart Windows and run sfc again.",
+                "REBOOT_PENDING",
+            ),
+            (
+                "Выполняется восстановление системы, для завершения которого требуется перезагрузка.",
+                "REBOOT_PENDING",
+            ),
+            (
+                "Windows Resource Protection found corrupt files but was unable to fix some of them.\nДля восстановления требуется перезагрузка.",
+                "INTEGRITY_VIOLATIONS",
+            ),
+        ] {
+            assert_eq!(
+                sfc_semantic_result(text, false, Some(0)),
+                expected,
+                "{text}"
+            );
+        }
+    }
+    #[test]
+    fn sfc_current_corruption_and_execution_failure_are_preserved() {
+        let clean = "Windows Resource Protection did not find any integrity violations.";
+        assert_eq!(sfc_semantic_result(clean, true, Some(0)), "UNKNOWN");
+        assert_eq!(sfc_semantic_result(clean, false, Some(5)), "ERROR");
+        assert_eq!(
+            classify_output(
+                DeepCheck::Sfc,
+                "Windows Resource Protection could not perform the requested operation.",
+                Some(0)
+            ),
+            CheckResult::Error
+        );
     }
 }

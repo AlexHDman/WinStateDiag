@@ -460,6 +460,7 @@ pub(crate) enum PassportAct {
 pub(crate) fn passport_value_color(kind: crate::passport2::Kind) -> egui::Color32 {
     match kind {
         crate::passport2::Kind::Config => c::TEXT_PRIMARY,
+        crate::passport2::Kind::Attention => c::YELLOW_WARNING,
         // v1.1 UI contract: a measurement is not a health verdict.
         crate::passport2::Kind::Measured => c::PASSPORT_MEASURED,
         crate::passport2::Kind::Unconfirmed => c::TEXT_MUTED,

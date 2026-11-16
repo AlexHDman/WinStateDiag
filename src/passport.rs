@@ -15,6 +15,7 @@ pub struct Passport {
     pub board: String,
     /// v1.0: `Win32_BIOS.SMBIOSBIOSVersion` (+ release date when reported).
     pub bios: String,
+    pub bios_identity: crate::bios::Identity,
     /// v1.0 item 34: on-board (soldered) LPDDR — the number of SMBIOS
     /// memory devices (channels/packages), never shown as "N×module".
     pub ram_onboard_devices: Option<usize>,
@@ -23,8 +24,13 @@ pub struct Passport {
 impl Passport {
     /// Compact UI only; `bios` retains the original vendor for Details/export.
     pub fn bios_display(&self) -> String {
-        let raw = self.bios.trim();
-        for vendor in [
+        if !self.bios_identity.version.is_empty() || !self.bios_identity.date.is_empty() {
+            return self
+                .bios_identity
+                .display(crate::bios::confirmed_public(&self.bios_identity).as_deref());
+        }
+        let mut raw = self.bios.trim();
+        for maker in [
             "American Megatrends International, LLC.",
             "American Megatrends International LLC.",
             "American Megatrends International, LLC",
@@ -33,18 +39,25 @@ impl Passport {
             "American Megatrends",
             "AMI",
         ] {
-            if let Some(version) = raw.strip_prefix(vendor)
-                && (version.is_empty() || version.starts_with(char::is_whitespace))
+            if let Some(v) = raw.strip_prefix(maker)
+                && (v.is_empty() || v.starts_with(char::is_whitespace))
             {
-                let version = version.trim().split(" (").next().unwrap_or("").trim();
-                return if version.is_empty() {
-                    "AMI".into()
-                } else {
-                    format!("AMI {version}")
-                };
+                raw = v.trim();
+                break;
             }
         }
-        self.bios.clone()
+        let mut id = crate::bios::Identity {
+            version: raw.into(),
+            ..Default::default()
+        };
+        if let Some((v, date)) = raw.rsplit_once(" (")
+            && let Some(date) = date.strip_suffix(')')
+            && crate::bios::date_display(date).is_some()
+        {
+            id.version = v.into();
+            id.date = date.into();
+        }
+        id.display(None)
     }
     /// RAM line with the localised on-board LPDDR topology suffix.
     pub fn ram_text(&self, ru: bool) -> String {
@@ -67,8 +80,13 @@ $cpu = @(Get-CimInstance Win32_Processor -OperationTimeoutSec 3)
 $mem = @(Get-CimInstance Win32_PhysicalMemory -OperationTimeoutSec 3)
 $bb = Get-CimInstance Win32_BaseBoard -OperationTimeoutSec 3
 $bios = Get-CimInstance Win32_BIOS -OperationTimeoutSec 3 | Select-Object -First 1
+$cs = Get-CimInstance Win32_ComputerSystem -OperationTimeoutSec 3 | Select-Object -First 1
 $biosDate = ''
-try { if ($bios.ReleaseDate) { $biosDate = ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } } catch { }
+# Raw DMTF keeps the BIOS calendar date; never round-trip through local/UTC time.
+try { $biosDate = [string](Get-WmiObject Win32_BIOS -ErrorAction Stop | Select-Object -First 1).ReleaseDate } catch { }
+if (!$biosDate) { try { $biosDate = [string](Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS' -ErrorAction Stop).BIOSReleaseDate } catch { } }
+$biosFull = (@([string]$bios.Version) + @($bios.BIOSVersion) | Where-Object { $_ }) -join ' | '
+
 $mods = New-Object System.Collections.Generic.List[object]
 foreach ($m in $mem) {
   $mods.Add([ordered]@{
@@ -89,6 +107,12 @@ $o = [ordered]@{
   threads = [int](($cpu | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
   mem = $mods.ToArray()
   total = [double]$os.TotalVisibleMemorySize
+  system_maker = [string]$cs.Manufacturer
+  system_model = [string]$cs.Model
+  system_sku = [string]$cs.SystemSKUNumber
+  mobile = ([int]$cs.PCSystemType -eq 2)
+  board_revision = [string]$bb.Version
+  bios_full = $biosFull
   board_maker = [string]$bb.Manufacturer
   board = [string]$bb.Product
   bios = [string]$bios.SMBIOSBIOSVersion
@@ -306,6 +330,7 @@ pub fn parse_output(stdout: &str) -> Option<Passport> {
         board,
         bios,
         ram_onboard_devices,
+        bios_identity: crate::bios::Identity::from_passport(&v),
     })
 }
 
@@ -347,13 +372,13 @@ mod tests {
             bios: raw.into(),
             ..Default::default()
         };
-        assert_eq!(p.bios_display(), "AMI 1.23");
+        assert_eq!(p.bios_display(), "1.23 (02.01.2026)");
         assert_eq!(p.bios, raw);
         let other = Passport {
             bios: "LENOVO 1.5".into(),
             ..Default::default()
         };
-        assert_eq!(other.bios_display(), other.bios);
+        assert_eq!(other.bios_display(), "LENOVO 1.5 (дата неизвестна)");
         for vendor in [
             "American Megatrends International, LLC.",
             "American Megatrends International, LLC",
@@ -366,7 +391,7 @@ mod tests {
                 bios: raw.clone(),
                 ..Default::default()
             };
-            assert_eq!(p.bios_display(), "AMI 1.AE0");
+            assert_eq!(p.bios_display(), "1.AE0 (24.06.2026)");
             assert_eq!(p.bios, raw);
         }
     }
@@ -381,7 +406,7 @@ mod tests {
         assert_eq!(partial.bios, "(2026-01-02)");
         assert!(partial.cpu.is_empty() && partial.ram.is_empty());
         assert_eq!(COLLECT_TIMEOUT, std::time::Duration::from_secs(20));
-        assert_eq!(COLLECTOR_PS1.matches("-OperationTimeoutSec 3").count(), 5);
+        assert_eq!(COLLECTOR_PS1.matches("-OperationTimeoutSec 3").count(), 6);
     }
 
     #[test]
@@ -508,8 +533,8 @@ WSD_PASSPORT {"caption":"Microsoft Windows 11 Pro","display":"25H2","build":"262
     #[test]
     fn client_copy_text() {
         assert_eq!(
-            client_clipboard_text("Клиент", "MSI", true),
-            "Клиент: Клиент\nКомпьютер: MSI"
+            client_clipboard_text("Алексей", "MSI", true),
+            "Клиент: Алексей\nКомпьютер: MSI"
         );
         assert_eq!(
             client_clipboard_text("  ", "MSI", true),

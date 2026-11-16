@@ -770,7 +770,7 @@ pub struct Dict {
 }
 
 pub static RU: Dict = Dict {
-    app_title: "WinStateDiag",
+    app_title: "WinDiag",
     header_subtitle: "Диагностический центр состояния Windows",
 
     client_label: "Клиент",
@@ -1053,7 +1053,7 @@ pub static RU: Dict = Dict {
     sensors_col_conf: "Достоверность",
     sensors_col_device: "Устройство",
     sensors_col_status: "Статус",
-    sensors_session_note: "* Мин/Макс — значения выборки WinStateDiag (около 10 с, без нагрузки), а не за всё время работы оборудования.",
+    sensors_session_note: "* Мин/Макс — значения выборки WinDiag (около 10 с, без нагрузки), а не за всё время работы оборудования.",
     sensors_mismatch: "РАСХОЖДЕНИЕ ИСТОЧНИКОВ",
     sensors_dynamic_note: "Динамические напряжения (Vcore, VID, VCCSA, GPU) — справочно, без оценки по номиналу.",
     sensors_lbl_cpu: "CPU",
@@ -1166,7 +1166,7 @@ pub static RU: Dict = Dict {
     nvme_error_log: "Журнал ошибок контроллера",
     nvme_error_log_read_fmt: "прочитано записей: {n}",
     ssd_retest_note_fmt: "Контрольный повтор: 1-й замер {first}",
-    ssd_retest_waiting_fmt: "Повтор через {s} с",
+    ssd_retest_waiting_fmt: "Повтор через {s} сек",
     ssd_retest_pending: "выполняется",
     ssd_retest_not_run: "не выполнен",
     ssd_runs_note_fmt: "1-й {first}, повтор {second}",
@@ -1182,7 +1182,7 @@ pub static RU: Dict = Dict {
     driver_popup_retry: "Повторить проверку",
     driver_popup_run: "Запустить проверку",
     driver_popup_rerun: "Проверить заново",
-    driver_popup_summary_fmt: "Итог: {status} — проблем: {problems}, предупреждений: {warnings}, без замечаний: {ok}; устройств: {devices}; события за {days} дн.; {generated}",
+    driver_popup_summary_fmt: "Итог: {status} — записи устройств: проблем {problems}, предупреждений {warnings}, без замечаний {ok}; устройств: {devices}; события за {days} дн.; {generated}",
     driver_popup_note: "Статус ставится только по конкретным признакам (ошибка PnP, сбой в модуле драйвера, Code Integrity, отказ загрузки). Возраст драйвера сам по себе не считается проблемой.",
     driver_popup_device_fmt: "Устройство: {device}",
     driver_popup_provider_fmt: "Поставщик драйвера: {provider}; дата: {date}; INF: {inf}; служба: {service}",
@@ -1198,7 +1198,7 @@ pub static RU: Dict = Dict {
     report_not_ready_error: "Итоговый отчёт ещё не создан.",
     hw_journal_saved: "сохранён в отчёт сессии",
     hw_journal_refreshed: "обновлён в отчёте сессии",
-    driver_journal_summary_fmt: "Проверка драйверов: {status} (проблем: {problems}, предупреждений: {warnings})",
+    driver_journal_summary_fmt: "Проверка драйверов: {status} (записи устройств: проблем {problems}, предупреждений {warnings})",
     driver_journal_added_fmt: "Проверка драйверов: данные добавлены в отчёт сессии ({path}).",
     client_field_hint: "необязательно",
     ssd_cancel_button: "Отменить",
@@ -1217,8 +1217,8 @@ pub static RU: Dict = Dict {
     journal_clear_button: "Очистить",
     journal_empty: "Журнал пуст.",
     journal_open_button: "Открыть",
-    journal_report_button: "Отчёт",
-    journal_viewer_title: "Журнал WinStateDiag",
+    journal_report_button: "Отчёт для ИИ",
+    journal_viewer_title: "Журнал WinDiag",
     journal_viewer_save: "Сохранить",
     journal_viewer_copy: "Копировать",
     journal_viewer_close: "Закрыть",
@@ -1227,8 +1227,8 @@ pub static RU: Dict = Dict {
     journal_viewer_copied: "Журнал скопирован в буфер обмена",
     journal_viewer_dropped_fmt: "Более ранние строки не сохранены (ограничение памяти): {count}",
     driver_summary_title: "ИТОГ",
-    driver_sum_problems: "Проблем",
-    driver_sum_warnings: "Предупреждений",
+    driver_sum_problems: "Проблем устройств",
+    driver_sum_warnings: "Предупр. устройств",
     driver_sum_ok: "Проверено без замечаний",
     driver_sum_devices: "Устройств",
     driver_sum_events: "Событий всего",
@@ -1239,7 +1239,7 @@ pub static RU: Dict = Dict {
     driver_copy_issues: "Скопировать ошибки",
     driver_save_issues: "Сохранить ошибки",
     driver_issues_none: "Проблем и предупреждений нет.",
-    driver_export_title: "WinStateDiag — Проверка драйверов",
+    driver_export_title: "WinDiag — Проверка драйверов",
     driver_export_version: "Версия",
     driver_export_provider: "Поставщик",
     driver_export_date: "Дата драйвера",
@@ -1343,7 +1343,7 @@ pub static RU: Dict = Dict {
     ],
     expc_result_label: "Результат",
     expc_suggested_action: "Рекомендуемое действие",
-    expc_not_executed: "WinStateDiag не выполняет эту команду автоматически.",
+    expc_not_executed: "WinDiag не выполняет эту команду автоматически.",
     expc_copy_command: "Копировать команду",
     expc_result_pending: "Этап выполнен; результат появится после завершения диагностики EXPC.",
     expc_no_structured: "Этап выполнен; подробности — в текстовом отчёте EXPC.",
@@ -1372,7 +1372,7 @@ pub static RU: Dict = Dict {
             "CHKDSK: проверка пропущена.",
         ],
     ],
-    deep_check_manual_command_fmt: "{check}: команда для ручного выполнения (WinStateDiag её не запускает): {command}",
+    deep_check_manual_command_fmt: "{check}: команда для ручного выполнения (WinDiag её не запускает): {command}",
     journal_report_finalized: "Отчёт проверен: в папке отчёта оставлен только итоговый ZIP.",
     journal_report_finalize_failed_fmt: "Файлы отчёта сохранены без очистки: {error}",
 
@@ -1511,7 +1511,7 @@ pub static RU: Dict = Dict {
 };
 
 pub static EN: Dict = Dict {
-    app_title: "WinStateDiag",
+    app_title: "WinDiag",
     header_subtitle: "Windows System Diagnostics Center",
 
     client_label: "Client",
@@ -1794,7 +1794,7 @@ pub static EN: Dict = Dict {
     sensors_col_conf: "Confidence",
     sensors_col_device: "Device",
     sensors_col_status: "Status",
-    sensors_session_note: "* Min/Max are WinStateDiag session sample values (about 10 s, no load applied), not lifetime hardware values.",
+    sensors_session_note: "* Min/Max are WinDiag session sample values (about 10 s, no load applied), not lifetime hardware values.",
     sensors_mismatch: "SENSOR SOURCE MISMATCH",
     sensors_dynamic_note: "Dynamic voltages (Vcore, VID, VCCSA, GPU) are informational and not rated against a nominal.",
     sensors_lbl_cpu: "CPU",
@@ -1958,8 +1958,8 @@ pub static EN: Dict = Dict {
     journal_clear_button: "Clear",
     journal_empty: "Log is empty.",
     journal_open_button: "Open",
-    journal_report_button: "Report",
-    journal_viewer_title: "WinStateDiag Log",
+    journal_report_button: "AI report",
+    journal_viewer_title: "WinDiag Log",
     journal_viewer_save: "Save",
     journal_viewer_copy: "Copy",
     journal_viewer_close: "Close",
@@ -1980,7 +1980,7 @@ pub static EN: Dict = Dict {
     driver_copy_issues: "Copy issues",
     driver_save_issues: "Save issues",
     driver_issues_none: "No problems or warnings.",
-    driver_export_title: "WinStateDiag — Driver Check",
+    driver_export_title: "WinDiag — Driver Check",
     driver_export_version: "Version",
     driver_export_provider: "Provider",
     driver_export_date: "Driver date",
@@ -2084,7 +2084,7 @@ pub static EN: Dict = Dict {
     ],
     expc_result_label: "Result",
     expc_suggested_action: "Suggested action",
-    expc_not_executed: "WinStateDiag does not run this command automatically.",
+    expc_not_executed: "WinDiag does not run this command automatically.",
     expc_copy_command: "Copy command",
     expc_result_pending: "Stage completed; the result appears when EXPC diagnostics finish.",
     expc_no_structured: "Stage completed; details are in the EXPC TXT report.",
@@ -2113,7 +2113,7 @@ pub static EN: Dict = Dict {
             "CHKDSK: check skipped.",
         ],
     ],
-    deep_check_manual_command_fmt: "{check}: command for manual use (WinStateDiag does not run it): {command}",
+    deep_check_manual_command_fmt: "{check}: command for manual use (WinDiag does not run it): {command}",
     journal_report_finalized: "Report verified: only the final ZIP remains in the report folder.",
     journal_report_finalize_failed_fmt: "Report files kept without cleanup: {error}",
 
@@ -2299,7 +2299,7 @@ mod tests {
 
     #[test]
     fn approved_russian_header_strings_match_exactly() {
-        assert_eq!(RU.app_title, "WinStateDiag");
+        assert_eq!(RU.app_title, "WinDiag");
         assert_eq!(
             RU.header_subtitle,
             "Диагностический центр состояния Windows"
@@ -2308,7 +2308,7 @@ mod tests {
 
     #[test]
     fn approved_english_header_strings_match_exactly() {
-        assert_eq!(EN.app_title, "WinStateDiag");
+        assert_eq!(EN.app_title, "WinDiag");
         assert_eq!(EN.header_subtitle, "Windows System Diagnostics Center");
     }
 
@@ -2522,7 +2522,7 @@ mod tests {
             "ETA",
             "EXPC",
             "Windows",
-            "WinStateDiag",
+            "WinDiag",
             "CPU",
             "GPU",
             "ZIP",
@@ -2698,15 +2698,15 @@ mod tests {
             (d.journal_title, "Журнал"),
             (d.journal_clear_button, "Очистить"),
             (d.journal_open_button, "Открыть"),
-            (d.journal_viewer_title, "Журнал WinStateDiag"),
+            (d.journal_viewer_title, "Журнал WinDiag"),
             (d.journal_viewer_save, "Сохранить"),
             (d.journal_viewer_copy, "Копировать"),
             (d.journal_viewer_close, "Закрыть"),
             (d.journal_viewer_saved, "Журнал сохранён"),
             (d.journal_viewer_save_failed, "Не удалось сохранить журнал"),
             (d.driver_summary_title, "ИТОГ"),
-            (d.driver_sum_problems, "Проблем"),
-            (d.driver_sum_warnings, "Предупреждений"),
+            (d.driver_sum_problems, "Проблем устройств"),
+            (d.driver_sum_warnings, "Предупр. устройств"),
             (d.driver_sum_ok, "Проверено без замечаний"),
             (d.driver_sum_devices, "Устройств"),
             (d.driver_sum_events, "Событий всего"),
@@ -2796,7 +2796,7 @@ mod tests {
             (d.journal_title, "Log"),
             (d.journal_clear_button, "Clear"),
             (d.journal_open_button, "Open"),
-            (d.journal_viewer_title, "WinStateDiag Log"),
+            (d.journal_viewer_title, "WinDiag Log"),
             (d.journal_viewer_save, "Save"),
             (d.journal_viewer_copy, "Copy"),
             (d.journal_viewer_close, "Close"),

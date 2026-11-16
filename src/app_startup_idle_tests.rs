@@ -25,7 +25,7 @@ fn app_in(tag: &str) -> (WinStateDiagApp, PathBuf) {
 
 #[test]
 fn rc4_client_survives_full_module_new_session_and_restart() {
-    for (client, computer) in [("ExampleClient", "MSI"), ("ExampleOrg", "SERVER")] {
+    for (client, computer) in [("ExampleClient", "MSI"), ("DEMO", "SERVER")] {
         let (mut app, exe) = app_in(&format!("rc4-client-{computer}"));
         app.client_name = client.into();
         app.computer_name = computer.into();

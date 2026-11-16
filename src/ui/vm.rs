@@ -52,6 +52,7 @@ pub enum Page {
     #[default]
     Diagnostics,
     Hardware,
+    Repair,
 }
 
 /// One label/value line of a compact card.
@@ -134,7 +135,7 @@ pub struct AnalysisProgressVm {
     pub elapsed: String,
     /// "Загрузка символов Microsoft..." while the symbol cache grows.
     pub note: Option<String>,
-    /// "Дамп 1 из 3 · 010100-00001-01.dmp".
+    /// "Дамп 1 из 3 · 100326-9500-01.dmp".
     pub dump_label: String,
 }
 
@@ -218,6 +219,7 @@ pub struct SensorRefRow {
 /// v0.4.5 compact Hardware Sensors card (full table in Details).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SensorsVm {
+    pub hardware: HardwareSupportVm,
     /// v1.0 main view: every EXPECTED row stays visible (missing values
     /// read "Нет данных").
     pub matrix: Vec<SensorMatrixRow>,
@@ -309,6 +311,8 @@ pub enum Tone {
 
 #[derive(Clone, Debug)]
 pub struct OverallVm {
+    pub detail: String,
+    pub retry_export: bool,
     pub fraction: f32,
     pub percent_text: String,
     pub status_text: String,
@@ -480,6 +484,9 @@ pub enum DriversVm {
 
 #[derive(Clone, Debug)]
 pub struct DashboardVm {
+    pub bios: BiosVm,
+    pub ai_export_enabled: bool,
+    pub ai_export_busy: bool,
     pub drivers_progress: String,
     pub controls_enabled: bool,
     /// Stop button: shown and enabled only while EXPC Diagnostic runs.
@@ -576,6 +583,7 @@ pub enum BlockId {
 #[derive(Clone, Debug)]
 pub enum Action {
     RequestRepair(usize),
+    RequestWindowsRepair,
     /// «Выполнить ReHash» (CryptoPro Details): open the warning /
     /// confirmation (v1.1: nothing runs yet).
     CryptoRehashRequest,
@@ -584,6 +592,8 @@ pub enum Action {
     CryptoRehashCancelled,
     /// v1.1: ⟳ on the CryptoPro card — a fresh read-only check.
     CryptoRecheck,
+    CheckBios,
+    OpenBiosSupport,
     ShowCryptoDetails,
     /// v1.1: «Проверка» on the Driver Audit card — manual re-check.
     CheckDrivers,
@@ -601,6 +611,9 @@ pub enum Action {
     /// Open the FINAL verified report of the completed session (the app
     /// resolves the path from its own state; the UI never supplies one).
     OpenReport,
+    ExportAi,
+    SelectAiArchive,
+    RetryExport,
     /// Open the folder of that same final report.
     OpenFolder,
     BenchmarkStart,
@@ -622,6 +635,8 @@ pub enum Action {
     InstallAnalyzer,
     /// v0.4.5: re-sample the hardware sensors (writes evidence).
     RefreshSensors,
+    InstallPawnIo,
+    ControlLhm,
     ShowSensorDetails,
     RunGpoCheck,
     ShowGpoDetails,
@@ -669,4 +684,31 @@ mod tests {
             assert!((0.0..=1.0).contains(&v));
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct BiosVm {
+    pub label: String,
+    pub tooltip: String,
+    pub preview: String,
+    pub available: bool,
+    pub enabled: bool,
+}
+impl Default for BiosVm {
+    fn default() -> Self {
+        Self {
+            label: "Не проверено".into(),
+            tooltip: "Проверить обновление BIOS".into(),
+            preview: String::new(),
+            available: false,
+            enabled: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HardwareSupportVm {
+    pub message: String,
+    pub busy: bool,
+    pub can_install: bool,
 }

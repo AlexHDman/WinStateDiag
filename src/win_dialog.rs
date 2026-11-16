@@ -31,6 +31,19 @@ pub fn save_as(dir: &Path, file_name: &str, title: &str) -> SavePick {
     }
 }
 
+/// Native selection only; no export confirmation or filesystem mutation.
+pub fn open_zip(dir: &Path) -> SavePick {
+    #[cfg(all(windows, not(test)))]
+    {
+        imp::pick(dir, "", "Выбери диагностический ZIP", true)
+    }
+    #[cfg(any(not(windows), test))]
+    {
+        let _ = dir;
+        SavePick::Unavailable
+    }
+}
+
 #[cfg(all(windows, not(test)))]
 mod imp {
     use super::SavePick;
@@ -74,6 +87,7 @@ mod imp {
     #[link(name = "comdlg32")]
     unsafe extern "system" {
         fn GetSaveFileNameW(ofn: *mut OpenFileNameW) -> i32;
+        fn GetOpenFileNameW(ofn: *mut OpenFileNameW) -> i32;
         fn CommDlgExtendedError() -> u32;
     }
     #[link(name = "user32")]
@@ -89,22 +103,31 @@ mod imp {
     }
 
     pub fn save_as(dir: &Path, file_name: &str, title: &str) -> SavePick {
-        let _ = std::fs::create_dir_all(dir);
+        pick(dir, file_name, title, false)
+    }
+    pub fn pick(dir: &Path, file_name: &str, title: &str, open: bool) -> SavePick {
+        if !open {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let mut buf = vec![0u16; 1024];
         for (i, c) in file_name.encode_utf16().take(1000).enumerate() {
             buf[i] = c;
         }
         // "Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0"
-        let filter: Vec<u16> = "Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0"
-            .encode_utf16()
-            .collect();
+        let filter: Vec<u16> = (if open {
+            "Diagnostic ZIP (*.zip)\0*.zip\0\0"
+        } else {
+            "Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0"
+        })
+        .encode_utf16()
+        .collect();
         let initial: Vec<u16> = dir
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
         let title_w = wide(title);
-        let ext = wide("txt");
+        let ext = wide(if open { "zip" } else { "txt" });
         let mut ofn = OpenFileNameW {
             lStructSize: std::mem::size_of::<OpenFileNameW>() as u32,
             hwndOwner: unsafe { GetActiveWindow() },
@@ -119,8 +142,11 @@ mod imp {
             nMaxFileTitle: 0,
             lpstrInitialDir: initial.as_ptr(),
             lpstrTitle: title_w.as_ptr(),
-            Flags: OFN_OVERWRITEPROMPT
-                | OFN_HIDEREADONLY
+            Flags: (if open {
+                0x0000_1000
+            } else {
+                OFN_OVERWRITEPROMPT
+            }) | OFN_HIDEREADONLY
                 | OFN_NOCHANGEDIR
                 | OFN_PATHMUSTEXIST
                 | OFN_EXPLORER,
@@ -136,7 +162,13 @@ mod imp {
         };
         // SAFETY: every pointer refers to a live, NUL-terminated buffer
         // owned by this frame for the whole (modal) call.
-        let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+        let ok = unsafe {
+            if open {
+                GetOpenFileNameW(&mut ofn)
+            } else {
+                GetSaveFileNameW(&mut ofn)
+            }
+        };
         if ok != 0 {
             let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
             return SavePick::Path(PathBuf::from(String::from_utf16_lossy(&buf[..len])));

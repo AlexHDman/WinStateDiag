@@ -12,6 +12,14 @@ pub fn aggregate(base: &str, checks: &[ExpcCheck]) -> Summary {
     let mut history = base.starts_with("HISTORICAL");
     for c in checks {
         let status = c.status.to_ascii_uppercase();
+        if c.key.starts_with("Repair") {
+            reasons.push(format!("{} [REPAIR/{}]: {}", c.key, c.status, c.detail));
+            if c.key == "Repair evidence" {
+                missing = true;
+            }
+            continue;
+        }
+
         let kind = match status.as_str() {
             "ATTENTION"
             | "WARNING"
@@ -24,7 +32,8 @@ pub fn aggregate(base: &str, checks: &[ExpcCheck]) -> Summary {
             }
             "REBOOT_PENDING" => {
                 warning = true;
-                "WARNING"
+                missing = true; // SFC did not verify integrity; this is not an execution error.
+                "COVERAGE"
             }
             "ERROR"
                 if c.key == "WHEA"
@@ -132,6 +141,66 @@ pub fn findings_status(system: &str, hardware: &str) -> &'static str {
     } else {
         "UNKNOWN"
     }
+}
+pub fn repair_status(reasons: &[String]) -> &'static str {
+    for status in [
+        "REPAIR_FAILED",
+        "VERIFICATION_FAILED",
+        "REPAIR_BLOCKED",
+        "REBOOT_REQUIRED",
+        "RESULT_UNKNOWN",
+        "REPAIR_SUCCESS",
+    ] {
+        if reasons
+            .iter()
+            .any(|r| r.contains(&format!("[REPAIR/{status}]")))
+        {
+            return status;
+        }
+    }
+    "NOT_RUN"
+}
+pub fn user_summary(system: &str, hardware: &str, reasons: &[String]) -> String {
+    let repair = repair_status(reasons);
+    if matches!(
+        repair,
+        "REPAIR_FAILED" | "VERIFICATION_FAILED" | "REPAIR_BLOCKED"
+    ) {
+        return format!(
+            "Ошибка восстановления · {}",
+            reasons
+                .iter()
+                .find(|r| r.contains(&format!("[REPAIR/{repair}]")))
+                .map(|r| r.split_once(": ").map(|(_, d)| d).unwrap_or(r))
+                .unwrap_or("см. журнал")
+        );
+    }
+    if matches!(
+        execution_status(system, hardware, reasons),
+        "ERROR" | "COMPLETED_WITH_ERRORS"
+    ) {
+        let module = reasons
+            .iter()
+            .find(|r| {
+                r.contains("[COVERAGE/ERROR]")
+                    || r.contains("[COVERAGE/FAILED]")
+                    || r.contains("[COVERAGE/SERVICE_ERROR]")
+            })
+            .map(|r| r.split(" [").next().unwrap_or(r))
+            .unwrap_or("см. журнал");
+        return format!("Ошибка диагностики · {module}");
+    }
+    if coverage_status(system, hardware, reasons) != "COMPLETE" {
+        return "Диагностика завершена частично".into();
+    }
+    if findings_status(system, hardware) == "ATTENTION" {
+        "Диагностика завершена · Обнаружены проблемы"
+    } else if findings_status(system, hardware) == "NO_FINDINGS" {
+        "Диагностика завершена · Проблем не обнаружено"
+    } else {
+        "Диагностика завершена частично"
+    }
+    .into()
 }
 pub fn execution_label(code: &str) -> &'static str {
     match code {

@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 1251 >nul
 echo ====================================================
 echo    Полный пересчет хэшей КриптоПро CSP
@@ -10,10 +10,10 @@ net session >nul 2>&1
 if %errorLevel% == 0 (
     echo Запуск пересчета...
     echo.
-    
+
     :: Основная команда полного пересчета
     "C:\Program Files\Crypto Pro\CSP\cpverify.exe" -rm
-    
+
     echo.
     echo Пересчет завершен!
     echo Рекомендуется перезагрузить компьютер.

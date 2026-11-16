@@ -2445,7 +2445,7 @@ Followup:     MachineOwner
     #[test]
     fn inventory_parses_bugchecks_dumps_and_debugger() {
         let out = r#"noise
-WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000116 (0xffffe20fb1a8c010, 0xfffff8066a2fd2c0, 0xffffffffc000009a, 0x0000000000000004)","C:\\Windows\\Minidump\\010100-00002-01.dmp","1f2e"]},{"t":"2026-10-03T09:11:58","src":"KP41","p":["278","18446708906380136464","1","2","4"]},{"t":"2026-09-20T08:00:00","src":"KP41","p":["0","0","0","0","0"]}],"dumps":[{"path":"C:\\Windows\\Minidump\\010100-00002-01.dmp","name":"010100-00002-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"C:\\Windows\\MEMORY.DMP","name":"MEMORY.DMP","size":1073741824,"t":"2026-10-03T09:10:05","kind":"full"}],"cdb":"C:\\Users\\u\\AppData\\Local\\Microsoft\\WindowsApps\\cdbX64.exe","notes":[]}
+WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000116 (0xffffe20fb1a8c010, 0xfffff8066a2fd2c0, 0xffffffffc000009a, 0x0000000000000004)","C:\\Windows\\Minidump\\100326-10421-01.dmp","1f2e"]},{"t":"2026-10-03T09:11:58","src":"KP41","p":["278","18446708906380136464","1","2","4"]},{"t":"2026-09-20T08:00:00","src":"KP41","p":["0","0","0","0","0"]}],"dumps":[{"path":"C:\\Windows\\Minidump\\100326-10421-01.dmp","name":"100326-10421-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"C:\\Windows\\MEMORY.DMP","name":"MEMORY.DMP","size":1073741824,"t":"2026-10-03T09:10:05","kind":"full"}],"cdb":"C:\\Users\\u\\AppData\\Local\\Microsoft\\WindowsApps\\cdbX64.exe","notes":[]}
 "#;
         let inv = parse_inventory(out).unwrap();
         assert_eq!(
@@ -2515,7 +2515,7 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
     fn third_party_culprit_with_driver_audit_is_high_and_strongest_first() {
         let report = nvidia_report();
         let a = DumpAnalysis::build(
-            dump("010100-00002-01.dmp", "2026-10-03T09:10:02"),
+            dump("100326-10421-01.dmp", "2026-10-03T09:10:02"),
             None,
             AnalysisStatus::Completed,
             NVIDIA_ANALYZE.into(),
@@ -2621,16 +2621,16 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
     fn evidence_files_txt_and_json() {
         let report = nvidia_report();
         let a = DumpAnalysis::build(
-            dump("010100-00002-01.dmp", "2026-10-03T09:10:02"),
+            dump("100326-10421-01.dmp", "2026-10-03T09:10:02"),
             None,
             AnalysisStatus::Completed,
             NVIDIA_ANALYZE.into(),
             Some(&report),
         );
-        let (txt, js, dmp) = evidence_names("04.10.26_10-00", 1, "010100-00002-01.dmp");
+        let (txt, js, dmp) = evidence_names("04.10.26_10-00", 1, "100326-10421-01.dmp");
         assert_eq!(txt, "CrashDump_Analysis_04.10.26_10-00_01.txt");
         assert_eq!(js, "CrashDump_Summary_04.10.26_10-00_01.json");
-        assert_eq!(dmp, "CrashDump_Dump_04.10.26_10-00_01_010100-00002-01.dmp");
+        assert_eq!(dmp, "CrashDump_Dump_04.10.26_10-00_01_100326-10421-01.dmp");
         let raw = analysis_txt(&a, Some("cdbX64.exe"));
         let raw = String::from_utf8_lossy(&raw);
         assert!(
@@ -2723,8 +2723,8 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
 
     fn case_dump() -> DumpFile {
         DumpFile {
-            path: "C:\\Windows\\Minidump\\010100-00001-01.dmp".into(),
-            name: "010100-00001-01.dmp".into(),
+            path: "C:\\Windows\\Minidump\\100326-9500-01.dmp".into(),
+            name: "100326-9500-01.dmp".into(),
             size: 1,
             modified: "2026-10-03T00:34:41".into(),
             kind: DumpKind::Mini,
@@ -3024,7 +3024,7 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
 
     // ---- v1.0.1 Phase 01: crash analyzer correctness ------------------
 
-    /// Synthetic modern WinDbg (cdbX64) `!analyze -v` example
+    /// Modern WinDbg (cdbX64) `!analyze -v` as CLIENT-HOME produced it
     /// (sanitized: machine identity removed): KEY_VALUES block, trailing
     /// spaces, tabs, a symbol warning for the third-party driver, DML
     /// link markup and a SECOND analyze echo with other values.
@@ -3228,7 +3228,7 @@ mod dump_identity_tests {
     /// counted once; the same NAME in another folder is another dump.
     #[test]
     fn the_same_dump_file_is_counted_once_by_full_path_size_and_time() {
-        let out = r#"WSD_CRASH {"bugchecks":[],"dumps":[{"path":"C:\\Windows\\Minidump\\010100-00002-01.dmp","name":"010100-00002-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"C:\\WINDOWS\\Minidump\\010100-00002-01.dmp","name":"010100-00002-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"D:\\Dumps\\010100-00002-01.dmp","name":"010100-00002-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"}],"cdb":"","notes":[]}"#;
+        let out = r#"WSD_CRASH {"bugchecks":[],"dumps":[{"path":"C:\\Windows\\Minidump\\100326-10421-01.dmp","name":"100326-10421-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"C:\\WINDOWS\\Minidump\\100326-10421-01.dmp","name":"100326-10421-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"},{"path":"D:\\Dumps\\100326-10421-01.dmp","name":"100326-10421-01.dmp","size":2621440,"t":"2026-10-03T09:10:02","kind":"mini"}],"cdb":"","notes":[]}"#;
         let inv = parse_inventory(out).expect("inventory");
         assert_eq!(inv.dumps.len(), 2, "{:?}", inv.dumps);
         assert!(INVENTORY_PS1.contains("Sort-Object -Unique)"));

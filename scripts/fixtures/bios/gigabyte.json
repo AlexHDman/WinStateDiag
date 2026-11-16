@@ -1,0 +1,148 @@
+{
+  "status": 0,
+  "data": [
+    {
+      "key": "download",
+      "child": [
+        {
+          "key": "bios",
+          "data": [
+            {
+              "fileName": "mb_bios_b760m-ds3h-d4_f1",
+              "fileVersion": "F1",
+              "fileReleaseDate": "2022-10-12T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-d4_f1.zip?v=bc0295b674b5cd76c436edc1c710ca84",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-d4_f3",
+              "fileVersion": "F3",
+              "fileReleaseDate": "2023-03-10T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-d4_f3.zip?v=53bfd65a0ba7c428b0d3941042009e20",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-d4_f11",
+              "fileVersion": "F11",
+              "fileReleaseDate": "2023-06-15T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-d4_f11.zip?v=f1d3e8f3efd9e07573d643821e7a9a8f",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-d4_f12",
+              "fileVersion": "F12",
+              "fileReleaseDate": "2023-07-28T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-d4_f12.zip?v=7e14049b29445c08e5998879d31d7451",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f13",
+              "fileVersion": "F13",
+              "fileReleaseDate": "2023-08-31T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f13.zip?v=252cc5ab8d759e3448a1799466deac74",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f14",
+              "fileVersion": "F14",
+              "fileReleaseDate": "2023-09-23T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f14.zip?v=4fc669fbbcceb2c481a77ca8ac39dfe1",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f15",
+              "fileVersion": "F15",
+              "fileReleaseDate": "2023-10-20T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f15.zip?v=9209c2c9cc709ce7779998e5c2ddceee",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f16",
+              "fileVersion": "F16",
+              "fileReleaseDate": "2023-12-21T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f16.zip?v=d86abf231fa6ca1f5db5a144f70033da",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f17",
+              "fileVersion": "F17",
+              "fileReleaseDate": "2024-05-09T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f17.zip?v=a0dae6a9daf4f6961701c24b862d4527",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f19",
+              "fileVersion": "F19",
+              "fileReleaseDate": "2024-09-27T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f19.zip?v=57d239ab67c0b9b10eb14e2ed3dfa741",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f20",
+              "fileVersion": "F20",
+              "fileReleaseDate": "2025-03-12T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f20.zip?v=5e061dd5e0b85a23ef5985ff0e217d60",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f21c",
+              "fileVersion": "F21c",
+              "fileReleaseDate": "2025-05-27T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f21c.zip?v=44a0ecf896467764b41820e23bbeedc1",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f21",
+              "fileVersion": "F21",
+              "fileReleaseDate": "2025-06-19T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f21.zip?v=94d78593c18c3bea7217419b72abe5c3",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f22",
+              "fileVersion": "F22",
+              "fileReleaseDate": "2025-09-24T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f22.zip?v=2f1e60e5d766412f8ed97095885610f3",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f23",
+              "fileVersion": "F23",
+              "fileReleaseDate": "2025-12-02T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f23.zip?v=930db05f0ec6e971ee1ae2ac898444fa",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f24a",
+              "fileVersion": "F24a",
+              "fileReleaseDate": "2026-04-29T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f24a.zip?v=be656d65b1bf52c3a1c6a0d2fd96a6ed",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f24",
+              "fileVersion": "F24",
+              "fileReleaseDate": "2026-06-12T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f24.zip?v=27fbb2e6ca3de95f09231bc7d2bf8efe",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f25a",
+              "fileVersion": "F25a",
+              "fileReleaseDate": "2026-07-31T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f25a.zip?v=843b28e57be9843f2986dcf5d4c24c5e",
+              "fileTitle": null
+            },
+            {
+              "fileName": "mb_bios_b760m-ds3h-ddr4_8arpt044_f25",
+              "fileVersion": "F25",
+              "fileReleaseDate": "2026-09-29T00:00:00",
+              "filePath": "https://download.gigabyte.com/FileList/BIOS/mb_bios_b760m-ds3h-ddr4_8arpt044_f25.zip?v=598dbfeb6894efce6439011e9fa96b3e",
+              "fileTitle": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

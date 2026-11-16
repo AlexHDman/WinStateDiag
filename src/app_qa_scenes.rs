@@ -53,7 +53,7 @@ impl WinStateDiagApp {
                     .unwrap_or_else(Instant::now),
                 dump_index: 0,
                 dump_total: 1,
-                dump_name: "010100-00001-01.dmp".into(),
+                dump_name: "100326-9500-01.dmp".into(),
                 symbols_downloading: true,
             });
         } else {
@@ -419,6 +419,7 @@ pub(super) fn qa_summary(
 
 fn qa_snapshot() -> sensors::Snapshot {
     sensors::Snapshot {
+        hardware_metadata: None,
         captured_at: "2026-10-06T11:00:00".into(),
         samples: 10,
         interval_ms: 1000,
@@ -533,7 +534,7 @@ pub(super) fn qa_inventory() -> crash_dump::Inventory {
             source: crash_dump::BugcheckSource::Wer1001,
             code: 0x139,
             params: vec![3, 0, 0, 0],
-            dump_path: Some("C:\\Windows\\Minidump\\010100-00001-01.dmp".into()),
+            dump_path: Some("C:\\Windows\\Minidump\\100326-9500-01.dmp".into()),
         }],
         dumps: vec![qa_dump()],
         debugger: crash_dump::DebuggerStatus::Installed {
@@ -548,15 +549,15 @@ pub(super) fn qa_inventory() -> crash_dump::Inventory {
 
 fn qa_dump() -> crash_dump::DumpFile {
     crash_dump::DumpFile {
-        path: "C:\\Windows\\Minidump\\010100-00001-01.dmp".into(),
-        name: "010100-00001-01.dmp".into(),
+        path: "C:\\Windows\\Minidump\\100326-9500-01.dmp".into(),
+        name: "100326-9500-01.dmp".into(),
         size: 2_621_440,
         modified: "2026-10-03T00:34:41".into(),
         kind: crash_dump::DumpKind::Mini,
     }
 }
 
-/// Synthetic 0x139 debugger case (QA fixture).
+/// The client case "C1" 0x139 case as the debugger reports it (QA fixture).
 pub(super) const CASE_0X139_ANALYZE: &str = r#"
 *******************************************************************************
 *                                                                             *
@@ -729,7 +730,7 @@ mod case_0x139_regression {
         );
         assert_eq!(r.incidents.len(), 1);
         assert_eq!(r.incidents[0].code, "0x00000139");
-        assert_eq!(r.incidents[0].dump, "010100-00001-01.dmp");
+        assert_eq!(r.incidents[0].dump, "100326-9500-01.dmp");
         assert!(!r.cause.iter().any(|c| c.contains("ntoskrnl")));
         // Same counters in the card format and the report.
         assert_eq!(

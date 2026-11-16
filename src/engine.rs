@@ -232,19 +232,26 @@ pub(crate) fn run_session_with(
     let started_local = crate::ui::sysinfo::local_time();
     let mut progress = RunProgress::default();
     let outcome = run_pipeline(req, tx, backend, started, &mut progress);
+    let succeeded = outcome.is_ok();
     match outcome {
         Ok(final_zip) => {
             send(tx, EngineEvent::Stage(Stage::Complete));
             send(tx, EngineEvent::Finished(Ok(final_zip)));
         }
-        Err(StepError::Failed(err)) => send(tx, EngineEvent::Finished(Err(err))),
+        Err(StepError::Failed(err)) => {
+            let note = salvage_failed_run(req, &progress, started, &err);
+            send(tx, EngineEvent::Log(note));
+            send(tx, EngineEvent::Finished(Err(err)));
+        }
         Err(StepError::Cancelled) => {
             let (zip_path, note) = salvage_cancelled_run(req, &progress, started, started_local);
             send(tx, EngineEvent::Cancelled { zip_path, note });
         }
     }
     // Best-effort cleanup; a failure here must not fail the session.
-    backend.cleanup();
+    if succeeded {
+        backend.cleanup();
+    } // Failed/cancelled runtime is recovery evidence.
 }
 
 fn check_cancel(req: &SessionRequest) -> Result<(), StepError> {
@@ -262,6 +269,11 @@ fn run_pipeline(
     started: SystemTime,
     progress: &mut RunProgress,
 ) -> Result<PathBuf, StepError> {
+    let pipeline_clock = std::time::Instant::now();
+    send(
+        tx,
+        EngineEvent::Log("[timing] Pipeline monotonic +0 ms: Preparing".into()),
+    );
     send(tx, EngineEvent::Stage(Stage::Preparing));
     send(tx, EngineEvent::Log("Подготовка runtime...".into()));
     check_cancel(req)?;
@@ -269,6 +281,13 @@ fn run_pipeline(
     progress.reports_root = Some(reports.clone());
     check_cancel(req)?;
 
+    send(
+        tx,
+        EngineEvent::Log(format!(
+            "[timing] Pipeline monotonic +{} ms: SystemDiagnostics",
+            pipeline_clock.elapsed().as_millis()
+        )),
+    );
     send(tx, EngineEvent::Stage(Stage::SystemDiagnostics));
     progress.current = Some(SessionStep::Expc);
     backend.run_expc(req, tx)?;
@@ -285,6 +304,13 @@ fn run_pipeline(
     progress.completed.push(SessionStep::Expc);
 
     if req.include_hardware {
+        send(
+            tx,
+            EngineEvent::Log(format!(
+                "[timing] Pipeline monotonic +{} ms: HardwareReport",
+                pipeline_clock.elapsed().as_millis()
+            )),
+        );
         send(tx, EngineEvent::Stage(Stage::HardwareReport));
         progress.current = Some(SessionStep::Hardware);
         let hw_started_at = SystemTime::now()
@@ -300,6 +326,13 @@ fn run_pipeline(
         progress.completed.push(SessionStep::Hardware);
     }
 
+    send(
+        tx,
+        EngineEvent::Log(format!(
+            "[timing] Pipeline monotonic +{} ms: DriverAudit",
+            pipeline_clock.elapsed().as_millis()
+        )),
+    );
     send(tx, EngineEvent::Stage(Stage::DriverAudit));
     let audit_started = std::time::Instant::now();
     progress.current = Some(SessionStep::DriverAudit);
@@ -317,9 +350,22 @@ fn run_pipeline(
 
     // Packaging: the run's evidence joins the session package (the same
     // ZIP that Hardware Report / SSD benchmark / Driver Audit update).
+    send(
+        tx,
+        EngineEvent::Log(format!(
+            "[timing] Pipeline monotonic +{} ms: Packaging",
+            pipeline_clock.elapsed().as_millis()
+        )),
+    );
     send(tx, EngineEvent::Stage(Stage::Packaging));
     let packaging_started = std::time::Instant::now();
-    let files = collect_runtime_evidence(&reports, started)?;
+    let mut files = collect_runtime_evidence(&reports, started)?;
+    if files.is_empty() {
+        return Err(StepError::Failed(
+            "Runtime не содержит диагностических файлов".into(),
+        ));
+    }
+    files.extend(crate::winsxs::evidence(&files));
     for file in &files {
         if file.name.starts_with("WindowsServicingLogs__") && file.name.ends_with("__Result.json") {
             let text = String::from_utf8_lossy(&file.bytes);
@@ -342,7 +388,11 @@ fn run_pipeline(
         files.iter().map(|f| (f.name.as_str(), f.bytes.as_slice())),
     ) {
         send(tx, EngineEvent::DeepChecks(run.outcomes));
-        send(tx, EngineEvent::ExpcChecks(run.checks));
+        let mut checks = run.checks;
+        if let Some(check) = crate::report_v3::ram_check(&files) {
+            checks.push(check);
+        }
+        send(tx, EngineEvent::ExpcChecks(checks));
     }
     let date = identity_date(crate::ui::sysinfo::local_time());
     let final_zip = lock(&req.package)
@@ -372,30 +422,127 @@ fn collect_runtime_evidence(root: &Path, since: SystemTime) -> Result<Vec<Eviden
     }));
     let mut files = Vec::new();
     for dir in dirs {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-            .filter(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                !name.starts_with('.') && !name.to_ascii_lowercase().ends_with(".zip")
-            })
-            .filter(|e| {
-                e.metadata()
-                    .and_then(|m| m.modified())
-                    .map(|t| t >= since)
-                    .unwrap_or(false)
-            })
-            .map(|e| e.path())
-            .collect();
+        let entries = fs::read_dir(&dir).map_err(|e| {
+            format!(
+                "stage=collect path={} os_code={:?}: {e}",
+                dir.display(),
+                e.raw_os_error()
+            )
+        })?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "stage=enumerate path={} os_code={:?}: {e}",
+                    dir.display(),
+                    e.raw_os_error()
+                )
+            })?;
+            let path = entry.path();
+            let metadata = entry.metadata().map_err(|e| {
+                format!(
+                    "stage=metadata path={} os_code={:?}: {e}",
+                    path.display(),
+                    e.raw_os_error()
+                )
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if metadata.is_file()
+                && !name.starts_with('.')
+                && !name.to_ascii_lowercase().ends_with(".zip")
+            {
+                let modified = metadata.modified().map_err(|e| {
+                    format!(
+                        "stage=modified path={} os_code={:?}: {e}",
+                        path.display(),
+                        e.raw_os_error()
+                    )
+                })?;
+                if modified >= since {
+                    paths.push(path);
+                }
+            }
+        }
         paths.sort();
         for p in paths {
             files.push(EvidenceFile::read(&p)?);
         }
     }
     Ok(files)
+}
+
+fn salvage_failed_run(
+    req: &SessionRequest,
+    progress: &RunProgress,
+    started: SystemTime,
+    error: &str,
+) -> String {
+    let mut files = Vec::new();
+    let mut errors = vec![error.to_string()];
+    if let Some(root) = &progress.reports_root {
+        let since = started
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or(started);
+        let mut dirs = vec![root.clone()];
+        dirs.extend(subdirectories(root));
+        for dir in dirs {
+            match fs::read_dir(&dir) {
+                Ok(items) => {
+                    for item in items {
+                        match item {
+                            Ok(item) => {
+                                let path = item.path();
+                                if path.is_file()
+                                    && !item.file_name().to_string_lossy().starts_with('.')
+                                    && path
+                                        .extension()
+                                        .is_none_or(|x| !x.eq_ignore_ascii_case("zip"))
+                                {
+                                    match item.metadata().and_then(|m| m.modified()) {
+                                        Ok(t) if t >= since => match EvidenceFile::read(&path) {
+                                            Ok(f) => files.push(f),
+                                            Err(e) => errors.push(e),
+                                        },
+                                        Err(e) => {
+                                            errors.push(format!("metadata {}: {e}", path.display()))
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Err(e) => errors.push(format!("enumerate {}: {e}", dir.display())),
+                        }
+                    }
+                }
+                Err(e) => errors.push(format!("enumerate {}: {e}", dir.display())),
+            }
+        }
+    }
+    let failed = match progress.current {
+        Some(SessionStep::Expc) => "expc_diagnostic",
+        Some(SessionStep::Hardware) => "hardware_report",
+        Some(SessionStep::DriverAudit) => "driver_audit",
+        None => "collection",
+    };
+    let execution = if progress.current.is_none() {
+        "COMPLETED"
+    } else {
+        "ERROR"
+    };
+    files.push(EvidenceFile::new("Session_Execution.json", format!("{{\"execution_status\":\"{execution}\",\"failed_module\":{},\"errors\":[{}],\"runtime_preserved\":true}}",crate::deep_checks::json::string(failed),errors.iter().map(|e|crate::deep_checks::json::string(e)).collect::<Vec<_>>().join(",")).into_bytes()));
+    let mut package = lock(&req.package);
+    package.set_execution_override(Some(if progress.current.is_none() {
+        "COMPLETED"
+    } else {
+        "ERROR"
+    }));
+    if progress.current.is_none() {
+        package.record_packaging_failure(error);
+    }
+    match package.contribute(&req.client_name, &req.computer_name, &identity_date(crate::ui::sysinfo::local_time()), files) {
+        Ok(_) => "Аварийные доказательства сохранены; диагностика завершилась с ошибкой, готовность ZIP проверяется отдельно.".into(),
+        Err(e) => format!("Аварийный экспорт не завершён: {e}; исходный runtime: {}", progress.reports_root.as_ref().map(|p|p.display().to_string()).unwrap_or_default())
+    }
 }
 
 /// `EXPC_x.txt` -> `EXPC_x_USER_CANCELLED.txt`.
@@ -602,10 +749,11 @@ fn run_driver_audit(
             send(
                 tx,
                 EngineEvent::Log(format!(
-                    "Проверка драйверов: {} (проблем: {}, предупреждений: {})",
+                    "Проверка драйверов: {} (проблем устройств: {}, предупреждений устройств: {}); {}",
                     report.overall.label_ru(),
                     report.count(Severity::Problem),
-                    report.count(Severity::Warning)
+                    report.count(Severity::Warning),
+                    report.scope_summary()
                 )),
             );
             if let Err(err) = driver_audit::write_report(&report, &day_dir, session_id) {
@@ -665,6 +813,7 @@ pub(crate) fn request_shutdown(flag: &AtomicBool) {
 
 pub(crate) struct ProcessGuard {
     child: Child,
+    kill_on_drop: bool,
     #[cfg(windows)]
     job: Option<job::Job>,
 }
@@ -683,8 +832,22 @@ impl ProcessGuard {
         let job = job::Job::for_child(&child);
         Ok(Self {
             child,
+            kill_on_drop: true,
             #[cfg(windows)]
             job,
+        })
+    }
+
+    /// Servicing is not assigned to a kill-on-close job. Its caller must wait for
+    /// completion; cancellation stops subsequent stages, never a live repair.
+    pub(crate) fn spawn_servicing(mut cmd: Command) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        Ok(Self {
+            child: cmd.spawn()?,
+            kill_on_drop: false,
+            #[cfg(windows)]
+            job: None,
         })
     }
 
@@ -774,7 +937,7 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
     /// No orphans: a child still running when its owner goes away is ended.
     fn drop(&mut self) {
-        if self.is_running() {
+        if self.kill_on_drop && self.is_running() {
             self.kill_tree();
         }
     }
@@ -937,6 +1100,9 @@ fn write_embedded(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn powershell_command() -> Command {
     let mut cmd = Command::new("powershell.exe");
     cmd.env("WSD_APP_VERSION", crate::APP_VERSION);
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("WSD_APP_EXE", exe);
+    }
     cmd.arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
@@ -1908,32 +2074,24 @@ pub fn stage_label(stage: &Stage) -> &'static str {
 /// For simplicity the caller passes `expc_credit` as the sum of per-step
 /// credit (each in 0.0..=step_weight).
 pub fn session_fraction(stage: &Stage, expc_credit: f32, total_weight: f32, hardware: bool) -> f32 {
-    // Session timeline allocation:
-    //   Preparing:         0.00 .. 0.03
-    //   SystemDiagnostics: 0.03 .. expc_end
-    //   HardwareReport:    expc_end .. 0.90  (only if hardware)
-    //   Packaging:         0.90 .. 0.97
-    //   Complete:          1.00
-    let expc_end: f32 = if hardware { 0.70 } else { 0.90 };
-
-    match stage {
-        Stage::Preparing => 0.02,
+    // Counts completed work units, not elapsed time. No invented mid-stage credit.
+    let hw = if hardware { 1.0 } else { 0.0 };
+    let total = 14.0 + hw + 3.0; // EXPC, optional hardware, A5, staging, verified ZIP.
+    let completed = match stage {
+        Stage::Preparing => 0.0,
         Stage::SystemDiagnostics => {
-            let frac = if total_weight <= 0.0 {
-                0.0
+            if total_weight > 0.0 {
+                (expc_credit / total_weight).clamp(0.0, 1.0) * 14.0
             } else {
-                (expc_credit / total_weight).clamp(0.0, 1.0)
-            };
-            0.03 + frac * (expc_end - 0.03)
+                0.0
+            }
         }
-        Stage::HardwareReport => {
-            // EXPC is done, hardware is running but indeterminate
-            expc_end + (0.90 - expc_end) * 0.5
-        }
-        Stage::Packaging => 0.93,
-        Stage::DriverAudit => 0.90,
-        Stage::Complete => 1.0,
-    }
+        Stage::HardwareReport => 14.0,
+        Stage::DriverAudit => 14.0 + hw,
+        Stage::Packaging => 15.0 + hw,
+        Stage::Complete => total,
+    };
+    completed / total
 }
 
 /// Opens Windows Explorer with the given file pre-selected.
@@ -1945,6 +2103,14 @@ pub fn open_report(path: &Path) -> Result<(), String> {
         return Err(format!("Файл отчёта не найден: {}", path.display()));
     }
     shell_open(path).map_err(|e| format!("Не удалось открыть отчёт: {e}"))
+}
+
+/// Opens a validated BIOS HTTPS support page; no downloaded file is executed.
+pub fn open_web_page(url: &str) -> Result<(), String> {
+    if crate::bios_net::official_host(url).is_none() {
+        return Err("Отклонён неофициальный адрес BIOS".into());
+    }
+    shell_open(Path::new(url))
 }
 
 /// Opens Explorer directly in the report's own folder.
@@ -2023,6 +2189,13 @@ pub fn verify_final_report(report: &Path, reports_root: &Path) -> Result<PathBuf
 
 #[allow(dead_code)]
 pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!("Отчёт не найден: {}", path.display()));
+    }
+    // Unit/offscreen tests never open the host desktop.
+    if cfg!(test) {
+        return Ok(());
+    }
     Command::new("explorer.exe")
         .arg(format!("/select,{}", path.display()))
         .spawn()
@@ -2196,11 +2369,8 @@ mod tests {
 
     #[test]
     fn ps_quote_path_escapes_single_quotes() {
-        let path = Path::new("C:\\Users\\Example'User\\WinStateDiag");
-        assert_eq!(
-            ps_quote_path(path),
-            "C:\\Users\\Example''User\\WinStateDiag"
-        );
+        let path = Path::new("C:\\Users\\O'Brien\\WinStateDiag");
+        assert_eq!(ps_quote_path(path), "C:\\Users\\O''Brien\\WinStateDiag");
     }
 
     #[test]
@@ -2307,7 +2477,7 @@ mod tests {
     #[test]
     fn session_fraction_preparing_is_small() {
         let f = session_fraction(&Stage::Preparing, 0.0, 30.7, true);
-        assert!(f > 0.0);
+        assert_eq!(f, 0.0);
         assert!(f < 0.05);
     }
 
@@ -2315,7 +2485,7 @@ mod tests {
     fn session_fraction_zero_credit_at_diagnostics_start() {
         let total: f32 = EXPC_WEIGHTS.iter().sum();
         let f = session_fraction(&Stage::SystemDiagnostics, 0.0, total, true);
-        assert!(f >= 0.03);
+        assert_eq!(f, 0.0);
         assert!(f < 0.05);
     }
 
@@ -2323,14 +2493,14 @@ mod tests {
     fn session_fraction_full_credit_at_diagnostics_end() {
         let total: f32 = EXPC_WEIGHTS.iter().sum();
         let f = session_fraction(&Stage::SystemDiagnostics, total, total, true);
-        assert!((f - 0.70).abs() < 0.01);
+        assert!((f - 14.0 / 18.0).abs() < 0.01);
     }
 
     #[test]
     fn session_fraction_full_credit_no_hardware() {
         let total: f32 = EXPC_WEIGHTS.iter().sum();
         let f = session_fraction(&Stage::SystemDiagnostics, total, total, false);
-        assert!((f - 0.90).abs() < 0.01);
+        assert!((f - 14.0 / 17.0).abs() < 0.01);
     }
 
     #[test]
@@ -2840,6 +3010,7 @@ mod session_pipeline_tests {
     #[derive(Clone, Copy, PartialEq)]
     enum Plan {
         Complete,
+        FailAudit,
         /// Stop pressed while EXPC's child process tree is running.
         StopDuringExpc,
         /// Stop pressed while Hardware Report runs (EXPC finished).
@@ -2948,6 +3119,11 @@ mod session_pipeline_tests {
             _tx: &Sender<EngineEvent>,
         ) -> Result<(), StepError> {
             self.ran.lock().unwrap().push("driver_audit");
+            if self.plan == Plan::FailAudit {
+                return Err(StepError::Failed(
+                    "synthetic collector failure; os error 5".into(),
+                ));
+            }
             fs::write(self.day().join("DriverAudit_24-09-26_10-50-00.json"), "{}").unwrap();
             Ok(())
         }
@@ -2973,7 +3149,7 @@ mod session_pipeline_tests {
             Arc::new(Mutex::new(SessionPackage::new(exe.join("Reports"), None)))
         });
         let req = SessionRequest {
-            client_name: "Клиент".into(),
+            client_name: "Алексей".into(),
             computer_name: "MSI".into(),
             mode: DiagnosticMode::Standard,
             deep_checks: DeepChecks::default(),
@@ -3024,6 +3200,45 @@ mod session_pipeline_tests {
         }
     }
 
+    #[test]
+    fn fieldfix_failed_collector_preserves_expc_hardware_and_primary_error() {
+        let r = run(Plan::FailAudit, "fieldfix-failure", None);
+        assert!(!r.ran.contains(&"cleanup"));
+        assert!(r.events.iter().any(
+            |e| matches!(e,EngineEvent::Finished(Err(error)) if error.contains("os error 5"))
+        ));
+        let mut p = lock(&r.package);
+        p.set_states("PARTIAL", "PARTIAL");
+        p.retry_export().unwrap();
+        let zip = p.final_zip().unwrap();
+        let entries = read_zip(&zip).unwrap();
+        assert!(entries.iter().any(|e| e.name.starts_with("Hardware_")));
+        assert!(entries.iter().any(|e| e.name.starts_with("EXPC_")));
+        let execution = entries
+            .iter()
+            .find(|e| e.name == "Session_Execution.json")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&execution.bytes).contains("os error 5"));
+        assert!(r.base.join("runtime/Reports").exists());
+        let manifest = entries.iter().find(|e| e.name == "manifest.json").unwrap();
+        let value =
+            crate::deep_checks::json::parse(&String::from_utf8_lossy(&manifest.bytes)).unwrap();
+        let modules = value.get("modules").unwrap().as_arr().unwrap();
+        assert_eq!(modules.len(), 3);
+        assert_eq!(
+            modules
+                .iter()
+                .find(|m| m.get("name").and_then(|v| v.as_str()) == Some("driver_audit"))
+                .unwrap()
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("failed")
+        );
+        assert!(
+            p.identity().unwrap().report_dir.exists(),
+            "emergency loose files preserved"
+        );
+    }
     #[test]
     fn complete_run_updates_the_session_package() {
         let r = run(Plan::Complete, "ok", None);
@@ -3081,7 +3296,7 @@ mod session_pipeline_tests {
     fn stop_during_expc_stops_the_run_and_keeps_marked_evidence() {
         let r = run(Plan::StopDuringExpc, "expc", None);
         // Remaining stages did not run.
-        assert_eq!(r.ran, vec!["prepare", "expc", "cleanup"]);
+        assert_eq!(r.ran, vec!["prepare", "expc"]);
         assert!(
             !r.events
                 .iter()
@@ -3124,7 +3339,7 @@ mod session_pipeline_tests {
     #[test]
     fn stop_during_hardware_keeps_completed_expc_evidence_as_is() {
         let r = run(Plan::StopDuringHardware, "hw", None);
-        assert_eq!(r.ran, vec!["prepare", "expc", "hardware", "cleanup"]);
+        assert_eq!(r.ran, vec!["prepare", "expc", "hardware"]);
         let (zip, _) = cancelled(&r.events).unwrap();
         let entries = read_zip(zip.as_ref().unwrap()).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -3144,7 +3359,7 @@ mod session_pipeline_tests {
     #[test]
     fn stop_before_any_evidence_creates_no_report() {
         let r = run(Plan::StopBeforeStart, "none", None);
-        assert_eq!(r.ran, vec!["cleanup"]);
+        assert!(r.ran.is_empty());
         let (zip, note) = cancelled(&r.events).unwrap();
         assert!(zip.is_none());
         assert!(note.contains("не создавался"));
@@ -3224,7 +3439,7 @@ mod session_pipeline_tests {
     #[test]
     fn journal_never_shows_the_temp_runtime_as_a_report_location() {
         let marker = runtime_marker("24-09-26_10-00-00");
-        let file_line = "Файл отчёта     : C:\\Users\\Клиент\\AppData\\Local\\Temp\\WinStateDiag\\24-09-26_10-00-00\\Reports\\24-09-26\\EXPC_24.09.26_10-00.txt";
+        let file_line = "Файл отчёта     : C:\\Users\\Алексей\\AppData\\Local\\Temp\\WinStateDiag\\24-09-26_10-00-00\\Reports\\24-09-26\\EXPC_24.09.26_10-00.txt";
         assert_eq!(mask_runtime_line(file_line, &marker, false), None);
         assert_eq!(mask_runtime_line("Reports:", &marker, false), None);
         let err =
@@ -3998,7 +4213,7 @@ mod expc_v044_tests {
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .collect();
-        assert_eq!(lines, ["INFO", "ATTENTION", "ATTENTION", "INFO", "OK"]);
+        assert_eq!(lines, ["INFO", "ATTENTION", "INFO", "INFO", "OK"]);
     }
 
     #[test]
@@ -4110,7 +4325,7 @@ foreach($text in @('Windows Resource Protection did not find any integrity viola
  $decoded=Convert-BytesToTextAuto $bytes
  if($decoded -ne $text){throw 'BOM-less UTF16 misdecoded'}
  if((Get-SfcSemanticResult $decoded $false $true 0) -ne 'CLEAN'){throw 'Clean semantic not recognized'}
- if((Get-SfcSemanticResult $decoded $true $true 0) -ne 'INTEGRITY_VIOLATIONS'){throw 'CBS contradiction lost'}
+ if((Get-SfcSemanticResult $decoded $true $true 0) -ne 'UNKNOWN'){throw 'CBS contradiction must be UNKNOWN'}
  if((Get-SfcSemanticResult $decoded $false $true 5) -ne 'ERROR'){throw 'Exit error lost'}
 }
 if((Get-SfcSemanticResult 'progress 100%' $false $true 0) -ne 'UNKNOWN'){throw 'Zero exit became invented clean'}
@@ -4243,7 +4458,7 @@ Write-Output 'PNP_RC6_PASS'
                 "HISTORICAL_REPAIRED|INFO",
                 "HISTORICAL_ONLY|INFO",
                 "CURRENT_CORRUPTION|ATTENTION",
-                "RECURRENT_CORRUPTION|ATTENTION",
+                "CURRENT_CORRUPTION|ATTENTION",
                 "CURRENT_CORRUPTION|ERROR",
                 "UNKNOWN|UNKNOWN"
             ],
@@ -4253,7 +4468,10 @@ Write-Output 'PNP_RC6_PASS'
             lines[1].contains("2026-05-02") && lines[1].contains("не текущая проблема"),
             "{out}"
         );
-        assert!(lines[4].contains("ПОВТОРНОЕ ПОВРЕЖДЕНИЕ"), "{out}");
+        assert!(
+            lines[4].contains("повторное повреждение тех же файлов не доказано"),
+            "{out}"
+        );
         assert!(
             lines[3].contains("автоматически ничего не менялось"),
             "{out}"

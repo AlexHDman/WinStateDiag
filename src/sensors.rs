@@ -1247,6 +1247,7 @@ pub struct Snapshot {
     /// v1.0 lightweight process context taken while the sensors were
     /// sampled (explains a high CPU load; never a fault by itself).
     pub process_context: Option<ProcessContext>,
+    pub hardware_metadata: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -1675,30 +1676,47 @@ pub fn parse_hwinfo_shm(b: &[u8]) -> Result<Vec<RawReading>, String> {
 /// `WSD_SENS_STATUS` lines. Never installs or writes anything.
 pub const SAMPLER_PS1: &str = r#"param([string]$LhmDir = '', [int]$Samples = 10, [int]$IntervalMs = 1000)
 $ErrorActionPreference = 'Continue'
+# This sampler never installs drivers; installation is a separate explicit action.
 function J($o) { ConvertTo-Json -InputObject $o -Compress -Depth 4 }
 function Status($p, $state, $detail) { Write-Output ('WSD_SENS_STATUS ' + (J ([ordered]@{ p = $p; state = $state; detail = [string]$detail }))) }
-$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-# ---- LibreHardwareMonitorLib (internal, bundled) ----
-$lhm = $null; $pawn = $false
-try { $pawn = [bool](Get-CimInstance Win32_SystemDriver -Filter "Name='PawnIO'" -ErrorAction Stop | Where-Object { $_.State -eq 'Running' }) } catch { }
-if ($LhmDir -and (Test-Path -LiteralPath (Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'))) {
-  try {
-    $script:asm = @{}; Get-ChildItem -LiteralPath $LhmDir -Filter *.dll | ForEach-Object { $script:asm[[IO.Path]::GetFileNameWithoutExtension($_.Name)] = $_.FullName }
-    [AppDomain]::CurrentDomain.add_AssemblyResolve({ param($s, $e) $n = (New-Object Reflection.AssemblyName($e.Name)).Name; if ($script:asm.ContainsKey($n)) { return [Reflection.Assembly]::LoadFrom($script:asm[$n]) }; return $null })
-    [void][Reflection.Assembly]::LoadFrom((Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'))
-    $lhm = New-Object LibreHardwareMonitor.Hardware.Computer
-    foreach ($f in 'IsCpuEnabled','IsGpuEnabled','IsMotherboardEnabled','IsMemoryEnabled','IsStorageEnabled','IsControllerEnabled','IsPsuEnabled') { try { $lhm.$f = $true } catch { } }
-    foreach ($f in 'IsNetworkEnabled','IsBatteryEnabled') { try { $lhm.$f = $false } catch { } }
-    $lhm.Open()
-    $detail = if ($pawn) { 'PawnIO driver present (installed by the user)' } else { 'PawnIO low-level driver not installed: CPU/motherboard/RAM sensors unavailable (WinStateDiag never installs drivers)' }
-    if (-not $admin) { $detail += '; not elevated' }
-    Status 'LHM' $(if ($pawn -and $admin) { 'AVAILABLE' } else { 'PARTIAL' }) $detail
-  } catch {
-    $m = $_.Exception.Message
-    if ($m -match 'blocked|Application Control|policy|0x800711C7|Device Guard') { Status 'LHM' 'BLOCKED_BY_WINDOWS_SECURITY' $m } else { Status 'LHM' 'PROVIDER_ERROR' $m }
-    $lhm = $null
-  }
-} else { Status 'LHM' 'UNAVAILABLE' 'LibreHardwareMonitorLib not bundled in this build' }
+$admin = Get-WsdIsAdmin
+Initialize-WsdPawnNative
+if([Console]::ReadLine() -ne 'start'){return}
+[WsdPawnNative]::WatchParent()
+$lhm=$null;$readerMutex=$null;$readerOwned=$false;$lease=$null;$cleanupOk=$true
+$meta=[ordered]@{restricted_container=($env:WSD_HARDWARE_RESTRICTED -eq '1');pawnio=(Get-WsdPawnIo);identity=(Get-WsdHardwareIdentity);lhm_version=$WsdManifest.lhm_version;lhm_sha256=$WsdManifest.lhm_sha256;modules=@();mode='read-only; no fan/OC/settings changes';board_profile='UNKNOWN';errors=@()}
+try {
+  $readerMutex=[Threading.Mutex]::new($false,'Global\EXPC.HardwareMonitor.Reader')
+  try{$readerOwned=$readerMutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$readerOwned=$true;Save-WsdHardwareAbort $meta.pawnio 'Abandoned reader mutex';throw 'Previous hardware reader was abandoned; protected read refused'}
+  if(-not $readerOwned){throw 'Another hardware reader or installation owns polling'}
+  if ($LhmDir -and (Test-Path -LiteralPath (Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'))) {
+    try {
+      $dll=Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'
+      if((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash -ne $WsdManifest.lhm_sha256){throw 'LHM library hash mismatch'}
+      [WsdPawnNative]::RegisterLhm($LhmDir)
+      $assembly=[Reflection.Assembly]::LoadFrom($dll)
+      $meta.modules=Test-WsdLhmModules $assembly $WsdManifest
+      [LibreHardwareMonitor.PawnIo.PawnIo]::AccessAllowed=($env:WSD_HARDWARE_RESTRICTED -ne '1' -and $admin -and $meta.pawnio.state -eq 'ACCESSIBLE' -and $meta.pawnio.reader_gate -eq 'READY')
+      [LibreHardwareMonitor.PawnIo.PawnIo]::AccessDenialReason=$meta.pawnio.state+': '+$meta.pawnio.open_message+'; '+$meta.pawnio.reader_gate_reason+'; restricted_container='+$meta.restricted_container
+      if([WsdPawnNative]::Stop){throw 'Parent closed before hardware startup'}
+      if([LibreHardwareMonitor.PawnIo.PawnIo]::AccessAllowed){$lease=Open-WsdHardwareLease $meta.pawnio}
+      $lhm = New-Object LibreHardwareMonitor.Hardware.Computer
+      # Native Windows Storage supplies temperature separately; no SMART enable.
+      $lhm.Open()
+      foreach ($f in 'IsCpuEnabled','IsGpuEnabled','IsMemoryEnabled','IsMotherboardEnabled') {
+        if([WsdPawnNative]::Stop){break}
+        if($f -eq 'IsMotherboardEnabled' -and -not [LibreHardwareMonitor.PawnIo.PawnIo]::AccessAllowed){continue}
+        try{$lhm.$f=$true}catch{$meta.errors+=($f+': '+$_.Exception.Message);Status 'LHM' 'PARTIAL' ($f+': '+$_.Exception.Message)}
+      }
+      $board=@($lhm.Hardware|Where-Object { [string]$_.HardwareType -eq 'Motherboard' })|Select-Object -First 1
+      if($board){$meta.board_profile=[string]$board.Model;$meta['board_discovery']=[string]$board.DiscoveryReport;$meta['super_io']=@($board.SubHardware|ForEach-Object { [ordered]@{id=[string]$_.Identifier;name=$_.Name;type=[string]$_.HardwareType} })}
+      Status 'LHM' 'PARTIAL' ('PawnIO='+$meta.pawnio.state+'; reader_admin='+$admin+'; individual sensor values determine coverage')
+    } catch {
+      $meta.errors+=('LHM: '+$_.Exception.Message)
+      Status 'LHM' 'PROVIDER_ERROR' $_.Exception.Message
+      if($lhm){try{$lhm.Close()}catch{$cleanupOk=$false;$meta.errors+=('initialization cleanup: '+$_.Exception.Message)}};$lhm=$null
+    }
+  } else { Status 'LHM' 'UNAVAILABLE' 'LibreHardwareMonitorLib not bundled' }
 # ---- WMI monitors already running ----
 $wmi = @()
 foreach ($ns in 'root\LibreHardwareMonitor','root\OpenHardwareMonitor') {
@@ -1722,23 +1740,26 @@ function Row($p, $hwid, $hwtype, $hw, $sid, $type, $name, $value, $bm, $state=''
   [ordered]@{ p=$p; hwid=[string]$hwid; hwtype=[string]$hwtype; hw=[string]$hw; sid=[string]$sid; type=[string]$type; name=[string]$name; value=$value; raw_value=$rawValue; state=$state; bm=[bool]$bm }
 }
 function WalkLhm($hw, $rows, $board) {
+  if([WsdPawnNative]::Stop){return}
   $readState=''
-  try { $hw.Update() } catch {
+  if($env:WSD_HW_TRACE -eq '1'){Write-Output ('WSD_HW_UPDATE '+$hw.Identifier)}
+  try { if($hw -is [LibreHardwareMonitor.Hardware.Hardware]){$hw.InvalidateDynamicReadings()};$hw.Update() } catch {
     $readState=if ($_.Exception -is [UnauthorizedAccessException]) { 'ACCESS_DENIED' } else { 'READ_ERROR' }
   }
   foreach ($sh in $hw.SubHardware) { WalkLhm $sh $rows $board }
   foreach ($s in $hw.Sensors) {
+    if([string]$hw.HardwareType -eq 'Memory' -and [string]$hw.Identifier -like '*dimm*' -and [string]$s.SensorType -eq 'Temperature' -and $s.Index -ne 0){continue}
     $v = $null; if ($s.Value -ne $null) { $v = [double]$s.Value }
     $bm = ([string]$hw.HardwareType -eq 'SuperIO') -and $board
     $rows.Add((Row 'LHM' $hw.Identifier $hw.HardwareType $hw.Name $s.Identifier $s.SensorType $s.Name $v $bm $readState))
   }
 }
-for ($i = 0; $i -lt $Samples; $i++) {
+for ($i = 0; $i -lt $Samples -and -not [WsdPawnNative]::Stop; $i++) {
   Write-Output ('WSD_SENS_T ' + (Get-Date).ToString('o'))
   $rows = New-Object System.Collections.Generic.List[object]
   if ($lhm) {
     foreach ($hw in $lhm.Hardware) {
-      $board = ([string]$hw.HardwareType -eq 'Motherboard') -and ($hw.Name -notmatch 'Unknown')
+      $board = ([string]$hw.HardwareType -eq 'Motherboard') -and ([string]$hw.Model -ne 'Unknown')
       WalkLhm $hw $rows $board
     }
   }
@@ -1788,7 +1809,23 @@ for ($i = 0; $i -lt $Samples; $i++) {
   Write-Output ('WSD_SENS ' + (J ($rows.ToArray())))
   if ($i -lt $Samples - 1) { Start-Sleep -Milliseconds $IntervalMs }
 }
-if ($lhm) { try { $lhm.Close() } catch { } }
+  $meta['module_diagnostics']=@([LibreHardwareMonitor.PawnIo.PawnIo]::AccessDiagnostics)
+} catch { $meta.errors+=($_.Exception.Message);Status 'LHM' 'PROVIDER_ERROR' $_.Exception.Message }
+finally {
+  try {
+    if ($lhm) { try { $lhm.Close() } catch { $cleanupOk=$false;$meta.errors+=('cleanup: '+$_.Exception.Message) } }
+    if($lease){
+      if([LibreHardwareMonitor.PawnIo.PawnIo]::CleanupUncertain){$cleanupOk=$false;$meta.errors+='Protected transaction cleanup was not confirmed'}
+      Close-WsdHardwareLease $lease $cleanupOk
+    }
+  } catch {$cleanupOk=$false;$meta.errors+=('lease cleanup: '+$_.Exception.Message)}
+  finally {
+    $meta['cleanup_confirmed']=$cleanupOk
+    if($readerOwned){try{$readerMutex.ReleaseMutex()}catch{$meta.errors+=('mutex cleanup: '+$_.Exception.Message)}}
+    if($readerMutex){$readerMutex.Dispose()}
+    Write-Output ('WSD_HW_META '+($meta|ConvertTo-Json -Depth 14 -Compress))
+  }
+}
 "#;
 
 // ---------------------------------------------------------------------
@@ -1984,6 +2021,11 @@ pub fn to_json(snap: &Snapshot) -> String {
                 .unwrap_or_else(|| "null".into())
         ),
     );
+    if let Some(meta) = &snap.hardware_metadata
+        && json::parse(meta).is_some()
+    {
+        output.insert_str(2, &format!("  \"hardware_support\": {meta},\n"));
+    }
     output
 }
 
@@ -2060,7 +2102,8 @@ pub fn collect_raw(
         }
     };
     let script = format!(
-        "& {{ {} }} -LhmDir '{}' -Samples {} -IntervalMs {}",
+        "{}\n& {{ {} }} -LhmDir '{}' -Samples {} -IntervalMs {}",
+        crate::hardware_support::base_script(),
         SAMPLER_PS1,
         lhm_dir
             .as_ref()
@@ -2073,8 +2116,9 @@ pub fn collect_raw(
     let timeout =
         std::time::Duration::from_millis(u64::from(samples) * u64::from(interval_ms) + 45_000);
     let proc_host = host.to_string();
-    let ps =
-        std::thread::spawn(move || crate::ps_exec::run_powershell(&host_owned, &script, timeout));
+    let ps = std::thread::spawn(move || {
+        crate::ps_exec::run_powershell_hardware(&host_owned, &script, timeout)
+    });
     // v1.0 process context, taken inside the sampling window.
     let procs = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(2500));
@@ -2133,8 +2177,10 @@ pub fn collect_raw(
             detail: "sensor sampler thread panicked".into(),
         }),
     }
-    if let Some(dir) = lhm_dir {
-        // The helper process has exited; the DLLs are no longer locked.
+    if raw.lines().any(|l| l.starts_with("WSD_HW_META "))
+        && let Some(dir) = lhm_dir
+    {
+        // Cooperative reader completed its cleanup before emitting final metadata.
         let _ = std::fs::remove_dir_all(dir);
     }
     providers.extend(hw_report);
@@ -2149,6 +2195,11 @@ pub fn collect_raw(
             sensors,
             providers,
             process_context,
+            hardware_metadata: raw
+                .lines()
+                .find_map(|l| l.strip_prefix("WSD_HW_META "))
+                .filter(|s| json::parse(s).is_some())
+                .map(str::to_owned),
         },
         raw,
     )
@@ -2431,6 +2482,7 @@ pub(crate) mod tests {
             sampler.add_sample(&rows, &t);
         }
         let snap = Snapshot {
+            hardware_metadata: None,
             sensors: sampler.into_sensors(),
             ..Default::default()
         };
@@ -2480,6 +2532,7 @@ pub(crate) mod tests {
                 rows.push(r);
             }
             let snap = Snapshot {
+                hardware_metadata: None,
                 sensors: sample(&rows),
                 ..Default::default()
             };
@@ -2518,7 +2571,7 @@ pub(crate) mod tests {
     #[test]
     fn rc7_field_gpu_zero_replay_and_provider_failure_invalidate_current_reading() {
         if let Ok(root) = std::env::var("WSD_RC7_FIELD_ROOT") {
-            for machine in ["CASE-F", "CASE-D", "CASE-E", "CASE-B"] {
+            for machine in ["LAB-S2", "LAB-B-SRV", "LAB-A-SRV", "DEMO-SERVER"] {
                 let dir = std::path::Path::new(&root).join(machine);
                 let path = std::fs::read_dir(dir)
                     .unwrap()
@@ -2636,6 +2689,7 @@ WSD_SENS_STATUS {"p":"nvidia-smi","state":"PROVIDER_ERROR","detail":"READ_ERROR;
     #[test]
     fn diag_105_missing_measurements_are_not_hardware_problem() {
         let snap = Snapshot {
+            hardware_metadata: None,
             captured_at: "2026-10-19T12:00:00".into(),
             providers: vec![ProviderReport {
                 provider: Provider::NvmeHealth,
@@ -3269,6 +3323,7 @@ WSD_SENS_STATUS {"p":"nvidia-smi","state":"PROVIDER_ERROR","detail":"READ_ERROR;
     #[test]
     fn missing_data_and_provider_failure_are_honest() {
         let snap = Snapshot {
+            hardware_metadata: None,
             captured_at: "t".into(),
             samples: 10,
             interval_ms: 1000,
@@ -3379,7 +3434,7 @@ WSD_SENS {\"p\":\"LHM\",\"hwid\":\"/gpu-nvidia/0\",\"hwtype\":\"GpuNvidia\",\"hw
         let b = hwinfo_block(
             &[
                 "MSI PRO Z890-P WIFI (MS-7E34) (Nuvoton NCT6687D)",
-                "S.M.A.R.T.: Samsung SSD 9100 PRO 1TB (QA-SERIAL-000001)",
+                "S.M.A.R.T.: Samsung SSD 9100 PRO 1TB (S7PZNX0R123456B)",
                 "GPU [#0]: NVIDIA GeForce RTX 5060",
             ],
             &[
@@ -3414,7 +3469,7 @@ WSD_SENS {\"p\":\"LHM\",\"hwid\":\"/gpu-nvidia/0\",\"hwtype\":\"GpuNvidia\",\"hw
     #[test]
     fn disk_keys_drop_serials_and_prefixes() {
         assert_eq!(
-            disk_key("S.M.A.R.T.: Samsung SSD 9100 PRO 1TB (QA-SERIAL-000001)"),
+            disk_key("S.M.A.R.T.: Samsung SSD 9100 PRO 1TB (S7PZNX0R123456B)"),
             "samsung ssd 9100 pro 1tb"
         );
         assert_eq!(
@@ -3430,6 +3485,7 @@ WSD_SENS {\"p\":\"LHM\",\"hwid\":\"/gpu-nvidia/0\",\"hwtype\":\"GpuNvidia\",\"hw
     #[test]
     fn json_evidence_is_valid_and_labels_session_min_max() {
         let snap = Snapshot {
+            hardware_metadata: None,
             captured_at: "2026-10-05T11:00:00".into(),
             samples: 10,
             interval_ms: 1000,
@@ -3612,6 +3668,7 @@ WSD_SENS {\"p\":\"LHM\",\"hwid\":\"/gpu-nvidia/0\",\"hwtype\":\"GpuNvidia\",\"hw
         assert_eq!(low.system_cpu_percent, 12.0);
         // The snapshot lands in the sensor evidence JSON.
         let snap = Snapshot {
+            hardware_metadata: None,
             process_context: Some(p),
             ..Default::default()
         };

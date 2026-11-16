@@ -1,0 +1,164 @@
+{
+  "result": {
+    "category": "mb",
+    "title": "PRO H610M-G DDR4",
+    "downloads": {
+      "AMI BIOS": [
+        {
+          "download_version": "7D46v1R",
+          "download_release": "2026-08-24",
+          "download_file": "mb/7D46v1R.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1R.zip"
+        },
+        {
+          "download_version": "7D46v1Q",
+          "download_release": "2026-06-16",
+          "download_file": "mb/7D46v1Q.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1Q.zip"
+        },
+        {
+          "download_version": "7D46v1Q2",
+          "download_release": "2026-05-06",
+          "download_file": "mb/7D46v1Q2.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1Q2.zip"
+        },
+        {
+          "download_version": "7D46v1P",
+          "download_release": "2026-04-07",
+          "download_file": "mb/7D46v1P.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1P.zip"
+        },
+        {
+          "download_version": "7D46v1O",
+          "download_release": "2025-09-05",
+          "download_file": "mb/7D46v1O.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1O.zip"
+        },
+        {
+          "download_version": "7D46v1N",
+          "download_release": "2025-07-11",
+          "download_file": "mb/7D46v1N.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1N.zip"
+        },
+        {
+          "download_version": "7D46v1M",
+          "download_release": "2025-04-23",
+          "download_file": "mb/7D46v1M.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1M.zip"
+        },
+        {
+          "download_version": "7D46v1L",
+          "download_release": "2024-12-06",
+          "download_file": "mb/7D46v1L.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1L.zip"
+        },
+        {
+          "download_version": "7D46v1K",
+          "download_release": "2024-11-19",
+          "download_file": "mb/7D46v1K.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1K.zip"
+        },
+        {
+          "download_version": "7D46v1J",
+          "download_release": "2024-09-05",
+          "download_file": "mb/7D46v1J.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1J.zip"
+        },
+        {
+          "download_version": "7D46v1J1(Beta version)",
+          "download_release": "2024-08-21",
+          "download_file": "mb/7D46v1J1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1J1.zip"
+        },
+        {
+          "download_version": "7D46v1H",
+          "download_release": "2024-04-09",
+          "download_file": "mb/7D46v1H.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1H.zip"
+        },
+        {
+          "download_version": "7D46v1G",
+          "download_release": "2024-01-29",
+          "download_file": "mb/7D46v1G.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1G.zip"
+        },
+        {
+          "download_version": "7D46v1F",
+          "download_release": "2023-11-02",
+          "download_file": "mb/7D46v1F.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1F.zip"
+        },
+        {
+          "download_version": "7D46v1E",
+          "download_release": "2023-09-12",
+          "download_file": "mb/7D46v1E.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1E.zip"
+        },
+        {
+          "download_version": "7D46v1C",
+          "download_release": "2023-05-22",
+          "download_file": "mb/7D46v1C.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1C.zip"
+        },
+        {
+          "download_version": "7D46v1B",
+          "download_release": "2023-03-30",
+          "download_file": "mb/7D46v1B.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1B.zip"
+        },
+        {
+          "download_version": "7D46v1A",
+          "download_release": "2023-01-11",
+          "download_file": "mb/7D46v1A.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v1A.zip"
+        },
+        {
+          "download_version": "7D46v19",
+          "download_release": "2022-11-08",
+          "download_file": "mb/7D46v19.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v19.zip"
+        },
+        {
+          "download_version": "7D46v18",
+          "download_release": "2022-09-07",
+          "download_file": "mb/7D46v18.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v18.zip"
+        },
+        {
+          "download_version": "7D46v17",
+          "download_release": "2022-07-04",
+          "download_file": "mb/7D46v17.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v17.zip"
+        },
+        {
+          "download_version": "7D46v13",
+          "download_release": "2022-05-20",
+          "download_file": "mb/7D46v13.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v13.zip"
+        },
+        {
+          "download_version": "7D46v12",
+          "download_release": "2022-03-31",
+          "download_file": "mb/7D46v12.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v12.zip"
+        },
+        {
+          "download_version": "7D46v11",
+          "download_release": "2022-02-22",
+          "download_file": "mb/7D46v11.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v11.zip"
+        },
+        {
+          "download_version": "7D46v10",
+          "download_release": "2022-01-05",
+          "download_file": "mb/7D46v10.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D46v10.zip"
+        }
+      ]
+    }
+  },
+  "status": {
+    "code": 200,
+    "response": "ok"
+  }
+}

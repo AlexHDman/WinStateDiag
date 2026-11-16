@@ -549,6 +549,7 @@ pub fn icon_refresh(painter: &Painter, center: Pos2, diameter: f32, col: Color32
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonKind {
     Primary,
+    Repair,
     Secondary,
     /// Secondary look with the softer label colour (journal "Очистить").
     Subtle,
@@ -590,6 +591,16 @@ pub fn button_colors(
             c::BORDER_INNER,
             c::BUTTON_DISABLED_TEXT,
         ),
+        (ButtonKind::Repair, true) => {
+            let fill = if pressed {
+                Color32::from_rgb(210, 155, 28)
+            } else if hovered {
+                Color32::from_rgb(255, 213, 92)
+            } else {
+                c::YELLOW_WARNING
+            };
+            (fill, fill, Color32::from_rgb(24, 24, 24))
+        }
         (ButtonKind::Primary, true) => {
             let f = if pressed {
                 c::BLUE_DARK

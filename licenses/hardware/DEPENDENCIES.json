@@ -1,0 +1,58 @@
+[
+  {
+    "package": "BlackSharp.Core/1.0.7",
+    "declared_license": "MPL-2.0",
+    "files": []
+  },
+  {
+    "package": "DiskInfoToolkit/1.1.2",
+    "declared_license": "MPL-2.0",
+    "files": []
+  },
+  {
+    "package": "HidSharp/2.6.4",
+    "declared_license": "LICENSE.txt",
+    "files": [
+      "LICENSE.txt"
+    ]
+  },
+  {
+    "package": "Mono.Posix.NETStandard/1.0.0",
+    "declared_license": null,
+    "files": []
+  },
+  {
+    "package": "RAMSPDToolkit-NDD/1.4.2",
+    "declared_license": "MPL-2.0",
+    "files": []
+  },
+  {
+    "package": "System.CodeDom/10.0.2",
+    "declared_license": "MIT",
+    "files": [
+      "THIRD-PARTY-NOTICES.TXT"
+    ]
+  },
+  {
+    "package": "System.IO.FileSystem.AccessControl/5.0.0",
+    "declared_license": "MIT",
+    "files": [
+      "LICENSE.TXT",
+      "THIRD-PARTY-NOTICES.TXT"
+    ]
+  },
+  {
+    "package": "System.IO.Ports/10.0.3",
+    "declared_license": "MIT",
+    "files": [
+      "THIRD-PARTY-NOTICES.TXT"
+    ]
+  },
+  {
+    "package": "System.Management/10.0.2",
+    "declared_license": "MIT",
+    "files": [
+      "THIRD-PARTY-NOTICES.TXT"
+    ]
+  }
+]

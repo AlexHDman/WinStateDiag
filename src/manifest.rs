@@ -63,7 +63,7 @@ use crate::ui::sysinfo::LocalTime;
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SCHEMA_VERSION: &str = "1.0";
-pub const PRODUCER: &str = "WinStateDiag";
+pub const PRODUCER: &str = "WinDiag";
 /// The canonical application version (Cargo.toml `[package] version`,
 /// release form "1.0" — see build.rs `display_version`).
 pub const PRODUCER_VERSION: &str = env!("WSD_DISPLAY_VERSION");
@@ -450,7 +450,12 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             .copied()
             .filter(|n| module_of(n) == Some(m))
             .collect();
-        if files.is_empty() {
+        let interrupted = entries
+            .iter()
+            .find(|e| e.name == "Session_Execution.json")
+            .and_then(|e| json_field(&e.bytes, &["failed_module"]))
+            .is_some_and(|name| name == module_name(m));
+        if files.is_empty() && !interrupted {
             continue;
         }
         let completed = files.iter().any(|n| !n.contains(USER_CANCELLED));
@@ -458,7 +463,13 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             format!("      \"name\": {}", json::string(module_name(m))),
             format!(
                 "      \"status\": {}",
-                json::string(if completed { "completed" } else { "cancelled" })
+                json::string(if interrupted {
+                    "failed"
+                } else if completed {
+                    "completed"
+                } else {
+                    "cancelled"
+                })
             ),
             format!("      \"evidence\": {}", str_list(&files, "      ")),
         ];
@@ -838,7 +849,12 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
         "  \"execution_status\": {},\n",
         json::string(&execution)
     ));
-    for field in ["coverage_status", "findings_status"] {
+    for field in [
+        "coverage_status",
+        "findings_status",
+        "repair_status",
+        "packaging_status",
+    ] {
         let value = entries
             .iter()
             .find(|e| e.name == "State_Summary.json")
@@ -920,7 +936,7 @@ mod tests {
     fn ctx() -> ManifestContext {
         ManifestContext {
             producer_version: PRODUCER_VERSION.to_string(),
-            package: "Клиент - MSI - 28-09-26.zip".into(),
+            package: "Алексей - MSI - 28-09-26.zip".into(),
             computer_name: "MSI".into(),
             created_at: LocalTime {
                 year: 2026,
@@ -984,13 +1000,13 @@ mod tests {
         let lock = include_str!("../Cargo.lock").replace("\r\n", "\n");
         let package = toml.split("[dependencies]").next().unwrap();
         assert!(package.contains("name = \"win_state_diag\""));
-        assert!(package.contains("\nversion = \"1.2.11\"\n"), "{package}");
-        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"1.2.11\"\n"));
-        assert_eq!(PRODUCER_VERSION, "1.2.11");
-        assert_eq!(crate::APP_VERSION, "1.2.11");
+        assert!(package.contains("\nversion = \"1.6.0\"\n"), "{package}");
+        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"1.6.0\"\n"));
+        assert_eq!(PRODUCER_VERSION, "1.6");
+        assert_eq!(crate::APP_VERSION, "1.6");
         let main = include_str!("lib.rs").replace("\r\n", "\n");
         assert!(main.contains("pub const APP_VERSION: &str = env!(\"WSD_DISPLAY_VERSION\");"));
-        assert!(main.contains("format!(\"WinStateDiag — v{APP_VERSION}\")"));
+        assert!(main.contains("format!(\"EXPC WinDiag — v{APP_VERSION}\")"));
         let build = include_str!("../build.rs");
         assert!(build.contains("res.set(\"FileVersion\", &display);"));
         assert!(build.contains("res.set(\"ProductVersion\", &display);"));
@@ -1006,7 +1022,7 @@ mod tests {
         );
         let release = include_str!("../scripts/make_release.ps1");
         assert!(release.contains("Join-Path $root 'Cargo.toml'"));
-        assert!(release.contains("\"WinStateDiag-v$version\""));
+        assert!(release.contains("\"WinDiag-v$version\""));
     }
 
     #[test]
@@ -1015,9 +1031,9 @@ mod tests {
         assert!(!bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "no BOM");
         let v = parsed(&bytes);
         assert_eq!(s(&v, "schema_version"), "1.0");
-        assert_eq!(s(&v, "producer"), "WinStateDiag");
+        assert_eq!(s(&v, "producer"), "WinDiag");
         assert_eq!(s(&v, "producer_version"), PRODUCER_VERSION);
-        assert_eq!(s(&v, "package"), "Клиент - MSI - 28-09-26.zip");
+        assert_eq!(s(&v, "package"), "Алексей - MSI - 28-09-26.zip");
         assert_eq!(s(&v, "computer_name"), "MSI");
         assert_eq!(s(&v, "created_at"), "2026-09-28T10:35:07");
         let w = v.get("windows").unwrap();
@@ -1378,7 +1394,7 @@ mod tests {
                 "{\"verdict\":\"INCOMPLETE\",\"overall\":\"INCOMPLETE\"}",
             ),
             f(
-                "CrashDump_Dump_04.10.26_10-00_01_010100-00002-01.dmp",
+                "CrashDump_Dump_04.10.26_10-00_01_100326-10421-01.dmp",
                 "MDMP",
             ),
             f("CrashDump_Analysis_04.10.26_10-00_01.txt", "raw"),
@@ -1609,7 +1625,7 @@ mod tests {
                 summary("COMPLETED"),
             ),
             EvidenceFile::new(
-                "CrashDump_Dump_06.10.26_11-00_01_010100-00001-01.dmp",
+                "CrashDump_Dump_06.10.26_11-00_01_100326-9500-01.dmp",
                 b"d".to_vec(),
             ),
             EvidenceFile::new("CrashDump_Analysis_06.10.26_11-00_02.txt", b"a".to_vec()),
@@ -1631,7 +1647,7 @@ mod tests {
             .unwrap();
         let latest = strs(m, "latest_evidence");
         assert_eq!(latest.len(), 3, "{latest:?}");
-        assert!(latest.iter().any(|n| n.ends_with("010100-00001-01.dmp")));
+        assert!(latest.iter().any(|n| n.ends_with("100326-9500-01.dmp")));
         assert!(
             latest
                 .iter()
@@ -1662,11 +1678,11 @@ mod tests {
     #[test]
     fn session_identity_is_in_the_manifest_and_additive() {
         let mut c = ctx();
-        c.session = Some(("S-20260928-103500-1".into(), "Клиент".into()));
+        c.session = Some(("S-20260928-103500-1".into(), "Алексей".into()));
         let v = parsed(&build(&c, &entries()));
         let session = v.get("session").unwrap();
         assert_eq!(s(session, "session_id"), "S-20260928-103500-1");
-        assert_eq!(s(session, "client_name"), "Клиент");
+        assert_eq!(s(session, "client_name"), "Алексей");
         assert_eq!(s(&v, "computer_name"), "MSI");
         // Empty client stays an empty string (only the computer names it).
         c.session = Some(("S-2".into(), String::new()));

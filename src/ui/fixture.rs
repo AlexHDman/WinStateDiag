@@ -10,7 +10,7 @@ use super::vm::*;
 use crate::i18n::{self, Language};
 
 pub const CLIENT_NAME: &str = "ExampleClient";
-pub const COMPUTER_NAME: &str = "QA-PC";
+pub const COMPUTER_NAME: &str = "MSI";
 pub const BENCHMARK_PATH: &str = "C:\\";
 
 #[allow(dead_code)] // canonical RU master (scenes use master_vm_in)
@@ -86,6 +86,9 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
     };
 
     DashboardVm {
+        bios: BiosVm::default(),
+        ai_export_enabled: true,
+        ai_export_busy: false,
         drivers_progress: String::new(),
         lang,
         controls_enabled: true,
@@ -101,6 +104,8 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
         computer_name: COMPUTER_NAME.into(),
         stages,
         overall: OverallVm {
+            detail: "Режим: Основная · глубокие проверки не выбирались".into(),
+            retry_export: false,
             fraction: 1.0,
             percent_text: "100%".into(),
             status_text: d.overall_status_done.into(),
@@ -115,7 +120,7 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
         },
         operation: OperationVm {
             name: d.curop_done_name.into(),
-            subtitle: "Reports\\QA-PC - 28-09-26".into(),
+            subtitle: "Reports\\MSI - 28-09-26".into(),
             fraction: Some(1.0),
             percent_text: "100%".into(),
             indeterminate: false,
@@ -177,7 +182,7 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
                 model: "Samsung 9100 PRO 1TB".into(),
                 capacity: "1 TB (931 GB)".into(),
                 interface: "NVMe".into(),
-                serial: Some("QA-SERIAL-000001".into()),
+                serial: Some("S7PZNX0R123456B".into()),
                 is_system: true,
                 has_target: true,
             },
@@ -187,7 +192,7 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
                 model: "Netac NV7000T 1TB".into(),
                 capacity: "1 TB".into(),
                 interface: "NVMe".into(),
-                serial: Some("QA-SERIAL-000002".into()),
+                serial: Some("NT2024081900001".into()),
                 is_system: false,
                 has_target: true,
             },
@@ -205,7 +210,7 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
         ssd_selected: 0,
         drivers: master_drivers(lang),
         result: ResultVm::Done {
-            path_display: "Reports\\QA-PC - 28-09-26\\QA-PC - 28-09-26.zip".into(),
+            path_display: "Reports\\MSI - 28-09-26\\MSI - 28-09-26.zip".into(),
             attention: false,
         },
         start: StartVm::NewDiagnostic,
@@ -242,6 +247,7 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
             install: None,
         },
         sensors: SensorsVm {
+            hardware: Default::default(),
             matrix: Vec::new(),
             refs: Vec::new(),
             temps: Vec::new(),

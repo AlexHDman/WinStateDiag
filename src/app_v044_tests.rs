@@ -81,6 +81,7 @@ fn tab_events(page: Page, d: &i18n::Dict) -> Vec<Vec<egui::Event>> {
     click_at(match page {
         Page::Diagnostics => rects[0].center(),
         Page::Hardware => rects[1].center(),
+        Page::Repair => rects[2].center(),
     })
 }
 
@@ -295,6 +296,7 @@ fn analyze_without_debugger_does_nothing_and_install_is_explicit() {
 
 fn msi_snapshot() -> sensors::Snapshot {
     sensors::Snapshot {
+        hardware_metadata: None,
         captured_at: "2026-10-05T11:00:00".into(),
         samples: 10,
         interval_ms: 1000,

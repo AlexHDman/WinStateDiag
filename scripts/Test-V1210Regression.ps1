@@ -36,7 +36,7 @@ Eq (ConvertFrom-VssWriters '' 0).Count $null 'empty not zero writers'
 Eq (ConvertFrom-VssWriters 'State: [1] Stable' 0).Status UNKNOWN 'headerless incomplete'
 $err=[Management.Automation.ErrorRecord]::new([Runtime.InteropServices.COMException]::new('Failure 0xc0040009',-1073479671),'DismError',[Management.Automation.ErrorCategory]::NotSpecified,$null)
 $detail=Get-DriverPackageFailure $err 'C:\user\run\dism.log'
-Eq ($detail -match 'category=DISMAPI_E_LOGGING_DISABLED') $true 'CASE-F known HRESULT'
+Eq ($detail -match 'category=DISMAPI_E_LOGGING_DISABLED') $true 'LAB-S2 known HRESULT'
 Eq ($detail -match 'scope=DRIVER_PACKAGE_COLLECTION') $true 'package scope separate'
 Eq ($detail -match 'original=Failure 0xc0040009') $true 'original retained'
 $steps=@([pscustomobject]@{execution_status='COMPLETED'})

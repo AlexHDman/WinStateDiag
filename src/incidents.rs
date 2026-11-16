@@ -891,11 +891,11 @@ pub(crate) mod tests {
             return;
         };
         for (machine, count) in [
-            ("CASE-C", 2),
-            ("CASE-D", 2),
-            ("CASE-E", 1),
-            ("CASE-F", 2),
-            ("CASE-B", 0),
+            ("CRE-SERVER", 2),
+            ("LAB-B-SRV", 2),
+            ("LAB-A-SRV", 1),
+            ("LAB-S2", 2),
+            ("DEMO-SERVER", 0),
         ] {
             let dir = std::path::Path::new(&root).join(machine);
             let text = std::fs::read_to_string(dir.join("incident-input.json")).unwrap();

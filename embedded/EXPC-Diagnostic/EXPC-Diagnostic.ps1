@@ -34,7 +34,7 @@ try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 } catch {}
 
-$ScriptVersion = if($env:WSD_APP_VERSION){$env:WSD_APP_VERSION}else{'1.2.11'}
+$ScriptVersion = if($env:WSD_APP_VERSION){$env:WSD_APP_VERSION}else{'1.3'}
 $ComputerName  = $env:COMPUTERNAME
 $CompanyName   = ''
 $StationName   = $ComputerName
@@ -136,7 +136,7 @@ function Set-CheckStatus {
     param(
         [Parameter(Mandatory=$true)][string]$Key,
         [Parameter(Mandatory=$true)]
-        [ValidateSet('OK','ATTENTION','ERROR','INFO','REVIEW','HISTORICAL','SKIPPED','NOT TESTED','UNKNOWN')]
+        [ValidateSet('OK','ATTENTION','ERROR','INFO','REVIEW','HISTORICAL','SKIPPED','NOT TESTED','UNKNOWN','REBOOT_PENDING','SERVICE_ERROR')]
         [string]$Status,
         [string]$Detail = ''
     )
@@ -208,6 +208,93 @@ function Get-DefenderStateSummary {
         Disabled = $disabled
         Unknown  = $unknown
     }
+}
+
+# Read-only correlation. ActionSuccess describes an action, not absence of an active threat.
+function Get-DefenderThreatAssessment {
+    param([object[]]$Threats,[object[]]$Detections,[string[]]$Errors=@())
+    $rows=@(); $active=0; $conflicts=0; $unknown=0; $history=0; $blocked=0; $unresolved=0
+    $ids=@(@($Threats|ForEach-Object {$_.ThreatID})+@($Detections|ForEach-Object {$_.ThreatID})|Where-Object {$null -ne $_}|Sort-Object -Unique)
+    foreach($id in $ids){
+        $t=@($Threats|Where-Object {$_.ThreatID -eq $id})
+        $ds=@($Detections|Where-Object {$_.ThreatID -eq $id})
+        $isActive=@($t|Where-Object {$_.IsActive -eq $true}).Count -gt 0
+        $knownInactive=$t.Count -gt 0 -and @($t|Where-Object {$_.IsActive -isnot [bool] -or $_.IsActive}).Count -eq 0
+        $complete=$ds.Count -gt 0; $historicalOnly=$ds.Count -gt 0; $successfulAction=$false; $pending=$false
+        foreach($d in $ds){
+            if($d.ActionSuccess -eq $true){$successfulAction=$true}
+            $start=$null; $change=$null; $remedy=$null
+            try {if($d.InitialDetectionTime){$start=[datetime]$d.InitialDetectionTime};if($d.LastThreatStatusChangeTime){$change=[datetime]$d.LastThreatStatusChangeTime};if($d.RemediationTime){$remedy=[datetime]$d.RemediationTime}} catch {$complete=$false}
+            $times=$null -ne $start -and $null -ne $change -and $null -ne $remedy -and $change -ge $start -and $remedy -ge $start -and $remedy -le $change -and $change -le (Get-Date)
+            $finished=$d.ThreatStatusID -in @(2,3,4) -and $d.ActionSuccess -eq $true -and $null -ne $d.ThreatStatusErrorCode -and $d.ThreatStatusErrorCode -eq 0 -and $null -ne $d.AdditionalActionsBitMask -and $d.AdditionalActionsBitMask -eq 0 -and $d.CurrentThreatExecutionStatusID -in @(1,4) -and $times
+            $contained=$d.ThreatStatusID -eq 6 -and $d.ActionSuccess -eq $true -and $null -ne $d.ThreatStatusErrorCode -and $d.ThreatStatusErrorCode -eq 0 -and $null -ne $d.AdditionalActionsBitMask -and $d.AdditionalActionsBitMask -eq 0 -and $d.CurrentThreatExecutionStatusID -in @(0,1,4) -and $null -ne $start -and $null -ne $change -and $change -ge $start -and $change -le (Get-Date)
+            if(!$finished){$complete=$false}
+            if(!$finished -and !$contained){$historicalOnly=$false}
+            if($d.ThreatStatusID -eq 1 -or ($d.ThreatStatusID -in @(101,102,103,104,105,107) -and !($knownInactive -and $d.ActionSuccess -eq $true)) -or $d.AdditionalActionsBitMask -gt 0 -or $d.CurrentThreatExecutionStatusID -eq 3){$pending=$true}
+        }
+        $kind=if($isActive){$active++;if($successfulAction){$conflicts++;'ACTIVE_WITH_SUCCESSFUL_ACTION'}else{'ACTIVE'}}elseif($pending){$unresolved++;'UNRESOLVED'}elseif($knownInactive -and $complete){$history++;'HISTORICAL_REMEDIATED'}elseif($knownInactive -and $historicalOnly){$blocked++;'HISTORICAL_BLOCKED'}else{$unknown++;'UNKNOWN'}
+        $state=if($isActive){'ACTIVE'}elseif($kind -eq 'HISTORICAL_REMEDIATED'){'REMEDIATED'}elseif($kind -eq 'HISTORICAL_BLOCKED'){'HISTORICAL'}else{'UNKNOWN'}
+        $rows += [pscustomobject]@{ThreatID=$id;State=$state;Classification=$kind;IsActive=$isActive;InactiveConfirmed=$knownInactive;DetectionCount=$ds.Count}
+    }
+    if(@($Threats|Where-Object {$null -eq $_.ThreatID}).Count -or @($Detections|Where-Object {$null -eq $_.ThreatID}).Count){$unknown++}
+    $limited=$Errors.Count -gt 0 -or $unknown -gt 0 -or $conflicts -gt 0
+    $status=if($active -gt 0 -or $unresolved -gt 0){'ATTENTION'}elseif($limited){'UNKNOWN'}elseif($history -gt 0 -or $blocked -gt 0){'HISTORICAL'}else{'OK'}
+    $detail="Угрозы Defender: активных=$active; незавершённых=$unresolved; подтверждённо устранённых=$history; исторических блокировок=$blocked; неопределённых=$unknown."
+    if($conflicts){$detail+=' Есть успешное действие при IsActive=True; устранение не подтверждено.'}
+    if($Errors.Count){$detail+=' Часть данных недоступна; подробности в диагностическом журнале.'}
+    [pscustomobject]@{Status=$status;Detail=$detail;Coverage=$(if($limited){'LIMITED'}else{'COMPLETE'});Rows=$rows}
+}
+
+function Get-ObservedFileEvidence {
+    param([string]$Path)
+    $r=[ordered]@{Path=$Path;CollectedAt=(Get-Date).ToString('o');Exists=$null;SHA256=$null;FileVersion=$null;Publisher=$null;SignatureStatus='UNKNOWN';Signer=$null;Error=$null;HashScope='File bytes at collection time, NOT the detection-time bytes'}
+    if($Path -notmatch '^[A-Za-z]:\\'){ $r.Error='Unsupported/nonlocal resource; not opened';return [pscustomobject]$r }
+    try {
+        $r.Exists=Test-Path -LiteralPath $Path -PathType Leaf -ErrorAction Stop
+        if(!$r.Exists){return [pscustomobject]$r}
+        $item=Get-Item -LiteralPath $Path -ErrorAction Stop
+        $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+        $sha=[Security.Cryptography.SHA256]::Create()
+        try {$r.SHA256=([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','')}finally{$stream.Dispose();$sha.Dispose()}
+        $r.FileVersion=$item.VersionInfo.FileVersion;$r.Publisher=$item.VersionInfo.CompanyName
+        try {$sig=Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop;$r.SignatureStatus=[string]$sig.Status;if($sig.SignerCertificate){$r.Signer=$sig.SignerCertificate.Subject}}catch{$r.SignatureStatus='UNAVAILABLE'}
+    } catch {$r.Error=$_.Exception.Message}
+    [pscustomobject]$r
+}
+function Get-DefenderFileEvidence {
+    param([object[]]$Threats,[object[]]$Detections,[string]$CurrentPath=$env:WSD_APP_EXE)
+    $current=if($CurrentPath){Get-ObservedFileEvidence $CurrentPath}else{$null}
+    $rows=@();$seen=@{}
+    foreach($record in @($Threats)+@($Detections)){
+        foreach($resource in @($record.Resources)){
+            $path=([string]$resource) -replace '^(?i)file:_',''
+            $key=([string]$record.ThreatID)+'|'+$path
+            if($seen.ContainsKey($key)){continue};$seen[$key]=$true
+            $file=Get-ObservedFileEvidence $path
+            $samePath=$CurrentPath -and $path -ieq $CurrentPath
+            $sameHash=$null -ne $file.SHA256 -and $null -ne $current -and $null -ne $current.SHA256 -and $file.SHA256 -eq $current.SHA256
+            $threat=@($Threats|Where-Object {$_.ThreatID -eq $record.ThreatID}|Select-Object -First 1)
+            $detection=@($Detections|Where-Object {$_.ThreatID -eq $record.ThreatID})
+            $rows+=[pscustomobject]@{ThreatID=$record.ThreatID;ThreatName=$(if($threat.Count){$threat[0].ThreatName}else{$null});Resource=[string]$resource;ObservedFile=$file;MatchesCurrentPath=[bool]$samePath;MatchesCurrentBytes=[bool]$sameHash;CurrentFileVersion=$(if($current){$current.FileVersion}else{$null});DetectionVersion='UNKNOWN unless detection-time hash/version independently available';Review=$(if($samePath -or $sameHash){'EXPC detection: submit evidence to Microsoft; false positive UNCONFIRMED, no safety override'}else{'Preserve Defender assessment'});Actions=$detection}
+        }
+    }
+    [pscustomobject]@{CurrentExecutable=$current;Resources=$rows;SubmissionUrl='https://www.microsoft.com/en-us/wdsi/filesubmission';AutomaticSubmission=$false;QuarantineChanged=$false}
+}
+function Get-ServicingHistoryEvidence {
+    $errors=@();$updates=@();$events=@();$since=(Get-Date).AddDays(-30)
+    try{$updates=@(Get-HotFix -ErrorAction Stop|Select-Object HotFixID,Description,InstalledOn)}catch{$errors+=$_.Exception.Message}
+    try{$events=@(Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-WindowsUpdateClient';StartTime=$since} -MaxEvents 512 -ErrorAction Stop|Select-Object Id,TimeCreated,Message)}catch{if($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound'){$errors+=$_.Exception.Message}}
+    [pscustomobject]@{RequestedFrom=$since.ToString('o');RequestedTo=(Get-Date).ToString('o');Returned=$events.Count;Limit=512;PossiblyTruncated=($events.Count -eq 512);OldestReturned=($events|Sort-Object TimeCreated|Select-Object -First 1 -ExpandProperty TimeCreated);Updates=$updates;Events=$events;Errors=$errors;Causality='UNKNOWN; temporal correlation does not prove an update caused corruption'}
+}
+
+function Get-DefenderThreatEvidence {
+    $threats=@(); $detections=@(); $errors=@()
+    try {$threats=@(Get-MpThreat -ErrorAction Stop | Select-Object ThreatID,ThreatName,SeverityID,CategoryID,IsActive,DidThreatExecute,Resources)}
+    catch {$errors+=('Get-MpThreat: '+$_.Exception.Message)}
+    try {$detections=@(Get-MpThreatDetection -ErrorAction Stop | Select-Object DetectionID,ThreatID,InitialDetectionTime,LastThreatStatusChangeTime,RemediationTime,ThreatStatusID,ThreatStatusErrorCode,CurrentThreatExecutionStatusID,CleaningActionID,ActionSuccess,AdditionalActionsBitMask,Resources)}
+    catch {$errors+=('Get-MpThreatDetection: '+$_.Exception.Message)}
+    $assessment=Get-DefenderThreatAssessment -Threats $threats -Detections $detections -Errors $errors
+    [pscustomobject]@{CollectedAt=(Get-Date).ToString('o');Threats=$threats;Detections=$detections;Errors=$errors;Assessment=$assessment;FileEvidence=(Get-DefenderFileEvidence $threats $detections)}
 }
 
 function Write-DiagResult {
@@ -624,6 +711,7 @@ function Invoke-NativeWithProgress {
     $processId = $null
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $lastPercent = $null
+    $exitCode=$null; $exitCodeKnown=$false
 
     try {
         Write-Host ''
@@ -738,9 +826,20 @@ function Invoke-NativeWithProgress {
         Show-LiveProgress -Label $Label -Percent $lastPercent -Elapsed $sw.Elapsed -Complete
         throw
     } finally {
+        $rawCaptureFailed=$false
+        if($ReportDirectory -and $Label -match '^(SFC|DISM|CHKDSK)') {
+            $nativeId=[guid]::NewGuid().ToString('N')
+            foreach($pair in @(@('stdout',$stdoutPath),@('stderr',$stderrPath))) {
+                try { if(Test-Path -LiteralPath $pair[1]) { Copy-Item -LiteralPath $pair[1] -Destination (Join-Path $ReportDirectory ($ReportBaseName+'_Native_'+$nativeId+'_'+$pair[0]+'.bin')) -ErrorAction Stop } }
+                catch { $rawCaptureFailed=$true; Write-Log ('[ERROR] Не сохранён исходный вывод команды; временный файл сохранён: '+$pair[1]+'; '+$_.Exception.Message) }
+            }
+            try {
+            [ordered]@{Command=$FilePath;Arguments=$Arguments;Label=$Label;CaptureId=$nativeId;EndedAt=(Get-Date).ToString('o');ExitCode=$exitCode;ExitCodeKnown=$exitCodeKnown} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $ReportDirectory ($ReportBaseName+'_Native_'+$nativeId+'.json')) -Encoding UTF8 -ErrorAction Stop
+            } catch { Write-Log ('[ERROR] Не сохранены метаданные команды: '+$_.Exception.Message) }
+        }
         foreach ($f in @($stdoutPath, $stderrPath)) {
             try {
-                if (Test-Path -LiteralPath $f) {
+                if (!$rawCaptureFailed -and (Test-Path -LiteralPath $f)) {
                     Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
                 }
             } catch {}
@@ -939,22 +1038,25 @@ function Get-DismRepairIntelligence {
     #                          recorded repair (context, INFO);
     #   CURRENT_CORRUPTION   - current run reports corruption (ATTENTION /
     #                          ERROR when not repairable);
-    #   RECURRENT_CORRUPTION - current corruption AFTER an earlier
-    #                          successful repair (ATTENTION, check storage /
-    #                          RAM before repeating repairs);
+    # Recurrence requires component/version/file correlation, handled by WinSxS analysis.
     #   UNKNOWN              - current result not recognised.
     param([string]$CurrentText = '', [string[]]$HistoryLines = @(), [datetime]$RunStartedAt = (Get-Date))
     $corruptRx = '(?i)component store is repairable|component store cannot be repaired|corruption detected|CSI Corrupt|STATUS_SXS_COMPONENT_STORE_CORRUPT|0x80073712'
     $repairRx = '(?i)restore operation completed successfully|операция восстановления успешно завершена'
     # IdleScavenge / repair complete is scheduler housekeeping, not a repair result.
     $dateOf = { param($l) if ([string]$l -match '^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})') { $dt=[datetime]::MinValue;if([datetime]::TryParse($Matches[1],[ref]$dt)){$dt.ToString('s')} } }
-    $HistoryLines=@($HistoryLines|Where-Object { $stamp=& $dateOf $_; !$stamp -or [datetime]$stamp -lt $RunStartedAt })
-    $histCorrupt = @($HistoryLines | Where-Object { $_ -match $corruptRx -and $_ -notmatch '(?i)No component store corruption' })
+    $HistoryLines=@($HistoryLines|Where-Object { $stamp=& $dateOf $_; $stamp -and [datetime]$stamp -lt $RunStartedAt })
+    $histCorrupt = @($HistoryLines | Where-Object {
+        # Numeric counters are not affirmative sentences: zero is not corruption.
+        if ($_ -match '(?i)(?:Count of times corruption detected|Total Detected Corruption|CSI (?:Payload|Manifest|Metadata) Corruption|CBS Manifest Corruption|CSI FileFlags Corrupt):\s*(\d+)') {
+            [long]$Matches[1] -gt 0
+        } else { $_ -match $corruptRx -and $_ -notmatch '(?i)No component store corruption|no corruption detected' }
+    })
     $histRepair = @($HistoryLines | Where-Object { $_ -match $repairRx -and $_ -notmatch '(?i)IdleScavenge|and/or' } | Sort-Object)
     $histCorrupt = @($histCorrupt | Sort-Object)
     $current = if ($CurrentText -match 'component store cannot be repaired|хранилище компонентов не подлежит восстановлению') { 'NOT_REPAIRABLE' }
         elseif ($CurrentText -match 'component store is repairable|хранилище компонентов подлежит восстановлению') { 'REPAIRABLE' }
-        elseif ($CurrentText -match 'No component store corruption detected|повреждений хранилища компонентов не обнаружено') { 'CLEAN' }
+        elseif ($CurrentText -match 'No component store corruption detected|повреждени(?:й|е) хранилища компонентов не обнаружено') { 'CLEAN' }
         else { 'UNKNOWN' }
     $lastCorrupt = if ($histCorrupt.Count) { & $dateOf $histCorrupt[-1] } else { $null }
     $lastRepair = if ($histRepair.Count) { & $dateOf $histRepair[-1] } else { $null }
@@ -977,8 +1079,8 @@ function Get-DismRepairIntelligence {
             $status = if ($current -eq 'NOT_REPAIRABLE') { 'ERROR' } else { 'ATTENTION' }
             $what = if ($current -eq 'NOT_REPAIRABLE') { 'повреждено и не может быть восстановлено обычным способом' } else { 'повреждено, но подлежит восстановлению' }
             if ($histRepair.Count -and $histCorrupt.Count -and $lastRepair -and $lastCorrupt -and $lastRepair -ge $lastCorrupt) {
-                $verdict = 'RECURRENT_CORRUPTION'
-                $detail = 'ПОВТОРНОЕ ПОВРЕЖДЕНИЕ: хранилище компонентов {0}, хотя ранее уже восстанавливалось ({1}). Перед повторным восстановлением проверьте накопитель и память. Автоматическое восстановление не выполнялось.' -f $what, (& $when $lastRepair)
+                $verdict = 'CURRENT_CORRUPTION'
+                $detail = 'Сейчас хранилище компонентов {0}. В истории есть успешное восстановление ({1}); повторное повреждение тех же файлов не доказано. Причина повреждения не установлена.' -f $what, (& $when $lastRepair)
             } else {
                 $verdict = 'CURRENT_CORRUPTION'
                 $detail = 'DISM сообщает: хранилище компонентов {0}. Восстановление выполняется только вручную (DISM /RestoreHealth); автоматически ничего не менялось.' -f $what
@@ -994,14 +1096,36 @@ function Get-DismRepairIntelligence {
 
 function Get-SfcSemanticResult {
     param([string]$Text, [bool]$CbsViolation, [bool]$ExitCodeKnown, $ExitCode)
-    $n = ((($Text -replace "`0", '') -replace 'ё', 'е') -replace '\s+', ' ').Trim()
-    if ($n -match 'system repair pending|ожидается восстановление системы|восстановление системы, для завершения которого требуется перезагрузка|ожидающее восстановления|требуется перезагрузка для завершения восстановления|требуется перезагрузка') { return 'REBOOT_PENDING' }
+    # Only explicit final Windows output; CBS evidence cannot silently override a clean result.
+    $console = (($Text -replace "`0", '') -split '\r?\n' | Where-Object { $_ -notmatch '^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}' }) -join ' '
+    $n = (($console -replace 'ё', 'е') -replace '\s+', ' ').Trim()
+    if ($n -match 'there is a system repair pending which requires reboot to complete|восстановление системы, для завершения которого требуется перезагрузка|требуется перезагрузка для завершения восстановления') { return 'REBOOT_PENDING' }
     if ($n -match 'could not start the repair service|не удалось запустить службу восстановления|не удается запустить службу восстановления') { return 'SERVICE_ERROR' }
-    if ($n -match 'could not perform the requested operation|не может выполнить запрошенную операцию|you must be an administrator|необходимо быть администратором') { return 'ERROR' }
-    if ($CbsViolation -or $n -match 'found integrity violations|found corrupt files|обнаружила нарушения целостности|обнаружила поврежд[её]нные файлы') { return 'INTEGRITY_VIOLATIONS' }
-    if ($ExitCodeKnown -and $ExitCode -ne 0) { return 'ERROR' }
-    if ($n -match 'did not find any integrity violations|не обнаружила нарушений целостности|нарушений целостности не обнаружила') { return 'CLEAN' }
+    if (($ExitCodeKnown -and $ExitCode -ne 0) -or $n -match 'could not perform the requested operation|не может выполнить запрошенную операцию|you must be an administrator|необходимо быть администратором') { return 'ERROR' }
+    $clean = $n -match 'did not find any integrity violations|не обнаружила нарушений целостности|нарушений целостности не обнаружила'
+    $bad = $n -match 'found integrity violations|found corrupt files|обнаружила нарушения целостности|обнаружила поврежденные файлы'
+    if ($clean -and ($bad -or $CbsViolation)) { return 'UNKNOWN' }
+    if ($bad -or $CbsViolation) { return 'INTEGRITY_VIOLATIONS' }
+    if ($clean) { return 'CLEAN' }
     return 'UNKNOWN'
+}
+function Get-SfcClassification {
+    param([string]$Semantic,[bool]$Completed=$true)
+    if(!$Completed){return 'INCOMPLETE'}
+    switch($Semantic){'CLEAN'{'PASS'} 'INTEGRITY_VIOLATIONS'{'ATTENTION'} 'ERROR'{'EXECUTION_FAILED'} 'SERVICE_ERROR'{'EXECUTION_FAILED'} 'REBOOT_PENDING'{'INCOMPLETE'} default{'UNKNOWN'}}
+}
+
+function Get-SfcCbsViolations {
+    param([string]$Text,[datetime]$StartedAt,[datetime]$EndedAt)
+    # Timestamp-scoped records survive rotation; old/undated records cannot override SFC.
+    $inWindow=$false
+    foreach($line in ($Text -split '\r?\n')) {
+        if($line -match '^\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})') {
+            $time=[datetime]::MinValue
+            $inWindow=[datetime]::TryParse($Matches[1],[ref]$time) -and $time -ge $StartedAt.AddSeconds(-1) -and $time -le $EndedAt.AddSeconds(1)
+        }
+        if($inWindow -and $line -match 'Cannot repair|Repair failed|\[SR\].*(?:не удается восстановить|не удалось восстановить)|Hashes for file member.*do not match|CSI.*(?:Payload Corrupt|Manifest Corrupt|hash mismatch)|STATUS_SXS_COMPONENT_STORE_CORRUPT' -and $line -notmatch '(?i)no.*corrupt|corruption.*(?:0|none)') { $line }
+    }
 }
 
 function Export-ServicingEvidence {
@@ -1035,7 +1159,7 @@ function Export-ServicingEvidence {
         } catch {[void]$errors.Add($_.Exception.Message)}
     }
     foreach($main in @('Logs\CBS\CBS.log','Logs\DISM\dism.log')){if(!(Test-Path -LiteralPath (Join-Path $WindowsRoot $main))){[void]$errors.Add(('Active log unavailable or rotated: '+$main))}}
-    $keyRx='(?i)\[SR\].*(?:cannot repair|corrupt|repairing)|Hashes for file member|CSI.*(?:corrupt|mismatch|payload)|cannot repair|repair failed|corruption detected|component store is repairable|component store cannot be repaired|Total (?:Detected|Repaired) Corruption|STATUS_SXS_COMPONENT_STORE_CORRUPT|0x800[0-9a-f]{5}|RestoreHealth|restore operation completed|Summary:.*(?:repair|corrupt)|поврежд|нарушени.*целостност'
+    $keyRx='(?i)\[SR\].*(?:cannot repair|corrupt|repairing)|Hashes for file member|CSI.*(?:corrupt|mismatch|payload)|cannot repair|repair failed|corruption detected|component store is repairable|component store cannot be repaired|Total (?:Detected|Repaired) Corruption|STATUS_SXS_COMPONENT_STORE_CORRUPT|0x800[0-9a-f]{5}|RestoreHealth|restore operation completed|Summary:|Operation: (?:Detect only|Detect and Repair)|Operation result:|поврежд|нарушени.*целостност'
     $encoding=New-Object Text.UTF8Encoding($false)
     $state=@{bytes=[long]0;last=0;after=0;keys=0;records=0;ranges=(New-Object Collections.ArrayList)}
     $indexPath=Join-Path $Directory ($prefix+'HistoryIndex.jsonl')
@@ -1688,7 +1812,6 @@ function Get-VssVolumeText {
 function Get-VssClassification {
     param([int]$NearLimitCount, [int]$RecentFailureCount, [int]$OlderFailureCount)
     if ($RecentFailureCount -gt 0) { return 'ATTENTION' }
-    if ($NearLimitCount -gt 0 -and $OlderFailureCount -gt 0) { return 'ATTENTION' }
     if ($NearLimitCount -gt 0 -or $OlderFailureCount -gt 0) { return 'INFO' }
     return 'OK'
 }
@@ -1697,12 +1820,14 @@ function Get-VssEventClassification {
     param([string]$Provider,[int]$Id,[string]$Message)
     if ($Message -match '(?i)0x8007045b|system shutdown is in progress|ид[её]т завершение работы системы') { return 'SERVICE_CONTEXT' }
     if ($Provider -eq 'volsnap') {
+        if ($Id -eq 29) { return 'DETECTION_CONTEXT' }
         if ($Id -eq 33) { return 'ROTATION' }
         if ($Id -eq 95 -and $Message -match '(?i)oldest shadow copy.*deleted.*marked for delete|самая старая теневая копия.*удален') { return 'DELETE_DEPENDENCY_CONTEXT' }
         if ($Id -eq 36 -and $Message -match '(?i)user.imposed limit|пользоват.*огранич|огранич.*пользоват') { return 'QUOTA_INTERRUPTION' }
         if ($Message -match '(?i)aborted|could not grow|прерван|не удалось.*(?:созда|увелич)|удалены.*недостат') { return 'SHADOW_LOSS' }
         return 'UNKNOWN'
     }
+    if ($Id -eq 8231 -and $Message -match '(?i)snapshot creation initiated|создани[ея].*(?:тенев|снимк).*(?:начат|иници)|(?:начат|иници).*создани.*(?:тенев|снимк)') { return 'SNAPSHOT_INITIATED' }
     if ($Id -in 8224,8225) { return 'SERVICE_CONTEXT' }
     if ($Id -in 8193,8194,12289,12293,12298,13) { return 'OPERATION_FAILURE' }
     return 'UNKNOWN'
@@ -1772,6 +1897,28 @@ function ConvertFrom-VssWriters([string]$Text,[int]$ExitCode) {
     $status=if($failed){'ATTENTION'}elseif(!$complete){'UNKNOWN'}elseif($waiting){'WAITING'}else{'OK'}
     [pscustomobject]@{Status=$status;Count=if($headers.Count){$headers.Count}else{$null};Stable=$stable;Waiting=$waiting;Failed=$failed;Unknown=$unknown;Coverage=if($complete){'COMPLETE'}else{'LIMITED'};ExitCode=$ExitCode;Writers=$writers;Raw=$Text}
 }
+function Get-VssServiceClassification($Service) {
+    if($null -eq $Service){return 'UNKNOWN'}
+    if($Service.StartMode -eq 'Disabled'){return 'DISABLED'}
+    if($Service.State -eq 'Running'){return 'AVAILABLE'}
+    if($Service.State -eq 'Stopped' -and $Service.StartMode -in @('Manual','Demand')){return 'ON_DEMAND'}
+    return 'UNKNOWN'
+}
+function Get-VssPlatformFacts {
+    $errors=@();$services=@();$providers=@()
+    try {
+        $rows=@(Get-CompatInstance -Class Win32_Service -Filter "Name='VSS' OR Name='swprv' OR Name='RpcSs'" -ErrorAction Stop)
+        foreach($name in @('VSS','swprv','RpcSs')) {
+            $row=$rows|Where-Object Name -eq $name|Select-Object -First 1
+            $services += [pscustomobject]@{Name=$name;State=$row.State;StartMode=$row.StartMode;Classification=(Get-VssServiceClassification $row)}
+        }
+    }catch{$errors+=('Службы VSS: '+$_.Exception.Message)}
+    try { $providers=@(Get-CompatInstance -Class Win32_ShadowProvider -ErrorAction Stop|Select-Object Name,ID,Type,Version) }
+    catch{$errors+=('Поставщики VSS: '+$_.Exception.Message)}
+    $status=if(@($services|Where-Object Classification -eq 'DISABLED').Count){'ATTENTION'}elseif($errors.Count -or $services.Count -ne 3 -or @($services|Where-Object Classification -eq 'UNKNOWN').Count -or !$providers.Count){'UNKNOWN'}else{'OK'}
+    [pscustomobject]@{Status=$status;Services=$services;Providers=$providers;Errors=$errors;SnapshotCreation='NOT TESTED'}
+}
+
 function Get-VssWriters {
     $proc=$null;$outStream=$null;$errStream=$null
     try {
@@ -1954,12 +2101,12 @@ function Get-ExecutionStatus([object[]]$Steps,[object[]]$Checks) {
 }
 function Get-CoverageStatus([object[]]$Steps,[object[]]$Checks) {
     if(!$Checks.Count){return 'NO_DATA'}
-    if(@($Steps|Where-Object execution_status -ne 'COMPLETED').Count -or @($Checks|Where-Object {$_.Status -in @('UNKNOWN','INCOMPLETE','SKIPPED','NOT TESTED','REVIEW') -or (Test-CheckExecutionError $_)}).Count){return 'LIMITED'}
+    if(@($Steps|Where-Object execution_status -ne 'COMPLETED').Count -or @($Checks|Where-Object {$_.Status -in @('UNKNOWN','INCOMPLETE','SKIPPED','NOT TESTED','REVIEW','REBOOT_PENDING') -or (Test-CheckExecutionError $_)}).Count){return 'LIMITED'}
     return 'COMPLETE'
 }
 function Get-FindingsStatus([object[]]$Checks) {
-    if(@($Checks|Where-Object {$_.Status -in @('ATTENTION','WARNING','CRITICAL','REPAIRABLE','INTEGRITY_VIOLATIONS') -or ($_.Status -eq 'ERROR' -and !(Test-CheckExecutionError $_))}).Count){return 'ATTENTION'}
-    if(!$Checks.Count -or @($Checks|Where-Object {$_.Status -in @('UNKNOWN','INCOMPLETE','SKIPPED','NOT TESTED','REVIEW') -or (Test-CheckExecutionError $_)}).Count){return 'UNKNOWN'}
+    if(@($Checks|Where-Object {$_.Status -in @('ATTENTION','WARNING','CRITICAL','REPAIRABLE','INTEGRITY_VIOLATIONS','REBOOT_PENDING') -or ($_.Status -eq 'ERROR' -and !(Test-CheckExecutionError $_))}).Count){return 'ATTENTION'}
+    if(!$Checks.Count -or @($Checks|Where-Object {$_.Status -in @('UNKNOWN','INCOMPLETE','SKIPPED','NOT TESTED','REVIEW','REBOOT_PENDING') -or (Test-CheckExecutionError $_)}).Count){return 'UNKNOWN'}
     return 'NO_FINDINGS'
 }
 
@@ -2538,32 +2685,59 @@ $continue = Invoke-Step -Number 5 -Title 'VSS Shadow Storage и события V
     $vss=Get-VssShadowStorageInfo
     $evidence=Get-VssEventEvidence
     $writers=Get-VssWriters
-    $script:VssEvidence=[PSCustomObject]@{Storage=$vss;Writers=$writers}
-    Write-ObjectLog $vss.Rows -Format List
-    Write-Log ('Модули записи VSS: состояние='+$writers.Status+'; обнаружено='+$writers.Count+'; '+$writers.Raw)
+    $platform=Get-VssPlatformFacts
+    $eventRows=@()
+    $serviceDetail=(@($platform.Services|ForEach-Object {
+        $label=switch($_.Classification){AVAILABLE{'работает'} ON_DEMAND{'запуск по запросу'} DISABLED{'отключена'} default{'нет данных'}}
+        "$($_.Name): $label"
+    }) -join '; ')
+    if([string]::IsNullOrWhiteSpace($serviceDetail)){$serviceDetail='нет данных'}
+    Set-CheckStatus -Key 'VSS services/providers' -Status $platform.Status -Detail ("Службы: $serviceDetail. Зарегистрировано поставщиков: $(@($platform.Providers).Count).")
+    Write-Log ('Службы VSS: '+$serviceDetail)
+    foreach($provider in @($platform.Providers)){Write-Log ("Поставщик VSS: {0}; версия {1}" -f $provider.Name,$provider.Version)}
+    foreach($err in @($platform.Errors)){Write-Log ('Ошибка сбора VSS: '+$err)}
+    Set-CheckStatus -Key 'VSS snapshot creation' -Status 'NOT TESTED' -Detail 'Создание теневой копии не выполнялось: проверка изменяет систему. Наличие providers и стабильных writers не подтверждает успешность резервного копирования.'
+    foreach($row in @($vss.Rows)){
+        $parts=@()
+        foreach($field in @(@('Volume','Том'),@('StorageVolume','Хранилище'),@('UsedGB','Занято, ГБ'),@('AllocatedGB','Выделено, ГБ'),@('MaximumGB','Лимит, ГБ'),@('Shadows','Копий'))){
+            $value=$row.($field[0]);if($null -ne $value -and [string]$value -ne ''){$parts+=('{0}: {1}' -f $field[1],$value)}
+        }
+        if($parts.Count){Write-Log ('Хранилище VSS — '+($parts -join '; '))}
+        if($row.ShadowQueryError){Write-Log ('Сведения о копиях недоступны: '+$row.ShadowQueryError)}
+    }
+    Write-Log ('Модули записи VSS: состояние='+$writers.Status+'; обнаружено='+$writers.Count+'; Stable='+$writers.Stable+'; Waiting='+$writers.Waiting+'; Failed='+$writers.Failed+'; Unknown='+$writers.Unknown)
+    if($ReportDirectory){try{[IO.File]::WriteAllText((Join-Path $ReportDirectory ($ReportBaseName+'_VSS_writers_raw.txt')),[string]$writers.Raw,[Text.Encoding]::UTF8)}catch{Write-Log ('Ошибка сохранения исходного VSS output: '+$_.Exception.Message)}}
     $recent=0; $older=0; $unknown=0; $rotation=0
     foreach ($ev in $evidence.Events) {
         $kind=Get-VssEventClassification $ev.ProviderName $ev.Id ([string]$ev.Message)
+        $eventRows += [pscustomobject]@{TimeCreated=$ev.TimeCreated;Provider=$ev.ProviderName;Id=$ev.Id;Classification=$kind;Message=[string]$ev.Message}
         Write-Log ("VSS EVIDENCE {0} {1} #{2} [{3}] {4}" -f $ev.TimeCreated.ToString('s'),$ev.ProviderName,$ev.Id,$kind,$ev.Message)
         if ($kind -in 'QUOTA_INTERRUPTION','SHADOW_LOSS','OPERATION_FAILURE') {
             if ($ev.TimeCreated -ge (Get-Date).AddDays(-7)) { $recent++ } else { $older++ }
         } elseif ($kind -eq 'UNKNOWN') { $unknown++ } else { $rotation++ }
     }
-    $missing=($writers.Status -eq 'UNKNOWN' -or ($writers.PSObject.Properties['Coverage'] -and $writers.Coverage -ne 'COMPLETE') -or -not $vss.Success -or @($vss.Rows).Count -eq 0 -or $evidence.Errors.Count -gt 0 -or $unknown -gt 0)
+    $missing=($platform.Status -eq 'UNKNOWN' -or $writers.Status -eq 'UNKNOWN' -or ($writers.PSObject.Properties['Coverage'] -and $writers.Coverage -ne 'COMPLETE') -or -not $vss.Success -or @($vss.Rows).Count -eq 0 -or $evidence.Errors.Count -gt 0 -or $unknown -gt 0)
     if($missing){Set-CheckStatus -Key 'VSS coverage' -Status 'UNKNOWN' -Detail 'Данные VSS неполны; подтверждённые сбои сохранены отдельно.'}
-    $status=if($recent -gt 0 -or $writers.Status -eq 'ATTENTION'){'ATTENTION'}elseif($missing){'UNKNOWN'}elseif($writers.Status -eq 'WAITING' -or $older -gt 0 -or $rotation -gt 0 -or $vss.NearLimitCount -gt 0){'INFO'}else{'OK'}
-    $detail="Сбои VSS/Volsnap: недавних=$recent; исторических=$older; ротация/контекст=$rotation; неизвестных=$unknown; областей хранения=$(@($vss.Rows).Count); ошибки запросов=$($evidence.Errors -join '; '); ошибка хранилища=$($vss.Error). Отсутствие области не доказывает исправность; причина отключения не определяется."
-    $detail += (" Writers={0}, count={1}; Stable={2}; Waiting={3}; Failed={4}; Unknown={5}; storage={6}" -f $writers.Status,$writers.Count,$writers.Stable,$writers.Waiting,$writers.Failed,$writers.Unknown,($vss.Rows|ConvertTo-Json -Compress))
+    $status=if($recent -gt 0 -or $writers.Status -eq 'ATTENTION' -or $platform.Status -eq 'ATTENTION'){'ATTENTION'}elseif($missing){'UNKNOWN'}elseif($writers.Status -eq 'WAITING' -or $older -gt 0 -or $rotation -gt 0 -or $vss.NearLimitCount -gt 0){'INFO'}else{'OK'}
+    $detail="События VSS: недавних=$recent; исторических=$older; контекстных=$rotation; неклассифицированных=$unknown. Недавнее событие не доказывает текущий отказ."
+    $detail += (" Модули записи: всего {0}, стабильных {1}, ожидающих {2}, с ошибкой {3}, неизвестных {4}. Областей хранения: {5}." -f $writers.Count,$writers.Stable,$writers.Waiting,$writers.Failed,$writers.Unknown,@($vss.Rows).Count)
+    if($writers.Waiting -gt 0){$detail+=' Ожидание само по себе не является неисправностью.'}
+    if($missing){$detail+=' Покрытие ограничено.'}
+    if($vss.NearLimitCount -gt 0){$detail+=' Область хранения близка к лимиту.'}
     # A query failure is separate from the health of the writers/storage.
-    $collectionErrors=@($evidence.Errors)
+    $collectionErrors=@($evidence.Errors)+@($platform.Errors)
     if(!$vss.Success){$collectionErrors += ('Хранилище VSS: '+$vss.Error)}
     if($writers.PSObject.Properties['ExitCode'] -and ($null -eq $writers.ExitCode -or $writers.ExitCode -ne 0)){
-        $collectionErrors += ('Чтение модулей записи VSS: '+$writers.Raw)
+        $collectionErrors += ('Чтение модулей записи VSS: охват '+$writers.Coverage+'; исходный вывод в VSS_writers_raw.txt / JSON')
     }
-    if($collectionErrors.Count){Set-CheckStatus -Key 'VSS collection' -Status 'ERROR' -Detail ($collectionErrors -join '; ')}
+    $script:VssEvidence=[PSCustomObject]@{Storage=$vss;Writers=$writers;Platform=$platform;Events=$eventRows;CollectionErrors=$collectionErrors}
+    if($collectionErrors.Count){
+        Write-ObjectLog $collectionErrors -Format List
+        Set-CheckStatus -Key 'VSS collection' -Status 'ERROR' -Detail ("Не удалось выполнить запросы VSS: {0}. Подробности в диагностическом журнале." -f $collectionErrors.Count)
+    }
     Set-CheckStatus -Key 'VSS Shadow Storage' -Status $status -Detail $detail
     Write-Log $detail
-    if($vss.Success -and @($vss.Rows).Count -gt 0){Write-ObjectLog $vss.Rows -Format Table}
+    # Full storage records remain in VssEvidence JSON; do not duplicate a technical table in TXT.
 }
 if (-not $continue) { break Diagnostics }
 
@@ -2734,9 +2908,11 @@ $continue = Invoke-Step -Number 6 -Title 'WHEA / CPER за 30 дней — кл�
             Add-Attention $msg
             Set-CheckStatus -Key 'WHEA' -Status 'ATTENTION' -Detail $msg
         } elseif ($correctedCount -gt 0) {
-            $msg = "WHEA: обнаружены Corrected аппаратные записи: {0}." -f $correctedCount
-            Add-Attention $msg
-            Set-CheckStatus -Key 'WHEA' -Status 'ATTENTION' -Detail $msg
+            $recentCorrected=@($parsed|Where-Object {$_.Severity -eq 'Corrected' -and $_.TimeCreated -ge (Get-Date).AddDays(-7)}).Count
+            $correctedStatus=if($recentCorrected -gt 0){'ATTENTION'}else{'HISTORICAL'}
+            $msg = "WHEA: исправленных записей {0}; за 7 дней {1}. Исправленное событие само по себе не доказывает неисправность оборудования." -f $correctedCount,$recentCorrected
+            if($recentCorrected -gt 0){Add-Attention $msg} # Recent corrected events retain the existing warning.
+            Set-CheckStatus -Key 'WHEA' -Status $correctedStatus -Detail $msg
         } elseif ($unknownCount -gt 0) {
             $msg = "WHEA: {0} записей не удалось классифицировать по CPER Severity; нужен инженерный разбор." -f $unknownCount
             Add-Attention $msg
@@ -3005,6 +3181,7 @@ $continue = Invoke-Step -Number 8 -Title 'Ошибки приложений за
         )
         $msg = "Crash/Hang/.NET/WER за 14 дней: {0}; уникальных групп: {1}: {2}." -f $crashEvents.Count, $crashGroups.Count, ($named -join '; ')
         Add-Attention $msg
+        $msg += ' Это события приложений, а не доказательство неисправности ОС или оборудования.'
         Set-CheckStatus -Key 'Applications' -Status 'ATTENTION' -Detail $msg
     } elseif ($crashEvents.Count -gt 0 -and $componentEvents.Count -eq 0) {
         Set-CheckStatus -Key 'Applications' -Status 'INFO' -Detail ('Исторические события / известный шум / тестовые инструменты: '+$crashEvents.Count+'; исходные события сохранены, самостоятельный отказ Windows не доказан.')
@@ -3068,7 +3245,7 @@ $continue = Invoke-Step -Number 10 -Title 'Антивирус и состоян�
 
     if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
         try {
-            $mp = Get-MpComputerStatus
+            $mp = Get-MpComputerStatus -ErrorAction Stop
 
             Write-ObjectLog (
                 $mp | Select-Object AntivirusEnabled, AMServiceEnabled, RealTimeProtectionEnabled,
@@ -3093,46 +3270,22 @@ $continue = Invoke-Step -Number 10 -Title 'Антивирус и состоян�
         }
 
         Write-Log ''
-        Write-Log 'Активные угрозы Defender:'
-        try {
-            $activeThreats = @(
-                Get-MpThreat -ErrorAction Stop |
-                Where-Object { $_.IsActive -eq $true }
-            )
-
-            if ($activeThreats.Count -gt 0) {
-                Write-ObjectLog (
-                    $activeThreats |
-                    Select-Object ThreatID, ThreatName, SeverityID, CategoryID, IsActive, DidThreatExecute
-                ) -Format List
-
-                $msg = "Defender сообщает активные угрозы: {0}" -f $activeThreats.Count
-                Add-Attention $msg
-                Set-CheckStatus -Key 'Defender' -Status 'ATTENTION' -Detail $msg
-            } else {
-                Write-Log 'Активных угроз не обнаружено.'
-            }
-        } catch {
-            Write-Log ("Get-MpThreat недоступен/нет данных: {0}" -f $_.Exception.Message)
+        $script:DefenderEvidence=Get-DefenderThreatEvidence
+        $threatResult=$script:DefenderEvidence.Assessment
+        Write-Log 'Первичные сведения Defender и история действий:'
+        Write-ObjectLog $script:DefenderEvidence.Threats -Format List
+        Write-ObjectLog $script:DefenderEvidence.Detections -Format List
+        Write-ObjectLog $script:DefenderEvidence.Errors -Format List
+        Set-CheckStatus -Key 'Defender threats' -Status $threatResult.Status -Detail $threatResult.Detail
+        Write-Log $threatResult.Detail
+        if($threatResult.Status -eq 'ATTENTION'){Add-Attention $threatResult.Detail}
+        if($threatResult.Coverage -eq 'LIMITED'){
+            Set-CheckStatus -Key 'Defender coverage' -Status 'UNKNOWN' -Detail 'Не все сведения об угрозах получены или согласованы; устранение не подтверждено.'
+        }
+        if($script:DefenderEvidence.Errors.Count){
+            Set-CheckStatus -Key 'Defender collection' -Status 'ERROR' -Detail 'Ошибка чтения сведений об угрозах Defender; подробности сохранены в диагностическом журнале.'
         }
 
-        Write-Log ''
-        Write-Log 'История обнаружений Defender (до 10; история НЕ равна активной угрозе):'
-        try {
-            $history = @(
-                Get-MpThreatDetection -ErrorAction Stop |
-                Sort-Object InitialDetectionTime -Descending |
-                Select-Object -First 10 InitialDetectionTime, ThreatID, ActionSuccess, Resources
-            )
-
-            if ($history.Count -gt 0) {
-                Write-ObjectLog $history -Format List
-            } else {
-                Write-Log 'История обнаружений не найдена.'
-            }
-        } catch {
-            Write-Log ("Get-MpThreatDetection недоступен/нет данных: {0}" -f $_.Exception.Message)
-        }
     } else {
         Write-Log 'Команды Microsoft Defender отсутствуют (возможен сторонний антивирус / другая редакция Windows).'
         Set-CheckStatus -Key 'Defender' -Status 'NOT TESTED' -Detail 'Команды Defender отсутствуют.'
@@ -3187,22 +3340,22 @@ $continue = Invoke-Step `
         $text -match 'Windows Resource Protection found integrity violations|(?:Защита ресурсов|Программа защиты ресурсов) Windows обнаружила нарушения целостности'
     )
 
-    $badCbs = @(
-        $newCbs -split '\r?\n' |
-        Where-Object {
-            $_ -match 'Cannot repair|Repair failed|Hashes for file member.*do not match|CSI.*(?:corrupt|hash mismatch)|STATUS_SXS_COMPONENT_STORE_CORRUPT|не удается восстановить|не удалось восстановить' -and $_ -notmatch '(?i)no.*corrupt|corruption.*(?:0|none)'
-        }
-    )
+    $badCbs = @(Get-SfcCbsViolations -Text $newCbs -StartedAt ([datetime]$check.started_at) -EndedAt ([datetime]$check.ended_at))
 
     $healthySfcText = (
         $text -match 'Windows Resource Protection did not find any integrity violations|Защита ресурсов Windows не обнаружила нарушений целостности'
     )
     $check.result = Get-SfcSemanticResult -Text $text -CbsViolation ($badCbs.Count -gt 0) -ExitCodeKnown ([bool]$r.ExitCodeKnown) -ExitCode $r.ExitCode
     $check | Add-Member -NotePropertyName output_text -NotePropertyValue $text
+    $check | Add-Member -NotePropertyName classification -NotePropertyValue (Get-SfcClassification $check.result)
+    $check | Add-Member -NotePropertyName current_cbs_evidence -NotePropertyValue @($badCbs)
+    $check.command = 'sfc.exe /verifyonly'
+    $check | Add-Member -NotePropertyName run_id -NotePropertyValue $ReportBaseName
+    $check | Add-Member -NotePropertyName source -NotePropertyValue 'native console + timestamp-scoped CBS'
     $badSfcText = $check.result -eq 'INTEGRITY_VIOLATIONS'
     $healthySfcText = $check.result -eq 'CLEAN'
 
-    if ($badSfcText -or $badCbs.Count -gt 0) {
+    if ($badSfcText) {
         $detail = 'SFC /verifyonly обнаружил признаки нарушения целостности.'
         Write-Log ("Result: ATTENTION — {0}" -f $detail)
         Add-Attention $detail
@@ -3225,8 +3378,8 @@ $continue = Invoke-Step `
         Write-Log ("Result: OK — {0}" -f $detail)
         Set-CheckStatus -Key 'SFC' -Status 'OK' -Detail $detail
         Write-DiagResult -Status 'OK' -Message $detail
-    } elseif ($r.ExitCodeKnown -and $r.ExitCode -ne 0) {
-        $detail = "SFC завершился с ExitCode {0}; итоговая строка не распознана." -f $r.ExitCode
+    } elseif ($check.result -eq 'ERROR') {
+        $detail = "SFC не выполнил проверку; ExitCode {0}. См. исходный вывод команды." -f $r.ExitCode
         Write-Log ("Result: ERROR/UNKNOWN — {0}" -f $detail)
         Add-Attention $detail
         Set-CheckStatus -Key 'SFC' -Status 'ERROR' -Detail $detail
@@ -3234,9 +3387,8 @@ $continue = Invoke-Step `
     } else {
         $detail = 'Не удалось однозначно распознать итог SFC; требуется инженерная проверка CBS.log.'
         Write-Log ("Result: UNKNOWN — {0}" -f $detail)
-        Add-Attention $detail
         Set-CheckStatus -Key 'SFC' -Status 'UNKNOWN' -Detail $detail
-        Write-DiagResult -Status 'ATTENTION' -Message $detail
+        Write-DiagResult -Status 'UNKNOWN' -Message $detail
     }
 }
 if (-not $continue) { break Diagnostics }
@@ -3810,7 +3962,7 @@ Write-Log ('CoverageStatus : '+$coverageStatus)
 Write-Log ('FindingsStatus : '+$findingsStatus)
 $jsonReport = [PSCustomObject][ordered]@{
     Tool='EXPC Diagnostic'; Version=$ScriptVersion; GeneratedAt=$EndTime.ToString('o'); StartedAt=$StartTime.ToString('o')
-    ExecutionStatus=$executionStatus; CoverageStatus=$coverageStatus; FindingsStatus=$findingsStatus; CollectorVersion='1.5'; Steps=@($script:StepRuns); ApplicationGroups=@($script:ApplicationGroups); ApplicationEvents=@($script:ApplicationEvents); VssEvidence=$script:VssEvidence
+    ExecutionStatus=$executionStatus; CoverageStatus=$coverageStatus; FindingsStatus=$findingsStatus; CollectorVersion='1.5'; Steps=@($script:StepRuns); ApplicationGroups=@($script:ApplicationGroups); ApplicationEvents=@($script:ApplicationEvents); VssEvidence=$script:VssEvidence; DefenderEvidence=$script:DefenderEvidence; ServicingHistory=(Get-ServicingHistoryEvidence)
     ReadOnly=$true; Company=$CompanyName; Station=$StationName; Computer=$ComputerName; Mode=$script:Mode
     Checks=@($script:Checks.GetEnumerator() | ForEach-Object { $_.Value }); Attention=@($script:Attention); TxtPath=$LogPath; JsonPath=$JsonPath
 }

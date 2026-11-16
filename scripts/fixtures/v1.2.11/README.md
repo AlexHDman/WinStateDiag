@@ -1,1 +1,0 @@
-Synthetic parser examples only. CASE-A and CASE-B are fictitious. Writer names and GUIDs are generated examples, not captured device/session identities. Checks contain only standard diagnostic phrases required by tests. No field archives, timestamps or provenance paths are included.

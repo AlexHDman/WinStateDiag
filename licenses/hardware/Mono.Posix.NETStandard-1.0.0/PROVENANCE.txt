@@ -1,0 +1,1 @@
+NuGet 1.0.0 licenseUrl https://go.microsoft.com/fwlink/?linkid=869050 redirects to https://github.com/mono/mono/blob/main/LICENSE. Raw text retrieved from https://raw.githubusercontent.com/mono/mono/main/LICENSE

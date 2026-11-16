@@ -84,19 +84,24 @@ fn info_rows(
 /// never below `PAGE_TAB_MIN_W`), the pair centred under the Start button.
 /// Width comes from the label length (caps at the tab font average ~9.6 px
 /// per glyph) so the geometry is deterministic and testable.
-pub fn page_tab_rects(o: Pos2, d: &i18n::Dict) -> [Rect; 2] {
+pub fn page_tab_rects(o: Pos2, d: &i18n::Dict) -> [Rect; 3] {
     let w = |label: &str| {
         (label.chars().count() as f32 * 9.6 + 2.0 * l::PAGE_TAB_PAD_X).max(l::PAGE_TAB_MIN_W)
     };
     let (wd, wh) = (w(d.page_diagnostics), w(d.page_hardware));
     let start = r(o, l::START_BUTTON);
-    let x0 = start.center().x - (wd + l::PAGE_TAB_GAP + wh) / 2.0;
+    let wr = w("Repair");
+    let x0 = start.right() - (wd + wh + wr + 2.0 * l::PAGE_TAB_GAP);
     let y = mrect(o, 0.0, l::PAGE_TAB_Y, 1.0, 1.0).top();
     [
         Rect::from_min_size(egui::pos2(x0, y), vec2(wd, l::PAGE_TAB_H)),
         Rect::from_min_size(
             egui::pos2(x0 + wd + l::PAGE_TAB_GAP, y),
             vec2(wh, l::PAGE_TAB_H),
+        ),
+        Rect::from_min_size(
+            egui::pos2(x0 + wd + wh + 2.0 * l::PAGE_TAB_GAP, y),
+            vec2(wr, l::PAGE_TAB_H),
         ),
     ]
 }
@@ -107,6 +112,7 @@ pub fn draw_tabs(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Actio
     for (page, rect, label, id) in [
         (Page::Diagnostics, rects[0], d.page_diagnostics, "page_diag"),
         (Page::Hardware, rects[1], d.page_hardware, "page_hw"),
+        (Page::Repair, rects[2], "Repair", "page_repair"),
     ] {
         let active = vm.page == page;
         let resp = ui.interact(rect, ui.id().with(id), egui::Sense::click());
@@ -204,6 +210,12 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
         }
     }
     let rect = card(&p, o, l::STAGE_TABLE_CARD, d.stages_table_title);
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new("repair_a9_anchor"),
+            rect.intersect(ui.clip_rect()),
+        )
+    });
     if active_focus {
         p.rect_stroke(
             rect,
@@ -231,6 +243,26 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
     .clicked()
     {
         actions.push(Action::ShowExpcDetails);
+    }
+    if vm.stages.get(10).is_some_and(|r| r.repair_available)
+        && vm.stages.get(11).is_some_and(|r| r.repair_available)
+        && paint::button(
+            ui,
+            Rect::from_min_size(
+                egui::pos2(rect.right() - 340.0, rect.top() + 10.0),
+                vec2(170.0, 28.0),
+            ),
+            "repair_windows",
+            "DISM → SFC",
+            ButtonKind::Repair,
+            true,
+            ButtonIcon::None,
+            t::BUTTON_TEXT_SMALL,
+        )
+        .on_hover_text("Один клик: DISM RestoreHealth → ScanHealth → SFC Scannow → VerifyOnly")
+        .clicked()
+    {
+        actions.push(Action::RequestWindowsRepair);
     }
     let x0 = rect.left() + 16.0;
     // v1.0 polish: "Выполнение" is wider (real percent + bar); "Результат"
@@ -399,7 +431,7 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
             &p,
             cols[4],
             b,
-            cols[5] - cols[4] - 10.0 - if row.repair_available { 58.0 } else { 0.0 },
+            cols[5] - cols[4] - 10.0 - if row.repair_available { 95.0 } else { 0.0 },
             if row.short_finding.is_empty() {
                 "—"
             } else {
@@ -416,18 +448,18 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
             && paint::button(
                 ui,
                 Rect::from_min_size(
-                    egui::pos2(cols[5] - 64.0, row_rect.top() + 6.0),
-                    vec2(54.0, 28.0),
+                    egui::pos2(cols[5] - 98.0, row_rect.top() + 6.0),
+                    vec2(88.0, 28.0),
                 ),
                 &format!("stage_repair_{i}"),
-                "Repair",
-                ButtonKind::Secondary,
+                "Исправить",
+                ButtonKind::Repair,
                 true,
                 ButtonIcon::None,
                 t::BUTTON_TEXT_SMALL,
             )
             .on_hover_text(
-                "Показать команду и запросить подтверждение; автоматического ремонта нет",
+                "SFC/DISM: нажатие запускает исправление Windows и повторную проверку. CHKDSK требует согласия на обслуживание",
             )
             .clicked()
         {
@@ -544,7 +576,11 @@ pub fn draw_result_indicator(p: &egui::Painter, center: Pos2, diameter: f32, s: 
 
 /// v1.0 compact "КОМПЬЮТЕР" passport: Windows, CPU, RAM and motherboard
 /// only (disks live on the Hardware page; no technical metadata).
+#[cfg(test)]
 pub fn draw_passport(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
+    draw_passport_actions(ui, o, vm, &mut Vec::new());
+}
+pub fn draw_passport_actions(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
     let rect = card(&p, o, l::PASSPORT_CARD, d.passport_title);
@@ -564,6 +600,10 @@ pub fn draw_passport(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
         vm.passport.clone()
     };
     for (i, row) in rows.iter().take(5).enumerate() {
+        if i == 4 {
+            draw_bios_row(ui, rect, &row.value, &vm.bios, actions);
+            continue;
+        }
         let b = rect.top() + 56.0 + i as f32 * 21.0;
         // v1.1 UI contract: white labels, values in the identity palette.
         paint::text_clipped(&p, x, b, 100.0, &row.label, t::CAPTION, c::PASSPORT_LABEL);
@@ -806,6 +846,71 @@ pub fn draw_report_row(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec
     }
 }
 
+/// Same A6 bounds/theme; the two-line label fits without moving neighbouring controls.
+fn ai_report_button(ui: &mut Ui, rect: Rect, vm: &DashboardVm) -> egui::Response {
+    if vm.ai_export_enabled {
+        for (expand, alpha) in [(3.0, 22), (1.5, 45)] {
+            ui.painter().rect_stroke(
+                rect.expand(expand),
+                CornerRadius::same(l::BUTTON_RADIUS),
+                Stroke::new(
+                    2.0,
+                    c::PAGE_TAB_ACTIVE_GLOW.gamma_multiply(alpha as f32 / 255.0),
+                ),
+                StrokeKind::Outside,
+            );
+        }
+    }
+    let response = paint::button(
+        ui,
+        rect,
+        "ai_export",
+        "",
+        ButtonKind::Nav,
+        vm.ai_export_enabled,
+        ButtonIcon::None,
+        t::BUTTON_TEXT_SMALL,
+    );
+    let (_, _, color) = paint::button_colors(
+        ButtonKind::Nav,
+        vm.ai_export_enabled,
+        response.hovered(),
+        response.is_pointer_button_down_on(),
+    );
+    let p = ui.painter();
+    paint::icon_document(
+        p,
+        Rect::from_center_size(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            vec2(12.0, 15.0),
+        ),
+        color,
+    );
+    let label = if vm.ai_export_busy {
+        if vm.lang == i18n::Language::Ru {
+            "Готовлю…"
+        } else {
+            "Exporting…"
+        }
+    } else {
+        i18n::t(vm.lang).journal_report_button
+    };
+    let galley = p.layout(
+        label.to_string(),
+        egui::FontId::proportional(9.0),
+        color,
+        rect.width() - 25.0,
+    );
+    p.galley(
+        egui::pos2(rect.left() + 23.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    response.on_hover_text(if vm.lang == i18n::Language::Ru {
+        "Создать AI.zip с UTF-8 AI.txt из завершённой сессии. Правой кнопкой: другой ZIP или обычный отчёт. Повторной диагностики нет."
+    } else { "Export AI.zip containing UTF-8 AI.txt. Right-click: another ZIP or the original report. No rescan." })
+}
+
 pub fn draw_journal_compact(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
@@ -833,50 +938,60 @@ pub fn draw_journal_compact(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mu
     // v1.0: report actions in the journal header (the idle report block is
     // gone). Enabled once the report exists; the attention glow stays.
     let done = matches!(&vm.result, super::vm::ResultVm::Done { .. });
-    let attention = matches!(
-        &vm.result,
-        super::vm::ResultVm::Done {
-            attention: true,
-            ..
-        }
-    );
     let br = l::JOURNAL_COMPACT_REPORT_BUTTON;
     let report_rect = mrect(o, br[0], br[1], br[2], br[3]);
-    let report = paint::button(
-        ui,
-        report_rect,
-        "open_report",
-        d.journal_report_button,
-        ButtonKind::Secondary,
-        done,
-        ButtonIcon::None,
-        t::BUTTON_TEXT_SMALL,
-    );
-    if attention && vm.animate && !report.hovered() {
-        p.rect_stroke(
-            report_rect,
-            CornerRadius::same(l::BUTTON_RADIUS),
-            Stroke::new(
-                1.0,
-                paint::intensity(
-                    c::ATTENTION_REPORT,
-                    super::dashboard::running_stage_intensity(vm.time, vm.animate),
-                ),
-            ),
-            StrokeKind::Inside,
-        );
-    }
+    let report = ai_report_button(ui, report_rect, vm);
+    report.context_menu(|ui| {
+        let ru = vm.lang == i18n::Language::Ru;
+        if ui
+            .add_enabled(
+                vm.ai_export_enabled,
+                egui::Button::new(if ru {
+                    "Для ИИ из другого ZIP…"
+                } else {
+                    "AI report from another ZIP…"
+                }),
+            )
+            .clicked()
+        {
+            actions.push(Action::SelectAiArchive);
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                done,
+                egui::Button::new(if ru {
+                    "Открыть обычный отчёт / ZIP"
+                } else {
+                    "Open original report / ZIP"
+                }),
+            )
+            .clicked()
+        {
+            actions.push(Action::OpenReport);
+            ui.close();
+        }
+    });
     if report.clicked() {
-        actions.push(Action::OpenReport);
+        actions.push(Action::ExportAi);
     }
     let bf = l::JOURNAL_COMPACT_FOLDER_BUTTON;
+    let folder_rect = mrect(o, bf[0], bf[1], bf[2], bf[3]);
+    if done {
+        p.rect_stroke(
+            folder_rect.expand(1.5),
+            CornerRadius::same(l::BUTTON_RADIUS),
+            Stroke::new(2.0, c::ATTENTION_REPORT.gamma_multiply(0.22)),
+            StrokeKind::Outside,
+        );
+    }
     if paint::button(
         ui,
         mrect(o, bf[0], bf[1], bf[2], bf[3]),
         "open_folder",
         d.report_row_folder,
-        // v1.1 UI contract: the folder action in the header tab violet.
-        ButtonKind::Nav,
+        // A6: original reports remain accessible as a secondary action.
+        ButtonKind::Secondary,
         done,
         ButtonIcon::None,
         t::BUTTON_TEXT_SMALL,
@@ -1047,7 +1162,7 @@ pub fn draw_sensors(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Ac
         "sensors_refresh",
         d.sensors_refresh,
         ButtonKind::Secondary,
-        !sv.busy,
+        !sv.busy && !sv.hardware.busy,
         ButtonIcon::None,
         t::BUTTON_TEXT_SMALL,
     )
@@ -1061,7 +1176,7 @@ pub fn draw_sensors(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Ac
         "sensors_details",
         d.sensors_details,
         ButtonKind::Secondary,
-        sv.has_data,
+        sv.has_data || !sv.hardware.message.is_empty(),
         ButtonIcon::None,
         t::BUTTON_TEXT_SMALL,
     )
@@ -1247,6 +1362,52 @@ pub fn draw_sensors(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Ac
         t::SSD_NOTE,
         c::TEXT_MUTED,
     );
+    let hw = &sv.hardware;
+    paint::text_clipped(
+        &p,
+        rect.left() + 21.0,
+        rect.bottom() - 88.0,
+        rect.width() - 115.0,
+        &hw.message,
+        t::SSD_NOTE,
+        c::TEXT_MUTED,
+    );
+    let enabled = !sv.busy && !hw.busy;
+    if hw.can_install
+        && paint::button(
+            ui,
+            Rect::from_min_size(
+                egui::pos2(rect.left() + 21.0, rect.bottom() - 73.0),
+                vec2(150.0, 27.0),
+            ),
+            "pawn_install",
+            "Установить PawnIO",
+            ButtonKind::Secondary,
+            enabled,
+            ButtonIcon::None,
+            t::BUTTON_TEXT_SMALL,
+        )
+        .clicked()
+    {
+        actions.push(Action::InstallPawnIo);
+    }
+    if paint::button(
+        ui,
+        Rect::from_min_size(
+            egui::pos2(rect.left() + 181.0, rect.bottom() - 73.0),
+            vec2(205.0, 27.0),
+        ),
+        "lhm_control",
+        "Открыть контрольный LHM",
+        ButtonKind::Secondary,
+        enabled,
+        ButtonIcon::None,
+        t::BUTTON_TEXT_SMALL,
+    )
+    .clicked()
+    {
+        actions.push(Action::ControlLhm);
+    }
     draw_sensor_read_indicator(&p, rect, vm);
 }
 
@@ -1818,6 +1979,9 @@ pub fn draw_test_block_pair(
         );
         // Caption: state, or (Test 2 of a retest) the two-line retest label.
         let caption = match block_vm {
+            TestBlockVm::Waiting(Some(text)) if i == 1 && retest && !text.is_empty() => {
+                text.clone()
+            }
             _ if i == 1 && retest => d.test_retest_label.to_string(),
             TestBlockVm::Active { .. } => d.test_running.to_string(),
             TestBlockVm::Waiting(Some(text)) if !text.is_empty() => text.clone(),
@@ -1939,6 +2103,242 @@ pub fn draw_test_block_pair(
                     t::SSD_NOTE,
                     c::TEXT_MUTED,
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ai_button_tests {
+    use super::*;
+    #[test]
+    fn a6_label_and_icon_fit_original_bounds_ru_en() {
+        for lang in [i18n::Language::Ru, i18n::Language::En] {
+            let ctx = egui::Context::default();
+            crate::ui::fonts::install(&ctx);
+            let vm = crate::ui::fixture::master_vm_in(lang);
+            let rect = Rect::from_min_size(
+                egui::pos2(20.0, 20.0),
+                vec2(
+                    l::JOURNAL_COMPACT_REPORT_BUTTON[2],
+                    l::JOURNAL_COMPACT_REPORT_BUTTON[3],
+                ),
+            );
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ai_report_button(ui, rect, &vm);
+            });
+            out.textures_delta.clear();
+            let text = out
+                .shapes
+                .iter()
+                .find_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        (t.galley.text() == i18n::t(lang).journal_report_button).then_some(t)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(
+                rect.expand(0.5)
+                    .contains_rect(Rect::from_min_size(text.pos, text.galley.size())),
+                "label overflow {:?} {:?}",
+                text.pos,
+                text.galley.size()
+            );
+        }
+    }
+}
+
+/// Only the A1 BIOS row adapts; neighbouring cards and the first four rows stay fixed.
+fn draw_bios_row(
+    ui: &mut Ui,
+    card: Rect,
+    value: &str,
+    vm: &super::vm::BiosVm,
+    actions: &mut Vec<Action>,
+) {
+    let p = ui.painter().clone();
+    let center = egui::pos2(card.right() - 23.0, card.bottom() - 16.0);
+    let button =
+        paint::round_refresh_button(ui, center, l::CRYPTO_RECHECK_D, "bios_recheck", vm.enabled);
+    if button.clicked() {
+        actions.push(Action::CheckBios)
+    }
+    button.on_hover_text("Проверить обновление BIOS");
+    let right = center.x - l::CRYPTO_RECHECK_D / 2.0 - 7.0;
+    let x = card.left() + 21.0;
+    let font = egui::FontId::proportional(14.2);
+    let value_g = p.layout_no_wrap(value.into(), font.clone(), c::IDENT_BIOS);
+    let label = if vm.preview.is_empty() {
+        vm.label.clone()
+    } else {
+        format!("{} · {}", vm.label, vm.preview)
+    };
+    let status_g = p.layout_no_wrap(
+        label.clone(),
+        egui::FontId::proportional(11.5),
+        if vm.available {
+            c::GOLD_ACCENT
+        } else {
+            c::TEXT_MUTED
+        },
+    );
+    let fits = 38.0 + value_g.size().x + status_g.size().x + 18.0 <= right - x;
+    let value_y = if fits {
+        card.bottom() - 22.0
+    } else {
+        card.bottom() - 30.0
+    };
+    let value_font = if fits {
+        font.clone()
+    } else {
+        egui::FontId::proportional(12.0)
+    };
+    let label_g = p.layout_no_wrap("BIOS".into(), value_font.clone(), c::PASSPORT_LABEL);
+    p.galley(egui::pos2(x, value_y), label_g, c::PASSPORT_LABEL);
+    let vx = x + 38.0;
+    let vg = p.layout_no_wrap(value.into(), value_font, c::IDENT_BIOS);
+    // Extremely long vendor strings stay available without ellipsis in a horizontal
+    // scroll area; ordinary and long OEM versions use the full first line.
+    let vw = if fits { vg.size().x } else { right - vx };
+    let vr = Rect::from_min_size(egui::pos2(vx, value_y), vec2(vw, 17.0));
+    if vg.size().x <= vw {
+        p.galley(vr.min, vg, c::IDENT_BIOS);
+    } else {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(vr), |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("bios_version")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(value).size(12.0).color(c::IDENT_BIOS));
+                });
+        });
+    }
+    let sx = if fits { vx + vw + 10.0 } else { vx };
+    let sy = if fits {
+        value_y + 1.0
+    } else {
+        card.bottom() - 15.0
+    };
+    let status_rect = Rect::from_min_size(
+        egui::pos2(sx, sy),
+        vec2((status_g.size().x + 8.0).min(right - sx), 14.0),
+    );
+    if vm.available {
+        p.rect_stroke(
+            status_rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0, c::GOLD_ACCENT),
+            StrokeKind::Inside,
+        );
+    }
+    let status_color = if vm.available {
+        c::GOLD_ACCENT
+    } else {
+        c::TEXT_MUTED
+    };
+    if status_g.size().x + 8.0 <= status_rect.width() {
+        p.galley(status_rect.min + vec2(4.0, 0.0), status_g, status_color);
+    } else {
+        // Keep the full result, including beta/uncertainty, reachable without
+        // drawing over the refresh button or adjacent cards.
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(status_rect.shrink2(vec2(4.0, 0.0))),
+            |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("bios_status")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(&label).size(11.5).color(status_color));
+                    });
+            },
+        );
+    }
+    let response = ui.interact(
+        status_rect,
+        egui::Id::new("bios_support_link"),
+        if vm.available {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    if response.clicked() && vm.available {
+        actions.push(Action::OpenBiosSupport)
+    }
+    response.on_hover_text(&vm.tooltip);
+    ui.interact(vr, egui::Id::new("bios_identity_tip"), egui::Sense::hover())
+        .on_hover_text(&vm.tooltip);
+}
+
+#[cfg(test)]
+mod bios_layout_tests {
+    use super::*;
+    #[test]
+    fn bios_value_date_status_and_preview_fit_a1_without_ellipsis() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            crate::ui::fonts::install(&ctx);
+            ctx.set_pixels_per_point(scale);
+            for (value, label, preview) in [
+                ("7D46v1R (24.08.2026)", "Актуален", ""),
+                ("7E34v1AE0 (24.06.2026)", "Доступен: 7E34v1AF0", ""),
+                (
+                    "1.AZ0 (24.06.2026)",
+                    "На сайте: 7E34v1AF0 · сопоставление не подтверждено",
+                    "",
+                ),
+                ("7D46v1R (24.08.2026)", "Кэш: Актуален", ""),
+                (
+                    "7D91vHI (22.04.2026)",
+                    "Доступен: 7D91vHJ",
+                    "Бета: 7D91vHK1",
+                ),
+                (
+                    "R2.43.0-OEM-20261115 (дата неизвестна)",
+                    "Не удалось проверить",
+                    "",
+                ),
+            ] {
+                let card = Rect::from_min_size(egui::pos2(15.0, 15.0), vec2(539.0, 151.0));
+                let vm = super::super::vm::BiosVm {
+                    label: label.into(),
+                    preview: preview.into(),
+                    available: label.starts_with("Доступен"),
+                    enabled: true,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    draw_bios_row(ui, card, value, &vm, &mut Vec::new())
+                });
+                out.textures_delta.clear();
+                let text: Vec<_> = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| {
+                        if let egui::Shape::Text(t) = &s.shape {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    text.iter().any(|t| t.galley.text() == value),
+                    "BIOS/version/date must be intact"
+                );
+                let right = card.right() - 45.0;
+                for t in text {
+                    let bounds = Rect::from_min_size(t.pos, t.galley.size());
+                    assert!(
+                        bounds.right() <= right + 1.0 && bounds.bottom() <= card.bottom() + 1.0,
+                        "overflow {} {:?}",
+                        t.galley.text(),
+                        bounds
+                    );
+                }
             }
         }
     }
