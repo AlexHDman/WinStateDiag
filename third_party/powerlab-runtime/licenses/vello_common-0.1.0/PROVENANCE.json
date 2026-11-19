@@ -1,0 +1,20 @@
+{
+  "name": "vello_common",
+  "version": "0.1.0",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/linebender/vello",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\vello_common-0.1.0\\LICENSE-APACHE",
+    "licenses\\vello_common-0.1.0\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "1b63b04c03873d81109b25316a7a523bec17b5e6"
+    },
+    "path_in_vcs": "sparse_strips/vello_common"
+  }
+}

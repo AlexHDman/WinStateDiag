@@ -1,0 +1,23 @@
+{
+  "name": "termcolor",
+  "version": "1.4.1",
+  "license": "Unlicense OR MIT",
+  "repository": "https://github.com/BurntSushi/termcolor",
+  "authors": [
+    "Andrew Gallant <jamslam@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\termcolor-1.4.1\\COPYING",
+    "licenses\\termcolor-1.4.1\\LICENSE-MIT",
+    "licenses\\termcolor-1.4.1\\UNLICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "71f0921f1eeceda85487098588a1602979d52493"
+    },
+    "path_in_vcs": ""
+  }
+}

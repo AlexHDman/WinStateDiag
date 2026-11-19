@@ -291,14 +291,38 @@ pub fn build(inv: &Inventory, analyses: &[DumpAnalysis], ru: bool) -> Report {
                 "No BSOD or unexpected shutdowns; live kernel reports present (Windows recovered by itself).",
             ),
         )
+    } else if !inv.notes.is_empty() {
+        // v1.1 RC: an unreadable source is not "no crashes".
+        (
+            Level::Attention,
+            if ru {
+                format!(
+                    "BSOD и неожиданных отключений за {} дн. не найдено, но сбор неполный: {}.",
+                    crate::incidents::WINDOW_DAYS,
+                    inv.notes.join("; ")
+                )
+            } else {
+                format!(
+                    "No BSOD or unexpected shutdowns found in {} days, but the collection is incomplete: {}.",
+                    crate::incidents::WINDOW_DAYS,
+                    inv.notes.join("; ")
+                )
+            },
+        )
     } else {
         (
             Level::Ok,
-            t(
-                ru,
-                "BSOD, неожиданных отключений и живых отчётов ядра за 60 дней не обнаружено.",
-                "No BSOD, unexpected shutdowns or live kernel reports in 60 days.",
-            ),
+            if ru {
+                format!(
+                    "BSOD, неожиданных отключений и живых отчётов ядра за {} дн. не обнаружено.",
+                    crate::incidents::WINDOW_DAYS
+                )
+            } else {
+                format!(
+                    "No BSOD, unexpected shutdowns or live kernel reports in {} days.",
+                    crate::incidents::WINDOW_DAYS
+                )
+            },
         )
     };
 

@@ -1,0 +1,22 @@
+{
+  "name": "winit",
+  "version": "0.30.13",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/rust-windowing/winit",
+  "authors": [
+    "The winit contributors",
+    "Pierre Krieger <pierre.krieger1708@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\winit-0.30.13\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "e9809ef54b18499bb4f2cac945719ecc2a61061b"
+    },
+    "path_in_vcs": ""
+  }
+}

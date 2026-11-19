@@ -1,0 +1,21 @@
+{
+  "name": "rustc-hash",
+  "version": "1.1.0",
+  "license": "Apache-2.0/MIT",
+  "repository": "https://github.com/rust-lang-nursery/rustc-hash",
+  "authors": [
+    "The Rust Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\rustc-hash-1.1.0\\LICENSE-APACHE",
+    "licenses\\rustc-hash-1.1.0\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "6fc9a706a9312ee801c7e77ca06c0782fa9eadef"
+    }
+  }
+}

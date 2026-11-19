@@ -84,19 +84,28 @@ fn info_rows(
 /// never below `PAGE_TAB_MIN_W`), the pair centred under the Start button.
 /// Width comes from the label length (caps at the tab font average ~9.6 px
 /// per glyph) so the geometry is deterministic and testable.
-pub fn page_tab_rects(o: Pos2, d: &i18n::Dict) -> [Rect; 2] {
+pub fn page_tab_rects(o: Pos2, d: &i18n::Dict) -> [Rect; 3] {
     let w = |label: &str| {
         (label.chars().count() as f32 * 9.6 + 2.0 * l::PAGE_TAB_PAD_X).max(l::PAGE_TAB_MIN_W)
     };
     let (wd, wh) = (w(d.page_diagnostics), w(d.page_hardware));
     let start = r(o, l::START_BUTTON);
-    let x0 = start.center().x - (wd + l::PAGE_TAB_GAP + wh) / 2.0;
+    let wr = w(if d.page_diagnostics == i18n::RU.page_diagnostics {
+        "РЕМОНТ"
+    } else {
+        "REPAIR"
+    });
+    let x0 = start.right() - (wd + wh + wr + 2.0 * l::PAGE_TAB_GAP);
     let y = mrect(o, 0.0, l::PAGE_TAB_Y, 1.0, 1.0).top();
     [
         Rect::from_min_size(egui::pos2(x0, y), vec2(wd, l::PAGE_TAB_H)),
         Rect::from_min_size(
             egui::pos2(x0 + wd + l::PAGE_TAB_GAP, y),
             vec2(wh, l::PAGE_TAB_H),
+        ),
+        Rect::from_min_size(
+            egui::pos2(x0 + wd + wh + 2.0 * l::PAGE_TAB_GAP, y),
+            vec2(wr, l::PAGE_TAB_H),
         ),
     ]
 }
@@ -107,6 +116,16 @@ pub fn draw_tabs(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Actio
     for (page, rect, label, id) in [
         (Page::Diagnostics, rects[0], d.page_diagnostics, "page_diag"),
         (Page::Hardware, rects[1], d.page_hardware, "page_hw"),
+        (
+            Page::Repair,
+            rects[2],
+            if vm.lang == i18n::Language::Ru {
+                "РЕМОНТ"
+            } else {
+                "REPAIR"
+            },
+            "page_repair",
+        ),
     ] {
         let active = vm.page == page;
         let resp = ui.interact(rect, ui.id().with(id), egui::Sense::click());
@@ -204,6 +223,12 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
         }
     }
     let rect = card(&p, o, l::STAGE_TABLE_CARD, d.stages_table_title);
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new("repair_a9_anchor"),
+            rect.intersect(ui.clip_rect()),
+        )
+    });
     if active_focus {
         p.rect_stroke(
             rect,
@@ -231,6 +256,26 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
     .clicked()
     {
         actions.push(Action::ShowExpcDetails);
+    }
+    if vm.stages.get(10).is_some_and(|r| r.repair_available)
+        && vm.stages.get(11).is_some_and(|r| r.repair_available)
+        && paint::button(
+            ui,
+            Rect::from_min_size(
+                egui::pos2(rect.right() - 340.0, rect.top() + 10.0),
+                vec2(170.0, 28.0),
+            ),
+            "repair_windows",
+            "DISM → SFC",
+            ButtonKind::Repair,
+            true,
+            ButtonIcon::None,
+            t::BUTTON_TEXT_SMALL,
+        )
+        .on_hover_text("Один клик: DISM RestoreHealth → ScanHealth → SFC Scannow → VerifyOnly")
+        .clicked()
+    {
+        actions.push(Action::RequestWindowsRepair);
     }
     let x0 = rect.left() + 16.0;
     // v1.0 polish: "Выполнение" is wider (real percent + bar); "Результат"
@@ -313,7 +358,11 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
             b,
             cols[2] - cols[1] - 10.0,
             &row.label,
-            t::STAGE_LABEL,
+            if row.number == 14 {
+                firmware_label_style(&p, &row.label, cols[2] - cols[1] - 10.0)
+            } else {
+                t::STAGE_LABEL
+            },
             c::TEXT_BODY,
         );
         // Execution: state + progress for running steps.
@@ -395,7 +444,7 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
             &p,
             cols[4],
             b,
-            cols[5] - cols[4] - 10.0,
+            cols[5] - cols[4] - 10.0 - if row.repair_available { 95.0 } else { 0.0 },
             if row.short_finding.is_empty() {
                 "—"
             } else {
@@ -408,6 +457,27 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
                 c::TEXT_BODY
             },
         );
+        if row.repair_available
+            && paint::button(
+                ui,
+                Rect::from_min_size(
+                    egui::pos2(cols[5] - 98.0, row_rect.top() + 6.0),
+                    vec2(88.0, 28.0),
+                ),
+                &format!("stage_repair_{i}"),
+                "Исправить",
+                ButtonKind::Repair,
+                true,
+                ButtonIcon::None,
+                t::BUTTON_TEXT_SMALL,
+            )
+            .on_hover_text(
+                "SFC/DISM: нажатие запускает исправление Windows и повторную проверку. CHKDSK требует согласия на обслуживание",
+            )
+            .clicked()
+        {
+            actions.push(Action::RequestRepair(i));
+        }
         paint::text(
             &p,
             cols[5],
@@ -448,6 +518,20 @@ pub fn draw_stages_table(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut V
 
 /// v1.0 polish: x positions of the six stage-table columns (№, stage,
 /// execution, result indicator, finding, time) from the table's left x.
+pub(crate) fn firmware_label_style(p: &egui::Painter, label: &str, width: f32) -> t::TextStyle {
+    let mut style = t::STAGE_LABEL;
+    while p
+        .layout_no_wrap(label.to_string(), super::fonts::font(style), c::TEXT_BODY)
+        .size()
+        .x
+        > width
+        && style.size > 10.0
+    {
+        style.size -= 0.25;
+    }
+    style
+}
+
 pub fn stage_table_columns(x0: f32) -> [f32; 6] {
     [
         x0,
@@ -505,7 +589,11 @@ pub fn draw_result_indicator(p: &egui::Painter, center: Pos2, diameter: f32, s: 
 
 /// v1.0 compact "КОМПЬЮТЕР" passport: Windows, CPU, RAM and motherboard
 /// only (disks live on the Hardware page; no technical metadata).
+#[cfg(test)]
 pub fn draw_passport(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
+    draw_passport_actions(ui, o, vm, &mut Vec::new());
+}
+pub fn draw_passport_actions(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
     let rect = card(&p, o, l::PASSPORT_CARD, d.passport_title);
@@ -525,21 +613,111 @@ pub fn draw_passport(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
         vm.passport.clone()
     };
     for (i, row) in rows.iter().take(5).enumerate() {
+        if i == 4 {
+            draw_bios_row(ui, rect, &row.value, &vm.bios, actions);
+            continue;
+        }
         let b = rect.top() + 56.0 + i as f32 * 21.0;
-        paint::text_clipped(&p, x, b, 100.0, &row.label, t::CAPTION, c::TEXT_SECONDARY);
+        // v1.1 UI contract: white labels, values in the identity palette.
+        paint::text_clipped(&p, x, b, 100.0, &row.label, t::CAPTION, c::PASSPORT_LABEL);
         paint::text_clipped(
             &p,
             x + 104.0,
             b,
-            rect.right() - x - 104.0 - 16.0,
+            rect.right()
+                - x
+                - 104.0
+                - 16.0
+                - if i == 1 {
+                    112.0
+                } else if (1..=3).contains(&i) {
+                    26.0
+                } else {
+                    0.0
+                },
             &row.value,
             t::CAPTION,
-            if row.value.is_empty() {
-                c::TEXT_MUTED
-            } else {
-                c::TEXT_BODY
-            },
+            passport_card_value_color(d, &row.label, &row.value),
         );
+        if (1..=3).contains(&i) {
+            let r =
+                Rect::from_min_size(egui::pos2(rect.right() - 34.0, b - 15.0), vec2(19.0, 18.0));
+            let response = ui
+                .interact(
+                    r,
+                    ui.id().with(("copy_passport_row", i)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(&row.value);
+            paint::icon_copy(
+                &p,
+                r.shrink(2.0),
+                if response.hovered() {
+                    c::TEXT_TITLE
+                } else {
+                    c::TEXT_SECONDARY
+                },
+            );
+            if response.clicked() {
+                actions.push(Action::CopyPassportRow(i));
+            }
+        }
+        if i == 1
+            && paint::button(
+                ui,
+                Rect::from_min_size(egui::pos2(rect.right() - 119.0, b - 15.0), vec2(78.0, 18.0)),
+                "cpu_reference",
+                if vm.lang == i18n::Language::Ru {
+                    "Бенчмарк"
+                } else {
+                    "Benchmark"
+                },
+                ButtonKind::Secondary,
+                true,
+                ButtonIcon::None,
+                t::BUTTON_TEXT_SMALL,
+            )
+            .clicked()
+        {
+            actions.push(Action::OpenCpuBenchmark);
+        }
+    }
+}
+
+/// v1.1 UI contract: the compact passport's value colour. Windows green,
+/// CPU Intel blue / AMD red, RAM violet, board orange, BIOS teal. Missing
+/// or still-collecting values are muted; an incomplete inventory is amber;
+/// identity colours are never used for a state.
+pub fn passport_card_value_color(d: &i18n::Dict, label: &str, value: &str) -> Color32 {
+    let v = value.to_lowercase();
+    if value.is_empty()
+        || value == d.passport_collecting
+        || value == d.passport_no_data
+        || value == "—"
+    {
+        return c::TEXT_MUTED;
+    }
+    if v.contains("incomplete") || v.contains("неполн") {
+        return c::YELLOW_WARNING;
+    }
+    if label == d.passport_windows {
+        c::IDENT_WINDOWS
+    } else if label == d.passport_cpu {
+        if v.contains("intel") || v.contains("xeon") {
+            c::IDENT_INTEL
+        } else if v.contains("amd") || v.contains("ryzen") {
+            c::IDENT_AMD
+        } else {
+            c::TEXT_BODY
+        }
+    } else if label == d.passport_ram {
+        c::IDENT_RAM
+    } else if label == d.passport_board {
+        c::IDENT_BOARD
+    } else if label == d.passport_bios {
+        c::IDENT_BIOS
+    } else {
+        c::TEXT_BODY
     }
 }
 
@@ -733,21 +911,169 @@ pub fn draw_report_row(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec
     }
 }
 
+/// Same A6 bounds/theme; the two-line label fits without moving neighbouring controls.
+#[cfg(test)]
+fn ai_report_button(ui: &mut Ui, rect: Rect, vm: &DashboardVm) -> egui::Response {
+    if vm.ai_export_enabled {
+        for (expand, alpha) in [(3.0, 22), (1.5, 45)] {
+            ui.painter().rect_stroke(
+                rect.expand(expand),
+                CornerRadius::same(l::BUTTON_RADIUS),
+                Stroke::new(
+                    2.0,
+                    c::PAGE_TAB_ACTIVE_GLOW.gamma_multiply(alpha as f32 / 255.0),
+                ),
+                StrokeKind::Outside,
+            );
+        }
+    }
+    let response = paint::button(
+        ui,
+        rect,
+        "ai_export",
+        "",
+        ButtonKind::Nav,
+        vm.ai_export_enabled,
+        ButtonIcon::None,
+        t::BUTTON_TEXT_SMALL,
+    );
+    let (_, _, color) = paint::button_colors(
+        ButtonKind::Nav,
+        vm.ai_export_enabled,
+        response.hovered(),
+        response.is_pointer_button_down_on(),
+    );
+    let p = ui.painter();
+    paint::icon_document(
+        p,
+        Rect::from_center_size(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            vec2(12.0, 15.0),
+        ),
+        color,
+    );
+    let label = if vm.ai_export_busy {
+        if vm.lang == i18n::Language::Ru {
+            "Готовлю…"
+        } else {
+            "Exporting…"
+        }
+    } else {
+        i18n::t(vm.lang).journal_report_button
+    };
+    let galley = p.layout(
+        label.to_string(),
+        egui::FontId::proportional(9.0),
+        color,
+        rect.width() - 25.0,
+    );
+    p.galley(
+        egui::pos2(rect.left() + 23.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    response.on_hover_text(if vm.lang == i18n::Language::Ru {
+        "Создать AI.zip с UTF-8 AI.txt из завершённой сессии. Правой кнопкой: другой ZIP или обычный отчёт. Повторной диагностики нет."
+    } else { "Export AI.zip containing UTF-8 AI.txt. Right-click: another ZIP or the original report. No rescan." })
+}
+
 pub fn draw_journal_compact(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
     let rect = card(&p, o, l::JOURNAL_COMPACT_CARD, d.journal_title);
+    let done = matches!(&vm.result, super::vm::ResultVm::Done { .. });
+    let ru = vm.lang == i18n::Language::Ru;
+    let y = l::JOURNAL_COMPACT_CARD[1] + 40.0;
+    let report_rect = mrect(o, 40.0, y, 112.0, 26.0);
+    for (expand, alpha) in [(3.0, 22), (1.5, 45)] {
+        p.rect_stroke(
+            report_rect.expand(expand),
+            CornerRadius::same(l::BUTTON_RADIUS),
+            Stroke::new(
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(160, 90, 240, alpha),
+            ),
+            StrokeKind::Outside,
+        );
+    }
+    let report = paint::button(
+        ui,
+        report_rect,
+        "open_ai_analysis",
+        if ru { "Отчёт ИИ" } else { "AI report" },
+        ButtonKind::Nav,
+        true,
+        ButtonIcon::None,
+        t::BUTTON_TEXT_SMALL,
+    );
+    if report.clicked() {
+        actions.push(Action::OpenAiAnalysis);
+    }
+    report.context_menu(|ui| {
+        if vm.ai_export_busy {
+            ui.label(if ru {
+                "Формируется AI.zip…"
+            } else {
+                "AI.zip export in progress…"
+            });
+        }
+        if ui
+            .add_enabled(
+                vm.ai_export_enabled,
+                egui::Button::new(if ru {
+                    "Создать AI.zip"
+                } else {
+                    "Export AI.zip"
+                }),
+            )
+            .clicked()
+        {
+            actions.push(Action::ExportAi);
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                vm.ai_export_enabled,
+                egui::Button::new(if ru {
+                    "AI.zip из другого ZIP…"
+                } else {
+                    "AI.zip from another ZIP…"
+                }),
+            )
+            .clicked()
+        {
+            actions.push(Action::SelectAiArchive);
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                done,
+                egui::Button::new(if ru {
+                    "Обычный отчёт / ZIP"
+                } else {
+                    "Original report / ZIP"
+                }),
+            )
+            .clicked()
+        {
+            actions.push(Action::OpenReport);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(d.journal_open_button).clicked() {
+            actions.push(Action::OpenJournal);
+            ui.close();
+        }
+        if ui.button(d.journal_clear_button).clicked() {
+            actions.push(Action::ClearLog);
+            ui.close();
+        }
+    });
     if paint::button(
         ui,
-        mrect(
-            o,
-            l::JOURNAL_COMPACT_OPEN_BUTTON[0],
-            l::JOURNAL_COMPACT_OPEN_BUTTON[1],
-            l::JOURNAL_COMPACT_OPEN_BUTTON[2],
-            l::JOURNAL_COMPACT_OPEN_BUTTON[3],
-        ),
-        "journal_compact_open",
-        d.journal_open_button,
+        mrect(o, 160.0, y, 94.0, 26.0),
+        "client_poster",
+        if ru { "Постер" } else { "Poster" },
         ButtonKind::Secondary,
         true,
         ButtonIcon::None,
@@ -755,51 +1081,20 @@ pub fn draw_journal_compact(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mu
     )
     .clicked()
     {
-        actions.push(Action::OpenJournal);
+        actions.push(Action::CreatePoster);
     }
-    // v1.0: report actions in the journal header (the idle report block is
-    // gone). Enabled once the report exists; the attention glow stays.
-    let done = matches!(&vm.result, super::vm::ResultVm::Done { .. });
-    let attention = matches!(
-        &vm.result,
-        super::vm::ResultVm::Done {
-            attention: true,
-            ..
-        }
-    );
-    let br = l::JOURNAL_COMPACT_REPORT_BUTTON;
-    let report_rect = mrect(o, br[0], br[1], br[2], br[3]);
-    let report = paint::button(
-        ui,
-        report_rect,
-        "open_report",
-        d.journal_report_button,
-        ButtonKind::Secondary,
-        done,
-        ButtonIcon::None,
-        t::BUTTON_TEXT_SMALL,
-    );
-    if attention && vm.animate && !report.hovered() {
+    let folder = mrect(o, 262.0, y, 94.0, 26.0);
+    if done {
         p.rect_stroke(
-            report_rect,
+            folder.expand(1.5),
             CornerRadius::same(l::BUTTON_RADIUS),
-            Stroke::new(
-                1.0,
-                paint::intensity(
-                    c::ATTENTION_REPORT,
-                    super::dashboard::running_stage_intensity(vm.time, vm.animate),
-                ),
-            ),
-            StrokeKind::Inside,
+            Stroke::new(2.0, c::ATTENTION_REPORT.gamma_multiply(0.22)),
+            StrokeKind::Outside,
         );
     }
-    if report.clicked() {
-        actions.push(Action::OpenReport);
-    }
-    let bf = l::JOURNAL_COMPACT_FOLDER_BUTTON;
     if paint::button(
         ui,
-        mrect(o, bf[0], bf[1], bf[2], bf[3]),
+        folder,
         "open_folder",
         d.report_row_folder,
         ButtonKind::Secondary,
@@ -811,29 +1106,8 @@ pub fn draw_journal_compact(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mu
     {
         actions.push(Action::OpenFolder);
     }
-    // Clear empties the dashboard view only (never the session journal).
-    if paint::button(
-        ui,
-        mrect(
-            o,
-            l::JOURNAL_COMPACT_CLEAR_BUTTON[0],
-            l::JOURNAL_COMPACT_CLEAR_BUTTON[1],
-            l::JOURNAL_COMPACT_CLEAR_BUTTON[2],
-            l::JOURNAL_COMPACT_CLEAR_BUTTON[3],
-        ),
-        "journal_compact_clear",
-        d.journal_clear_button,
-        ButtonKind::Secondary,
-        !vm.journal.is_empty(),
-        ButtonIcon::None,
-        t::BUTTON_TEXT_SMALL,
-    )
-    .clicked()
-    {
-        actions.push(Action::ClearLog);
-    }
     let panel = Rect::from_min_max(
-        egui::pos2(rect.left() + 12.0, rect.top() + 42.0),
+        egui::pos2(rect.left() + 12.0, rect.top() + 74.0),
         egui::pos2(rect.right() - 12.0, rect.bottom() - 10.0),
     );
     p.rect(
@@ -899,10 +1173,27 @@ pub fn draw_system_state(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
         x,
         rect.bottom() - 8.0,
         rect.width() - 42.0,
-        &vm.system_state.note,
+        vm.system_state.note.lines().next().unwrap_or(""),
         t::SSD_NOTE,
         c::TEXT_MUTED,
     );
+    ui.interact(
+        rect,
+        egui::Id::new("system_state_reasons"),
+        egui::Sense::hover(),
+    )
+    .on_hover_ui(|ui| {
+        ui.set_max_width(560.0);
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(&vm.system_state.note)
+                        .wrap()
+                        .selectable(true),
+                );
+            });
+    });
 }
 
 /// v1.0 SENSOR card: "ДАТЧИКИ  T°C / Volt / Watt" on one line, the main
@@ -910,252 +1201,220 @@ pub fn draw_system_state(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
 /// expected row visible, and the thin-framed "Эталон" reference table on the
 /// right. No dots / checkmarks: only the number is coloured. Provider and
 /// debug states live in Details.
+/// The header/footer are outside the scroller; every body draw is clipped to B3.
+pub fn sensor_body_rect(card: Rect) -> Rect {
+    Rect::from_min_max(
+        card.min + vec2(18., 102.),
+        egui::pos2(card.right() - 18., card.bottom() - 112.),
+    )
+}
+pub fn sensor_detail_buttons(card: Rect) -> [Rect; 2] {
+    let details = Rect::from_min_size(
+        egui::pos2(card.right() - 92., card.top() + 8.),
+        vec2(76., 26.),
+    );
+    [details, details.translate(vec2(0., 31.))]
+}
 pub fn draw_sensors(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     use super::vm::SensorCell;
     let d = i18n::t(vm.lang);
-    let p = ui.painter().clone();
     let rect = r(o, l::POWER_CARD);
+    let p = ui.painter().clone();
     paint::card(&p, rect);
-    // "ДАТЧИКИ" + "T°C / Volt / Watt" on one baseline (same cyan family,
-    // ~24 % smaller, dimmer).
-    let title_b = rect.top() + 26.0;
-    let tr = paint::text(
+    paint::text(
         &p,
-        rect.left() + 21.0,
-        title_b,
+        rect.left() + 21.,
+        rect.top() + 26.,
         Align::Min,
         d.sensors_title,
         t::CARD_TITLE,
         c::TEXT_TITLE,
     );
-    let units_style = t::TextStyle {
-        size: t::CARD_TITLE.size * 0.76,
-        ..t::CARD_TITLE
-    };
+    let sv = &vm.sensors;
     paint::text(
         &p,
-        tr.right() + 10.0,
-        title_b,
+        rect.left() + 21.,
+        rect.top() + 59.,
         Align::Min,
         d.sensors_header_units,
-        units_style,
-        c::TEXT_TITLE.gamma_multiply(0.62),
+        t::SSD_NOTE,
+        c::TEXT_SECONDARY,
     );
-    let sv = &vm.sensors;
-    let btn_refresh = Rect::from_min_size(
-        egui::pos2(rect.right() - 196.0, rect.top() + 8.0),
-        vec2(96.0, 26.0),
-    );
-    let btn_details = Rect::from_min_size(
-        egui::pos2(rect.right() - 92.0, rect.top() + 8.0),
-        vec2(76.0, 26.0),
-    );
-    if paint::button(
-        ui,
-        btn_refresh,
-        "sensors_refresh",
-        d.sensors_refresh,
-        ButtonKind::Secondary,
-        !sv.busy,
-        ButtonIcon::None,
-        t::BUTTON_TEXT_SMALL,
-    )
-    .clicked()
-    {
-        actions.push(Action::RefreshSensors);
-    }
-    if paint::button(
-        ui,
-        btn_details,
-        "sensors_details",
-        d.sensors_details,
-        ButtonKind::Secondary,
-        sv.has_data,
-        ButtonIcon::None,
-        t::BUTTON_TEXT_SMALL,
-    )
-    .clicked()
-    {
-        actions.push(Action::ShowSensorDetails);
-    }
-    let geo = SensorMatrixGeometry::new(rect);
-    let x0 = geo.name_x;
-    if sv.matrix.is_empty() {
-        let (text, tone) = if sv.busy {
-            (d.sensors_reading, Tone::Running)
-        } else {
-            (sv.power_state.as_str(), Tone::Idle)
-        };
-        paint::text_clipped(
-            &p,
-            x0,
-            rect.top() + 66.0,
-            rect.width() - 42.0,
-            text,
-            t::BODY_STRONG,
-            tone_color(tone),
-        );
-    } else {
-        // Column headers.
-        let head_b = rect.top() + 62.0;
-        paint::text(
-            &p,
-            x0,
-            head_b,
-            Align::Min,
-            d.sensors_col_name,
-            t::SSD_NOTE,
-            c::TEXT_MUTED,
-        );
-        for (x, h) in [
-            (geo.temp_r, "T°C"),
-            (geo.volt_r, "Volt"),
-            (geo.watt_r, "Watt"),
-        ] {
-            paint::text(&p, x, head_b, Align::Max, h, t::SSD_NOTE, c::TEXT_MUTED);
-        }
-        p.line_segment(
-            [
-                egui::pos2(x0, head_b + 7.0),
-                egui::pos2(geo.watt_r, head_b + 7.0),
-            ],
-            Stroke::new(1.0, c::BORDER_INNER),
-        );
-        let mut y = head_b + 7.0 + geo.pitch;
-        for row in &sv.matrix {
-            paint::text_clipped(
-                &p,
-                x0,
-                y,
-                geo.temp_r - geo.col_w - x0 + 6.0,
-                &row.label,
-                t::CAPTION,
-                c::TEXT_BODY,
-            );
-            for (cell, xr) in [
-                (&row.temp, geo.temp_r),
-                (&row.volt, geo.volt_r),
-                (&row.watt, geo.watt_r),
-            ] {
-                match cell {
-                    SensorCell::Value { text, tone } => {
-                        let col = if *tone == Tone::Idle {
-                            c::TEXT_PRIMARY
-                        } else {
-                            tone_color(*tone)
-                        };
-                        paint::text(&p, xr, y, Align::Max, text, t::BODY_STRONG, col);
-                    }
-                    SensorCell::NoData => {
-                        paint::text(
-                            &p,
-                            xr,
-                            y,
-                            Align::Max,
-                            d.sensors_no_data,
-                            t::SSD_NOTE,
-                            c::TEXT_MUTED,
-                        );
-                    }
-                    SensorCell::NotApplicable => {
-                        paint::text(&p, xr, y, Align::Max, "—", t::CAPTION, c::TEXT_MUTED);
-                    }
-                }
-            }
-            y += geo.pitch;
-        }
-        // "Состояние ПИТАНИЯ: Отлично / Внимание! / Критично! / Нет данных".
-        y += 8.0;
-        let lr = paint::text(
-            &p,
-            x0,
-            y,
-            Align::Min,
-            d.sensors_power_state_label,
-            t::CAPTION,
-            c::TEXT_SECONDARY,
-        );
-        paint::text(
-            &p,
-            lr.right() + 8.0,
-            y,
-            Align::Min,
-            &sv.power_state,
-            t::BODY_STRONG,
-            if sv.power_tone == Tone::Idle {
-                c::TEXT_SECONDARY
-            } else {
-                tone_color(sv.power_tone)
-            },
-        );
-        if !sv.power_message.is_empty() && matches!(sv.power_tone, Tone::Warning | Tone::Error) {
-            for (k, line) in wrap_two(&sv.power_message).iter().enumerate() {
-                paint::text_clipped(
-                    &p,
-                    x0,
-                    y + 20.0 + k as f32 * 16.0,
-                    rect.width() - 42.0,
-                    line,
-                    t::SSD_NOTE,
-                    tone_color(sv.power_tone),
-                );
-            }
-        }
-        // "Эталон" reference table: thin cyan frame, right-hand side.
-        let frame = Rect::from_min_max(
-            egui::pos2(geo.ref_l, rect.top() + 46.0),
-            egui::pos2(
-                geo.ref_r,
-                rect.top() + 46.0 + 30.0 + sv.refs.len() as f32 * geo.ref_pitch + 8.0,
-            ),
-        );
-        p.rect_stroke(
-            frame,
-            CornerRadius::same(4),
-            Stroke::new(1.0, c::TEST_BLOCK_BORDER.gamma_multiply(0.6)),
-            StrokeKind::Inside,
-        );
-        paint::text(
-            &p,
-            frame.left() + 8.0,
-            frame.top() + 18.0,
-            Align::Min,
-            d.sensors_ref_title,
-            t::SSD_NOTE,
-            c::TEXT_TITLE.gamma_multiply(0.85),
-        );
-        let mut ry = frame.top() + 18.0 + geo.ref_pitch + 4.0;
-        for rr in &sv.refs {
-            let range_r = paint::text(
-                &p,
-                frame.right() - 8.0,
-                ry,
-                Align::Max,
-                &rr.range,
-                t::SSD_NOTE,
-                c::TEXT_SECONDARY,
-            );
-            paint::text_clipped(
-                &p,
-                frame.left() + 8.0,
-                ry,
-                (range_r.left() - frame.left() - 14.0).max(30.0),
-                &rr.label,
-                t::SSD_NOTE,
-                c::TEXT_MUTED,
-            );
-            ry += geo.ref_pitch;
+    let [detail, powerlab] = sensor_detail_buttons(rect);
+    for (area, id, label, enabled, action) in [
+        (
+            detail.translate(vec2(-104., 0.)),
+            "sensors_refresh",
+            d.sensors_refresh,
+            !sv.busy && !sv.hardware.busy,
+            Action::RefreshSensors,
+        ),
+        (
+            detail,
+            "sensors_details",
+            d.sensors_details,
+            sv.has_data || !sv.hardware.message.is_empty(),
+            Action::ShowSensorDetails,
+        ),
+        (
+            powerlab,
+            "sensors_powerlab",
+            "PowerLab",
+            true,
+            Action::OpenPowerLab,
+        ),
+    ] {
+        if paint::button(
+            ui,
+            area,
+            id,
+            label,
+            ButtonKind::Secondary,
+            enabled,
+            ButtonIcon::None,
+            t::BUTTON_TEXT_SMALL,
+        )
+        .clicked()
+        {
+            actions.push(action);
         }
     }
-    paint::text_clipped(
+    let body = sensor_body_rect(rect);
+    let name_w = body.width() - 216.;
+    let col = [body.right() - 144., body.right() - 72., body.right()];
+    paint::text(
         &p,
-        x0,
-        rect.bottom() - 12.0,
-        rect.width() - 42.0,
-        d.sensors_note,
+        body.left(),
+        body.top() - 12.,
+        Align::Min,
+        d.sensors_col_name,
         t::SSD_NOTE,
         c::TEXT_MUTED,
     );
+    for (x, h) in col.into_iter().zip(["T°C", "Volt", "Watt"]) {
+        paint::text(
+            &p,
+            x,
+            body.top() - 12.,
+            Align::Max,
+            h,
+            t::SSD_NOTE,
+            c::TEXT_MUTED,
+        );
+    }
+    ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+        ui.set_clip_rect(body);
+        egui::ScrollArea::vertical()
+            .id_salt("b3-sensor-table")
+            .auto_shrink([false, false])
+            .max_height(body.height())
+            .show(ui, |ui| {
+                if sv.matrix.is_empty() {
+                    ui.label(if sv.busy {
+                        d.sensors_reading
+                    } else {
+                        &sv.power_state
+                    });
+                }
+                for row in &sv.matrix {
+                    let (rr, response) =
+                        ui.allocate_exact_size(vec2(body.width() - 10., 25.), egui::Sense::hover());
+                    response.on_hover_text(&row.label);
+                    let p = ui.painter();
+                    paint::text_clipped(
+                        p,
+                        rr.left(),
+                        rr.top() + 18.,
+                        name_w,
+                        &row.label,
+                        t::CAPTION,
+                        c::TEXT_BODY,
+                    );
+                    for (cell, x) in [
+                        (&row.temp, col[0] - 10.),
+                        (&row.volt, col[1] - 10.),
+                        (&row.watt, col[2] - 10.),
+                    ] {
+                        let (text, tone, style) = match cell {
+                            SensorCell::Value { text, tone } => {
+                                (text.as_str(), *tone, t::BODY_STRONG)
+                            }
+                            SensorCell::NoData => (d.sensors_no_data, Tone::Idle, t::SSD_NOTE),
+                            SensorCell::NotApplicable => ("—", Tone::Idle, t::CAPTION),
+                        };
+                        paint::text(
+                            p,
+                            x,
+                            rr.top() + 18.,
+                            Align::Max,
+                            text,
+                            style,
+                            tone_color(tone),
+                        );
+                    }
+                }
+                ui.separator();
+                ui.collapsing(d.sensors_ref_title, |ui| {
+                    for r in &sv.refs {
+                        ui.label(format!("{}: {}", r.label, r.range));
+                    }
+                });
+            });
+    });
+    let footer = Rect::from_min_max(
+        egui::pos2(rect.left() + 21., rect.bottom() - 102.),
+        rect.max - vec2(82., 10.),
+    );
+    let fp = p.with_clip_rect(footer);
+    paint::text_clipped(
+        &fp,
+        footer.left(),
+        footer.top() + 18.,
+        footer.width(),
+        &format!("{} {}", d.sensors_power_state_label, sv.power_state),
+        t::CAPTION,
+        tone_color(sv.power_tone),
+    );
+    let msg = if !sv.power_message.is_empty() {
+        &sv.power_message
+    } else {
+        &sv.hardware.message
+    };
+    paint::text_clipped(
+        &fp,
+        footer.left(),
+        footer.top() + 39.,
+        footer.width(),
+        msg,
+        t::SSD_NOTE,
+        c::TEXT_SECONDARY,
+    );
+    if sv.hardware.can_install {
+        if paint::button(
+            ui,
+            Rect::from_min_size(footer.min + vec2(0., 49.), vec2(158., 27.)),
+            "pawn_install",
+            "Установить PawnIO",
+            ButtonKind::Secondary,
+            !sv.busy && !sv.hardware.busy,
+            ButtonIcon::None,
+            t::BUTTON_TEXT_SMALL,
+        )
+        .clicked()
+        {
+            actions.push(Action::InstallPawnIo);
+        }
+    } else {
+        paint::text_clipped(
+            &fp,
+            footer.left(),
+            footer.bottom() - 1.,
+            footer.width(),
+            d.sensors_note,
+            t::SSD_NOTE,
+            c::TEXT_MUTED,
+        );
+    }
     draw_sensor_read_indicator(&p, rect, vm);
 }
 
@@ -1223,49 +1482,6 @@ fn draw_sensor_read_indicator(p: &Painter, card: Rect, vm: &DashboardVm) {
                 c::RED_ERROR,
             );
         }
-    }
-}
-
-/// Column geometry of the v1.0 sensor matrix (right edges of the value
-/// columns, reference table bounds) inside the sensor card.
-pub struct SensorMatrixGeometry {
-    pub name_x: f32,
-    pub temp_r: f32,
-    pub volt_r: f32,
-    pub watt_r: f32,
-    pub col_w: f32,
-    pub ref_l: f32,
-    pub ref_r: f32,
-    pub pitch: f32,
-    pub ref_pitch: f32,
-}
-
-impl SensorMatrixGeometry {
-    pub fn new(card: Rect) -> Self {
-        let name_x = card.left() + 21.0;
-        let col_w = 64.0;
-        let temp_r = name_x + 120.0 + col_w;
-        let volt_r = temp_r + 72.0;
-        let watt_r = volt_r + 64.0;
-        Self {
-            name_x,
-            temp_r,
-            volt_r,
-            watt_r,
-            col_w,
-            ref_l: watt_r + 14.0,
-            ref_r: card.right() - 12.0,
-            pitch: 23.0,
-            ref_pitch: 19.0,
-        }
-    }
-}
-
-/// Splits a long status sentence into at most two lines at a sentence end.
-fn wrap_two(s: &str) -> Vec<String> {
-    match s.split_once(". ") {
-        Some((a, b)) => vec![format!("{a}."), b.to_string()],
-        None => vec![s.to_string()],
     }
 }
 
@@ -1657,6 +1873,29 @@ pub fn draw_test_block_pair(
     let d = i18n::t(vm.lang);
     let half = frame.width() / 2.0;
     let pulse = super::dashboard::running_stage_intensity(vm.time, vm.animate);
+    let retest_busy = retest
+        && blocks.iter().any(|b| {
+            matches!(b, TestBlockVm::Active { .. })
+                || matches!(b, TestBlockVm::Waiting(Some(s)) if !s.is_empty())
+        });
+    if retest_busy {
+        p.rect_filled(
+            frame,
+            CornerRadius::same(8),
+            c::YELLOW_WARNING.gamma_multiply(0.12),
+        );
+        p.rect_stroke(
+            frame,
+            CornerRadius::same(8),
+            Stroke::new(2.0, c::YELLOW_WARNING),
+            StrokeKind::Inside,
+        );
+        p.circle_filled(
+            egui::pos2(frame.right() - 10.0, frame.top() + 10.0),
+            4.0 + pulse,
+            c::YELLOW_WARNING,
+        );
+    }
     for (i, block_vm) in blocks.iter().enumerate() {
         let block = Rect::from_min_size(
             egui::pos2(frame.left() + 10.0 + i as f32 * half, frame.top() + 12.0),
@@ -1704,6 +1943,9 @@ pub fn draw_test_block_pair(
         );
         // Caption: state, or (Test 2 of a retest) the two-line retest label.
         let caption = match block_vm {
+            TestBlockVm::Waiting(Some(text)) if i == 1 && retest && !text.is_empty() => {
+                text.clone()
+            }
             _ if i == 1 && retest => d.test_retest_label.to_string(),
             TestBlockVm::Active { .. } => d.test_running.to_string(),
             TestBlockVm::Waiting(Some(text)) if !text.is_empty() => text.clone(),
@@ -1745,8 +1987,8 @@ pub fn draw_test_block_pair(
                 block.top() + 168.0,
                 Align::Center,
                 text,
-                t::CAPTION,
-                c::TEXT_SECONDARY,
+                t::SSD_RING_LABEL,
+                c::YELLOW_WARNING,
             );
         }
         let (read, write, value_col) = match block_vm {
@@ -1825,6 +2067,242 @@ pub fn draw_test_block_pair(
                     t::SSD_NOTE,
                     c::TEXT_MUTED,
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ai_button_tests {
+    use super::*;
+    #[test]
+    fn a6_label_and_icon_fit_original_bounds_ru_en() {
+        for lang in [i18n::Language::Ru, i18n::Language::En] {
+            let ctx = egui::Context::default();
+            crate::ui::fonts::install(&ctx);
+            let vm = crate::ui::fixture::master_vm_in(lang);
+            let rect = Rect::from_min_size(
+                egui::pos2(20.0, 20.0),
+                vec2(
+                    l::JOURNAL_COMPACT_REPORT_BUTTON[2],
+                    l::JOURNAL_COMPACT_REPORT_BUTTON[3],
+                ),
+            );
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ai_report_button(ui, rect, &vm);
+            });
+            out.textures_delta.clear();
+            let text = out
+                .shapes
+                .iter()
+                .find_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        (t.galley.text() == i18n::t(lang).journal_report_button).then_some(t)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(
+                rect.expand(0.5)
+                    .contains_rect(Rect::from_min_size(text.pos, text.galley.size())),
+                "label overflow {:?} {:?}",
+                text.pos,
+                text.galley.size()
+            );
+        }
+    }
+}
+
+/// Only the A1 BIOS row adapts; neighbouring cards and the first four rows stay fixed.
+fn draw_bios_row(
+    ui: &mut Ui,
+    card: Rect,
+    value: &str,
+    vm: &super::vm::BiosVm,
+    actions: &mut Vec<Action>,
+) {
+    let p = ui.painter().clone();
+    let center = egui::pos2(card.right() - 23.0, card.bottom() - 16.0);
+    let button =
+        paint::round_refresh_button(ui, center, l::CRYPTO_RECHECK_D, "bios_recheck", vm.enabled);
+    if button.clicked() {
+        actions.push(Action::CheckBios)
+    }
+    button.on_hover_text("Проверить обновление BIOS");
+    let right = center.x - l::CRYPTO_RECHECK_D / 2.0 - 7.0;
+    let x = card.left() + 21.0;
+    let font = egui::FontId::proportional(14.2);
+    let value_g = p.layout_no_wrap(value.into(), font.clone(), c::IDENT_BIOS);
+    let label = if vm.preview.is_empty() {
+        vm.label.clone()
+    } else {
+        format!("{} · {}", vm.label, vm.preview)
+    };
+    let status_g = p.layout_no_wrap(
+        label.clone(),
+        egui::FontId::proportional(11.5),
+        if vm.available {
+            c::GOLD_ACCENT
+        } else {
+            c::TEXT_MUTED
+        },
+    );
+    let fits = 38.0 + value_g.size().x + status_g.size().x + 18.0 <= right - x;
+    let value_y = if fits {
+        card.bottom() - 22.0
+    } else {
+        card.bottom() - 30.0
+    };
+    let value_font = if fits {
+        font.clone()
+    } else {
+        egui::FontId::proportional(12.0)
+    };
+    let label_g = p.layout_no_wrap("BIOS".into(), value_font.clone(), c::PASSPORT_LABEL);
+    p.galley(egui::pos2(x, value_y), label_g, c::PASSPORT_LABEL);
+    let vx = x + 38.0;
+    let vg = p.layout_no_wrap(value.into(), value_font, c::IDENT_BIOS);
+    // Extremely long vendor strings stay available without ellipsis in a horizontal
+    // scroll area; ordinary and long OEM versions use the full first line.
+    let vw = if fits { vg.size().x } else { right - vx };
+    let vr = Rect::from_min_size(egui::pos2(vx, value_y), vec2(vw, 17.0));
+    if vg.size().x <= vw {
+        p.galley(vr.min, vg, c::IDENT_BIOS);
+    } else {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(vr), |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("bios_version")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(value).size(12.0).color(c::IDENT_BIOS));
+                });
+        });
+    }
+    let sx = if fits { vx + vw + 10.0 } else { vx };
+    let sy = if fits {
+        value_y + 1.0
+    } else {
+        card.bottom() - 15.0
+    };
+    let status_rect = Rect::from_min_size(
+        egui::pos2(sx, sy),
+        vec2((status_g.size().x + 8.0).min(right - sx), 14.0),
+    );
+    if vm.available {
+        p.rect_stroke(
+            status_rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0, c::GOLD_ACCENT),
+            StrokeKind::Inside,
+        );
+    }
+    let status_color = if vm.available {
+        c::GOLD_ACCENT
+    } else {
+        c::TEXT_MUTED
+    };
+    if status_g.size().x + 8.0 <= status_rect.width() {
+        p.galley(status_rect.min + vec2(4.0, 0.0), status_g, status_color);
+    } else {
+        // Keep the full result, including beta/uncertainty, reachable without
+        // drawing over the refresh button or adjacent cards.
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(status_rect.shrink2(vec2(4.0, 0.0))),
+            |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("bios_status")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(&label).size(11.5).color(status_color));
+                    });
+            },
+        );
+    }
+    let response = ui.interact(
+        status_rect,
+        egui::Id::new("bios_support_link"),
+        if vm.available {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    if response.clicked() && vm.available {
+        actions.push(Action::OpenBiosSupport)
+    }
+    response.on_hover_text(&vm.tooltip);
+    ui.interact(vr, egui::Id::new("bios_identity_tip"), egui::Sense::hover())
+        .on_hover_text(&vm.tooltip);
+}
+
+#[cfg(test)]
+mod bios_layout_tests {
+    use super::*;
+    #[test]
+    fn bios_value_date_status_and_preview_fit_a1_without_ellipsis() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            crate::ui::fonts::install(&ctx);
+            ctx.set_pixels_per_point(scale);
+            for (value, label, preview) in [
+                ("7D46v1R (24.08.2026)", "Актуален", ""),
+                ("7E34v1AE0 (24.06.2026)", "Доступен: 7E34v1AF0", ""),
+                (
+                    "1.AZ0 (24.06.2026)",
+                    "На сайте: 7E34v1AF0 · сопоставление не подтверждено",
+                    "",
+                ),
+                ("7D46v1R (24.08.2026)", "Кэш: Актуален", ""),
+                (
+                    "7D91vHI (22.04.2026)",
+                    "Доступен: 7D91vHJ",
+                    "Бета: 7D91vHK1",
+                ),
+                (
+                    "R2.43.0-OEM-20261115 (дата неизвестна)",
+                    "Не удалось проверить",
+                    "",
+                ),
+            ] {
+                let card = Rect::from_min_size(egui::pos2(15.0, 15.0), vec2(539.0, 151.0));
+                let vm = super::super::vm::BiosVm {
+                    label: label.into(),
+                    preview: preview.into(),
+                    available: label.starts_with("Доступен"),
+                    enabled: true,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    draw_bios_row(ui, card, value, &vm, &mut Vec::new())
+                });
+                out.textures_delta.clear();
+                let text: Vec<_> = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| {
+                        if let egui::Shape::Text(t) = &s.shape {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    text.iter().any(|t| t.galley.text() == value),
+                    "BIOS/version/date must be intact"
+                );
+                let right = card.right() - 45.0;
+                for t in text {
+                    let bounds = Rect::from_min_size(t.pos, t.galley.size());
+                    assert!(
+                        bounds.right() <= right + 1.0 && bounds.bottom() <= card.bottom() + 1.0,
+                        "overflow {} {:?}",
+                        t.galley.text(),
+                        bounds
+                    );
+                }
             }
         }
     }

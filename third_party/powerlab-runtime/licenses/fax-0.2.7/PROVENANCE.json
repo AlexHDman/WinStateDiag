@@ -1,0 +1,21 @@
+{
+  "name": "fax",
+  "version": "0.2.7",
+  "license": "MIT",
+  "repository": "https://github.com/pdf-rs/fax",
+  "authors": [
+    "Sebastian K <s3bk@protonmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\fax-0.2.7\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "ac2a4b2237d98830ea1fd37c7d280eec0e87c1d8"
+    },
+    "path_in_vcs": ""
+  }
+}

@@ -30,9 +30,10 @@ function New-HardwareReportLines {
     param([Parameter(Mandatory=$true)][object]$Passport)
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('EXPC HARDWARE DIAGNOSTICS')
+    if($Passport.PSObject.Properties['Version']){$lines.Add((Format-HardwareLine 'WinStateDiag' $Passport.Version))}
     $lines.Add((Format-HardwareLine 'Generated' $Passport.GeneratedAt))
     $lines.Add((Format-HardwareLine 'Read-only' $Passport.ReadOnly))
-    $lines.Add((Format-HardwareLine 'Overall state' $Passport.OverallState))
+    $lines.Add((Format-HardwareLine 'Inventory assessment' $Passport.OverallState))
     $lines.Add('')
     $lines.Add('[HARDWARE SUMMARY]')
     $lines.Add((Format-HardwareLine 'Device' ("$($Passport.System.Manufacturer) $($Passport.System.Model)")))
@@ -68,7 +69,7 @@ function New-HardwareReportLines {
     $lines.Add((Format-HardwareLine 'Model' ($Passport.Cpu.Models -join '; ')))
     $lines.Add((Format-HardwareLine 'Cores / threads' ("$($Passport.Cpu.PhysicalCores) / $($Passport.Cpu.LogicalProcessors)")))
     $lines.Add((Format-HardwareLine 'Base clock (Windows-reported nominal)' ("$($Passport.Cpu.MaxClockMHz) MHz")))
-    $lines.Add((Format-HardwareLine 'Current clock' ("$($Passport.Cpu.CurrentClockMHz) MHz")))
+    $lines.Add((Format-HardwareLine 'Current clock' 'Not measured'))
     $lines.Add((Format-HardwareLine 'Max Boost' 'Not reliably reported by Windows'))
     $lines.Add((Format-HardwareLine 'Socket' ($Passport.Cpu.Sockets -join '; ')))
     $lines.Add('')
@@ -82,6 +83,15 @@ function New-HardwareReportLines {
         $lines.Add('Note: SMBIOS may not reflect full physical topology (soldered/onboard RAM, incomplete SMBIOS). An unpopulated physical slot is not confirmed.')
     }
     foreach ($reason in @($Passport.Ram.Reasons)) { $lines.Add("Reason: $reason") }
+    if ($Passport.Ram.PSObject.Properties['Intelligence']) {
+        $ri=$Passport.Ram.Intelligence
+        $lines.Add("RAM configuration: $($ri.Status) / $($ri.Color)")
+        foreach($key in @('CurrentMTs','ProfileMTs','CpuOfficialMTs','BoardOfficialMTs','PreviousMTs')) { $value=$ri.$key; if($null -eq $value){$value='UNKNOWN'}; $lines.Add("${key}: $value") }
+        $lines.Add("SPD source: $($ri.SpdAvailability); XMP active: UNKNOWN; stability: NOT_TESTED")
+        if($null -ne $ri.TransferRateChangePercent){$lines.Add("Data rate change: $($ri.TransferRateChangePercent)%; performance change: NOT_MEASURED")}
+        $lines.Add("Sources: $($ri.Sources -join '; ')")
+        $lines.Add("Recommendation: $($ri.Recommendation)")
+    }
     foreach ($ctx in @($Passport.Ram.Context)) { $lines.Add("Context (INFO): $ctx") }
     foreach ($module in @($Passport.Ram.Modules)) { $lines.Add("- $($module.DeviceLocator): $($module.Manufacturer) $($module.PartNumber), $($module.Capacity) $($module.Type), rated $(Format-HardwareMemoryRate $module.RatedSpeedMHz), configured $(Format-HardwareMemoryRate $module.ConfiguredClockMHz) (SMBIOS-reported data rate, not measured)") }
     $lines.Add('')
@@ -313,7 +323,7 @@ function Update-HardwareGui {
     $State.OverviewValues.Gpu.ScrollBars=$(if(@($p.Gpu.Controllers).Count -gt 2){'Vertical'}else{'None'})
     $State.OverviewValues.Overall.Font=New-Object Drawing.Font('Segoe UI Semibold',14)
     $State.OverviewValues.Overall.ForeColor=$(switch($p.OverallState){'OK'{Get-HwColor 'Green'}'WARNING'{Get-HwColor 'Yellow'}'CRITICAL'{Get-HwColor 'Red'}default{Get-HwColor 'Secondary'}})
-    $cpu=@{Model=$p.Cpu.Models-join '; ';Manufacturer=$p.Cpu.Manufacturers-join '; ';Cores=$p.Cpu.PhysicalCores;Logical=$p.Cpu.LogicalProcessors;Socket=$p.Cpu.Sockets-join '; ';MaxClock="$($p.Cpu.MaxClockMHz) MHz";CurrentClock="$($p.Cpu.CurrentClockMHz) MHz";MaxBoost='Not reliably reported by Windows';Architecture=$p.Cpu.Architecture;Cache="L2 $($p.Cpu.L2CacheKB) KB; L3 $($p.Cpu.L3CacheKB) KB"}
+    $cpu=@{Model=$p.Cpu.Models-join '; ';Manufacturer=$p.Cpu.Manufacturers-join '; ';Cores=$p.Cpu.PhysicalCores;Logical=$p.Cpu.LogicalProcessors;Socket=$p.Cpu.Sockets-join '; ';MaxClock="$($p.Cpu.MaxClockMHz) MHz";CurrentClock='Not measured';MaxBoost='Not reliably reported by Windows';Architecture=$p.Cpu.Architecture;Cache="L2 $($p.Cpu.L2CacheKB) KB; L3 $($p.Cpu.L3CacheKB) KB"}
     foreach($key in $cpu.Keys){$State.CpuValues[$key].Text=[string]$cpu[$key]}
     Set-HardwareGridRows $State.RamGrid @($p.Ram.Modules|ForEach-Object{,@($_.DeviceLocator,$_.Manufacturer,$_.PartNumber,$_.Capacity,(Format-HardwareMemoryRate $_.RatedSpeedMHz),(Format-HardwareMemoryRate $_.ConfiguredClockMHz),$_.Serial,$_.State)})
     $State.RamFooter.Text="Total installed: $($p.Ram.Total) | Type: $(@($p.Ram.Modules|ForEach-Object Type|Sort-Object -Unique)-join '/') | Declared slots: $($p.Ram.DeclaredSlots) | Detected: $($p.Ram.ModuleCount) | State: $($p.Ram.State)`r`n$((@($p.Ram.Reasons) + @($p.Ram.Context)) -join '; ')"
@@ -441,6 +451,7 @@ Write-Host ''
 
 try {
     $passport = New-HardwarePassport
+    Update-HardwareRamHistory -Passport $passport -Directory (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "EXPC\WinStateDiag")
     if (-not (Test-Path -LiteralPath $OutputDirectory)) { [void](New-Item -ItemType Directory -Path $OutputDirectory -Force) }
     $allocation=Get-UniqueWinDiagReportBaseName -Prefix Hardware -RunStartedAt $runStarted -Directory $OutputDirectory -Extensions @('.txt','.json','.html')
     $baseName=$allocation.BaseName
@@ -452,7 +463,7 @@ try {
     foreach ($disk in @($passport.Storage.Disks)) { Write-Host ("Storage: {0}; {1}; {2}/{3}; Health: {4}" -f $disk.Model,$disk.Capacity,$disk.MediaType,$disk.BusType,$disk.Health) }
     Write-Host ("Battery: {0}" -f $passport.Battery.Summary)
     Write-Host ''
-    Write-Host ("Overall hardware state: {0}" -f $passport.OverallState) -ForegroundColor $(switch ($passport.OverallState) { 'OK' {'Green'} 'WARNING' {'Yellow'} 'CRITICAL' {'Red'} default {'Cyan'} })
+    Write-Host ("Inventory assessment (not a hardware test): {0}" -f $passport.OverallState) -ForegroundColor $(switch ($passport.OverallState) { 'OK' {'Green'} 'WARNING' {'Yellow'} 'CRITICAL' {'Red'} default {'Cyan'} })
     Write-Host 'Reports:' -ForegroundColor Cyan
     Write-Host $OutputDirectory
     if(-not [string]::IsNullOrWhiteSpace($QaScreenshotPath)){

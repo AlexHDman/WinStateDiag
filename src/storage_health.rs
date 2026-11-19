@@ -703,7 +703,13 @@ pub fn classify(inputs: &StorageHealthInputs) -> Classification {
             }
         }
     }
-    if state == StorageState::Ok && smart.is_none() && ata.is_none() {
+    // v1.1 RC: AnomalyNotConfirmed promises "health clean" — without any
+    // health record it is insufficient data, never a green state.
+    let ata_partial = ata.is_some_and(|a| a.health().starts_with("SMART: PARTIAL"));
+    if matches!(state, StorageState::Ok | StorageState::AnomalyNotConfirmed)
+        && smart.is_none()
+        && (ata.is_none() || ata_partial)
+    {
         state = StorageState::InsufficientData;
     }
     Classification { state, findings }

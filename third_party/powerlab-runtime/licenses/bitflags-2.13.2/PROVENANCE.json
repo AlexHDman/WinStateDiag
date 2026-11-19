@@ -1,0 +1,22 @@
+{
+  "name": "bitflags",
+  "version": "2.13.2",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/bitflags/bitflags",
+  "authors": [
+    "The Rust Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\bitflags-2.13.2\\LICENSE-APACHE",
+    "licenses\\bitflags-2.13.2\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "80ce9b545acb0bd42150695fc351889cac1d8eb4"
+    },
+    "path_in_vcs": ""
+  }
+}

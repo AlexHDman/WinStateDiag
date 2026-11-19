@@ -1,0 +1,22 @@
+{
+  "name": "quote",
+  "version": "1.0.47",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/dtolnay/quote",
+  "authors": [
+    "David Tolnay <dtolnay@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\quote-1.0.47\\LICENSE-APACHE",
+    "licenses\\quote-1.0.47\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "723dcb47d3f0ddc896e17287c8a8d3f2ea2317d5"
+    },
+    "path_in_vcs": ""
+  }
+}

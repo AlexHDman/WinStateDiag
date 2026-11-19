@@ -1,0 +1,22 @@
+{
+  "name": "png",
+  "version": "0.18.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/image-rs/image-png",
+  "authors": [
+    "The image-rs Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\png-0.18.1\\LICENSE-APACHE",
+    "licenses\\png-0.18.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "2a3f980245e3ae38b82ade96533e7b450e8477bb"
+    },
+    "path_in_vcs": ""
+  }
+}

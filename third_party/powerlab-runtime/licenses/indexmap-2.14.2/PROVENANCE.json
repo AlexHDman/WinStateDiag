@@ -1,0 +1,20 @@
+{
+  "name": "indexmap",
+  "version": "2.14.2",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/indexmap-rs/indexmap",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\indexmap-2.14.2\\LICENSE-APACHE",
+    "licenses\\indexmap-2.14.2\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "41a870887c4c77adf665886e63df08f406bfe37a"
+    },
+    "path_in_vcs": ""
+  }
+}

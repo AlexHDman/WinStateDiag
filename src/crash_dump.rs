@@ -140,6 +140,15 @@ impl Inventory {
         }
     }
 
+    /// v1.1 RC: nothing was found but a source could not be read (dump
+    /// folder, MEMORY.DMP, CrashControl, System log). "No dumps / no events"
+    /// is then not "no crashes".
+    pub fn is_incomplete_none(&self) -> bool {
+        self.state() == CrashState::NoCrashes
+            && self.unexpected_shutdowns == 0
+            && !self.notes.is_empty()
+    }
+
     /// Dumps to analyze: newest minidumps first (BugCheck-linked ones are
     /// naturally among them), at most [`MAX_ANALYZED_DUMPS`].
     pub fn analysis_queue(&self) -> Vec<&DumpFile> {
@@ -210,16 +219,23 @@ pub fn parse_wer_bugcheck(text: &str) -> Option<(u32, Vec<u64>)> {
 pub const INVENTORY_PS1: &str = r#"$ErrorActionPreference = 'Continue'
 # v1.0.1: the same 30-day window as EXPC stage 07 (incidents::WINDOW_DAYS).
 $since = (Get-Date).AddDays(-30)
+$notes = @()
+# v1.1 RC: "no matching events" is an empty result; any other read failure
+# is a collection gap and is kept as a note (never a silent "no crashes").
+function Note-LogError($what, $err) {
+    if ([string]$err.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') {
+        $script:notes += ('System log not readable (' + $what + '): ' + $err.Exception.Message)
+    }
+}
 $bc = @()
 try {
     $bc += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'; Id=1001; StartTime=$since } -ErrorAction Stop | ForEach-Object {
         [PSCustomObject]@{ t = $_.TimeCreated.ToString('s'); src = 'WER1001'; p = @($_.Properties | ForEach-Object { [string]$_.Value }) } })
-} catch { }
+} catch { Note-LogError 'WER 1001' $_ }
 try {
     $bc += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41; StartTime=$since } -ErrorAction Stop | ForEach-Object {
         [PSCustomObject]@{ t = $_.TimeCreated.ToString('s'); src = 'KP41'; p = @($_.Properties | Select-Object -First 5 | ForEach-Object { [string]$_.Value }) } })
-} catch { }
-$notes = @()
+} catch { Note-LogError 'Kernel-Power 41' $_ }
 $dirs = @()
 $fullPath = ''
 try {
@@ -290,9 +306,9 @@ if (-not $cdb -and $env:LOCALAPPDATA) {
 # System / Application events of the 10 minutes before it. Read-only.
 $raw = @()
 try { $raw += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41; StartTime=$since } -ErrorAction Stop | ForEach-Object {
-    [PSCustomObject]@{ t = $_.TimeCreated; src = 'KP41'; code = [string](@($_.Properties)[0].Value) } }) } catch { }
+    [PSCustomObject]@{ t = $_.TimeCreated; src = 'KP41'; code = [string](@($_.Properties)[0].Value) } }) } catch { Note-LogError 'Kernel-Power 41 (incidents)' $_ }
 try { $raw += @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='EventLog'; Id=6008; StartTime=$since } -ErrorAction Stop | ForEach-Object {
-    [PSCustomObject]@{ t = $_.TimeCreated; src = 'EL6008'; code = '0' } }) } catch { }
+    [PSCustomObject]@{ t = $_.TimeCreated; src = 'EL6008'; code = '0' } }) } catch { Note-LogError 'EventLog 6008' $_ }
 $groups = New-Object System.Collections.Generic.List[object]
 foreach ($e in @($raw | Sort-Object t -Descending)) {
     $g = $null
@@ -2023,7 +2039,10 @@ pub fn resolution_lines(r: &DriverResolution, ru: bool) -> Vec<String> {
 /// Generic kernel frames (ntoskrnl, hal, memory_corruption …) never are.
 /// The base report is not changed; confidence of the analysis was computed
 /// from the base report only (the dump never corroborates itself).
-pub fn extend_audit(base: &AuditReport, analyses: &[DumpAnalysis]) -> AuditReport {
+/// `ru` selects the UI language of the added texts (v1.1 RC: the English
+/// UI showed Russian crash-link texts).
+pub fn extend_audit(base: &AuditReport, analyses: &[DumpAnalysis], ru: bool) -> AuditReport {
+    let tr = |a: &'static str, b: &'static str| if ru { a } else { b };
     use crate::driver_audit::{AuditItem, Category, Evidence};
     let mut report = base.clone();
     for a in analyses
@@ -2051,14 +2070,21 @@ pub fn extend_audit(base: &AuditReport, analyses: &[DumpAnalysis]) -> AuditRepor
             .clone()
             .unwrap_or_else(|| format!("{stem}.sys"));
         let reason = format!(
-            "BugCheck {code}{} — дамп {} указывает модуль {image} (уверенность {}); вывод отладчика — эвристика, не вердикт",
+            "BugCheck {code}{} — {} {} {} {image} ({} {}); {}",
             a.parsed
                 .bugcheck_name
                 .as_deref()
                 .map(|n| format!(" {n}"))
                 .unwrap_or_default(),
+            tr("дамп", "dump"),
             a.dump.name,
-            a.confidence.code()
+            tr("указывает модуль", "points to module"),
+            tr("уверенность", "confidence"),
+            a.confidence.code(),
+            tr(
+                "вывод отладчика — эвристика, не вердикт",
+                "debugger output is a heuristic, not a verdict"
+            )
         );
         let ev = Evidence {
             kind: EvidenceKind::BugcheckDump,
@@ -2092,27 +2118,37 @@ pub fn extend_audit(base: &AuditReport, analyses: &[DumpAnalysis]) -> AuditRepor
             continue;
         }
         let device = match res {
-            Some(r) if !r.present => format!("{image} — драйвер не найден (удалён?)"),
+            Some(r) if !r.present => format!(
+                "{image} — {}",
+                tr("драйвер не найден (удалён?)", "driver not found (removed?)")
+            ),
             Some(r) if !r.devices.is_empty() => r
                 .devices
                 .iter()
                 .map(|d| d.name.clone())
                 .collect::<Vec<_>>()
                 .join("; "),
-            _ => format!("{image} — устройство не найдено"),
+            _ => format!(
+                "{image} — {}",
+                tr("устройство не найдено", "device not found")
+            ),
         };
         let mut item = AuditItem {
             category: Category::Other,
-            label: format!("{image} (дамп BSOD)"),
+            label: format!("{image} ({})", tr("дамп BSOD", "BSOD dump")),
             device,
             vendor: res.map(|r| r.company.clone()).unwrap_or_default(),
             provider: res.map(|r| r.provider.clone()).unwrap_or_default(),
             version: res.map(|r| r.file_version.clone()).unwrap_or_default(),
             date: String::new(),
+            date_source: String::new(),
+            date_raw: String::new(),
             inf: res.map(|r| r.inf.clone()).unwrap_or_default(),
             service,
             pnp_id: String::new(),
             pnp_error_code: res.and_then(|r| r.devices.iter().find_map(|d| d.problem_code)),
+            pnp_source: "dump resolver".into(),
+            pnp_query_error: String::new(),
             signed: res.and_then(|r| match r.signature_status.as_str() {
                 "Valid" => Some(true),
                 "" => None,
@@ -2364,10 +2400,14 @@ Followup:     MachineOwner
             provider: "NVIDIA".into(),
             version: "32.0.15.6094".into(),
             date: "2024-08-14".into(),
+            date_source: String::new(),
+            date_raw: String::new(),
             inf: "oem42.inf".into(),
             service: "nvlddmkm".into(),
             pnp_id: "PCI\\VEN_10DE&DEV_1D01".into(),
             pnp_error_code: Some(0),
+            pnp_source: String::new(),
+            pnp_query_error: String::new(),
             signed: Some(true),
             status: Severity::Problem,
             evidence: vec![
@@ -2746,7 +2786,7 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
         // Driver Audit: was "0 problems / 0 warnings" — now the culprit is
         // an item with kernel-driver (priority 2) dump evidence.
         assert_eq!(base.count(Severity::Warning), 0);
-        let ext = extend_audit(&base, std::slice::from_ref(&resolved));
+        let ext = extend_audit(&base, std::slice::from_ref(&resolved), true);
         assert_eq!(ext.count(Severity::Warning), 1);
         let item = &ext.items[0];
         assert_eq!(item.service, "RvNetMP60");
@@ -2784,8 +2824,27 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
                 ..Default::default()
             }),
         );
-        let ext = extend_audit(&base, std::slice::from_ref(&a));
+        let ext = extend_audit(&base, std::slice::from_ref(&a), true);
         assert!(ext.items[0].device.contains("не найден"));
+        // v1.1 RC: the English UI gets English link texts.
+        let en = extend_audit(&base, std::slice::from_ref(&a), false);
+        assert!(
+            en.items[0].device.contains("driver not found"),
+            "{}",
+            en.items[0].device
+        );
+        assert!(en.items[0].label.contains("(BSOD dump)"));
+        let reason = &en.items[0].evidence[0].reason;
+        assert!(
+            reason.contains("points to module") && reason.contains("heuristic"),
+            "{reason}"
+        );
+        assert!(
+            !reason
+                .chars()
+                .any(|c| ('а'..='я').contains(&c.to_ascii_lowercase())),
+            "{reason}"
+        );
         assert!(
             resolution_lines(a.resolution.as_ref().unwrap(), false)[0]
                 .contains("not found on this computer")
@@ -2799,7 +2858,7 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
             Some(&base),
         );
         assert_eq!(nt.third_party_module(), None);
-        assert!(extend_audit(&base, &[nt]).items.is_empty());
+        assert!(extend_audit(&base, &[nt], true).items.is_empty());
     }
 
     #[test]
@@ -2813,10 +2872,14 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
             provider: String::new(),
             version: String::new(),
             date: String::new(),
+            date_source: String::new(),
+            date_raw: String::new(),
             inf: String::new(),
             service: "RvNetMP60".into(),
             pnp_id: String::new(),
             pnp_error_code: None,
+            pnp_source: String::new(),
+            pnp_query_error: String::new(),
             signed: Some(true),
             status: Severity::Ok,
             evidence: Vec::new(),
@@ -2828,7 +2891,7 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
             case_raw(),
             Some(&base),
         );
-        let ext = extend_audit(&base, &[a]);
+        let ext = extend_audit(&base, &[a], true);
         assert_eq!(ext.items.len(), 1, "no duplicate item");
         assert_eq!(ext.items[0].status, Severity::Warning);
     }
@@ -2961,7 +3024,7 @@ WSD_CRASH {"bugchecks":[{"t":"2026-10-03T09:12:40","src":"WER1001","p":["0x00000
 
     // ---- v1.0.1 Phase 01: crash analyzer correctness ------------------
 
-    /// Modern WinDbg (cdbX64) `!analyze -v` as GALINA-HOME produced it
+    /// Modern WinDbg (cdbX64) `!analyze -v` with synthetic fixture values
     /// (sanitized: machine identity removed): KEY_VALUES block, trailing
     /// spaces, tabs, a symbol warning for the third-party driver, DML
     /// link markup and a SECOND analyze echo with other values.

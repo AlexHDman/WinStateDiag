@@ -131,6 +131,10 @@ pub mod layout {
     /// Round ⟳ (fresh read-only check): centre and diameter.
     pub const CRYPTO_RECHECK_CENTER: [f32; 2] = [533.0, 154.0];
     pub const CRYPTO_RECHECK_D: f32 = 30.0;
+    /// v1.1 UI contract: compact CSP line under the name, and the round
+    /// ReHash button right of the HASH icon (same size as ⟳ above it).
+    pub const CRYPTO_CSP_BASELINE: f32 = 179.0;
+    pub const CRYPTO_REHASH_CENTER: [f32; 2] = [533.0, 215.0];
     /// Status disc — centred in the card, directly above the status.
     pub const CRYPTO_ICON: R = [439.0, 188.0, 54.0, 54.0];
     /// Status word sits under the disc: disc + word read as one object.
@@ -214,7 +218,7 @@ pub mod layout {
     pub const RESULT_BUTTON_FOLDER: R = [425.0, 1011.0, 113.0, 40.0];
 
     /// v0.4.4: Start Diagnostics lives in the common header.
-    pub const START_BUTTON: R = [600.0, 50.0, 330.0, 40.0];
+    pub const START_BUTTON: R = [560.0, 50.0, 460.0, 40.0];
 
     // ---- Right column ----
     pub const OVERALL_CARD: R = [571.0, 121.0, 788.0, 245.0];
@@ -365,6 +369,20 @@ pub mod layout {
     #[allow(dead_code)]
     pub const HW_RESULT_SHIFT: [f32; 2] = [0.0, -91.0];
     pub const HW_SSD_SHIFT: [f32; 2] = [0.0, -257.0];
+    /// v1.1 UI contract (page A order): the computer passport opens page A
+    /// (moved from y 648 to the top, 121) and the client / CryptoPro /
+    /// EXPC-mode / driver group moves down by the passport height + gap.
+    /// The journal moves up into the freed space and Group Policy closes
+    /// the page. Height-neutral: the column still ends at y 1099.
+    pub const DIAG_PASSPORT_SHIFT: [f32; 2] = [0.0, -527.0];
+    pub const DIAG_TOP_GROUP_SHIFT: [f32; 2] = [0.0, 161.0];
+    pub const DIAG_JOURNAL_SHIFT: [f32; 2] = [0.0, -68.0];
+    pub const DIAG_GPO_SHIFT: [f32; 2] = [0.0, 232.0];
+    /// v1.1 block index badge (A1… / B1…): a compact bright-yellow tab that
+    /// sits on the card's top border, left aligned (x offset, w, h).
+    pub const BLOCK_INDEX_DX: f32 = 9.0;
+    pub const BLOCK_INDEX_W: f32 = 26.0;
+    pub const BLOCK_INDEX_H: f32 = 15.0;
     /// Diagnostics page.
     /// v0.4.4 GPO card (kept for reference; v0.4.5 shows GPO as a thin row
     /// inside the passport card).
@@ -393,8 +411,8 @@ pub mod layout {
     pub const JOURNAL_COMPACT_CLEAR_BUTTON: R = [458.0, 885.0, 88.0, 26.0];
     /// v1.0 report actions in the journal header (enabled once a report
     /// exists): [Отчёт] [Папка].
-    pub const JOURNAL_COMPACT_REPORT_BUTTON: R = [182.0, 885.0, 86.0, 26.0];
-    pub const JOURNAL_COMPACT_FOLDER_BUTTON: R = [274.0, 885.0, 86.0, 26.0];
+    pub const JOURNAL_COMPACT_REPORT_BUTTON: R = [40.0, 917.0, 86.0, 26.0];
+    pub const JOURNAL_COMPACT_FOLDER_BUTTON: R = [224.0, 917.0, 86.0, 26.0];
     /// Hardware page.
     pub const SYSTEM_STATE_CARD: R = [19.0, 220.0, 539.0, 98.0];
     /// v0.4.5 sensor card: the Hardware page no longer repeats Driver Audit
@@ -516,6 +534,24 @@ pub mod color {
     ];
 
     pub const YELLOW_WARNING: Color32 = hex(0xf0c83a);
+    /// v1.1 block index badge: bright yellow with near-black text (a
+    /// navigation marker, never a status colour).
+    pub const BLOCK_INDEX_FILL: Color32 = hex(0xffd60a);
+    pub const BLOCK_INDEX_TEXT: Color32 = hex(0x161200);
+    /// v1.1 hardware IDENTITY palette (brand / component accents of the
+    /// passport values). Identity is never a health state: red AMD is not
+    /// a fault, green Windows is not "OK".
+    pub const IDENT_WINDOWS: Color32 = hex(0x5ad16a);
+    pub const IDENT_INTEL: Color32 = hex(0x3d9bff);
+    pub const IDENT_AMD: Color32 = hex(0xff4d4f);
+    pub const IDENT_RAM: Color32 = hex(0xc46bff);
+    pub const IDENT_BOARD: Color32 = hex(0xff9a3c);
+    pub const IDENT_BIOS: Color32 = hex(0x2ed3c4);
+    /// Passport labels (white) and neutral values.
+    pub const PASSPORT_LABEL: Color32 = hex(0xffffff);
+    /// Passport 2.0 current measurements: a neutral soft blue (never the
+    /// healthy green — a measurement is not a verdict).
+    pub const PASSPORT_MEASURED: Color32 = hex(0x9ad7ff);
     /// One restrained gold accent family shared by: active RU/EN, the
     /// selected SSD card, the SSD connector and the READ/WRITE frame —
     /// tuned to sit with the EXPC gold logo, never fluorescent.
@@ -675,6 +711,8 @@ pub mod typography {
     pub const SLOGAN: TextStyle = s(17.2, Regular);
     /// Generic card title (fallback for titles without a measured size).
     pub const CARD_TITLE: TextStyle = s(17.6, Semibold);
+    /// v1.1 block index badge text (A1 / B1).
+    pub const BLOCK_INDEX: TextStyle = s(11.5, Bold);
     pub const TITLE_EXPC: TextStyle = s(17.75, Semibold);
     pub const TITLE_HARDWARE: TextStyle = s(18.0, Semibold);
     pub const TITLE_STAGES: TextStyle = s(17.8, Semibold);

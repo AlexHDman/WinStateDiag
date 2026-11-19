@@ -1,0 +1,21 @@
+{
+  "name": "error-code",
+  "version": "3.4.0",
+  "license": "BSL-1.0",
+  "repository": "https://github.com/DoumanAsh/error-code",
+  "authors": [
+    "Douman <douman@gmx.se>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\error-code-3.4.0\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "e4615e514db3ff64f5f1b328b4865b20a3dcdbc3"
+    },
+    "path_in_vcs": ""
+  }
+}

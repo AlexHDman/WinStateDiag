@@ -2,7 +2,7 @@
 # user-testable EXE).
 #
 # Rule: target\ is internal build output only. Users test ONLY
-#       dist\WinStateDiag-vX.Y.Z\WinStateDiag.exe produced by this script.
+#       dist\WinDiag-vX.Y.Z\WinDiag.exe produced by this script.
 #
 # Steps:
 #   1. version from Cargo.toml ([package] version)
@@ -10,7 +10,7 @@
 #   3. forced fresh cargo build --release (the package is cleaned first, so
 #      the EXE is guaranteed to come from THIS run)
 #   4. EXE version metadata must equal the Cargo version
-#   5. copy to dist\WinStateDiag-vX.Y.Z\WinStateDiag.exe (never overwrites an
+#   5. copy to dist\WinDiag-vX.Y.Z\WinDiag.exe (never overwrites an
 #      existing release unless -Force)
 #   6. SHA256(dist EXE) must equal SHA256(target\release\win_state_diag.exe)
 #   7. lists older dist entries as obsolete (does NOT delete anything)
@@ -24,7 +24,7 @@
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File C:\AI\WinStateDiag\scripts\make_release.ps1 [-Force] [-ManifestDir <dir>]
 
-param([switch]$Force, [string]$ManifestDir = '')
+param([switch]$Force, [string]$ManifestDir = '', [switch]$PreserveBuildCache)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -46,10 +46,10 @@ function Run([string]$name, [scriptblock]$cmd) {
 # 1. version (v1.0 policy: Cargo semver 1.0.0 -> release name "1.0"; a
 #    patch digit is kept only when it is not zero, exactly as build.rs).
 $cargo = Get-Content (Join-Path $root 'Cargo.toml') -Raw
-if ($cargo -notmatch '(?ms)^\[package\].*?^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') { Fail 'version not found in Cargo.toml' }
-$semver = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
-$version = if ($Matches[3] -eq '0') { "$($Matches[1]).$($Matches[2])" } else { $semver }
-Write-Host "WinStateDiag release v$version (Cargo $semver)" -ForegroundColor Yellow
+if ($cargo -notmatch '(?ms)^\[package\].*?^version\s*=\s*"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?"') { Fail 'version not found in Cargo.toml' }
+$semver = "$($Matches[1]).$($Matches[2]).$($Matches[3])$($Matches[4])"
+$version = if ($Matches[4]) { $semver } elseif ($Matches[3] -eq '0') { "$($Matches[1]).$($Matches[2])" } else { $semver }
+Write-Host "WinDiag release v$version (Cargo $semver)" -ForegroundColor Yellow
 
 # Producer commit (recorded in the manifest; a dirty tree is recorded too).
 $commit = "$(git rev-parse HEAD)".Trim()
@@ -60,7 +60,7 @@ $worktreeClean = @(git status --porcelain --untracked-files=all | Where-Object {
 $dist = Join-Path $root 'dist'
 function Get-OtherReleaseHashes {
     Get-ChildItem -LiteralPath $dist -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notlike (Join-Path $dist "WinStateDiag-v$version\*") } |
+        Where-Object { $_.FullName -notlike (Join-Path $dist "WinDiag-v$version\*") } |
         ForEach-Object { "$($_.FullName)|$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash)" } |
         Sort-Object
 }
@@ -70,10 +70,13 @@ $othersBefore = @(Get-OtherReleaseHashes)
 Run 'cargo fmt --check' { cargo fmt --check }
 Run 'cargo check' { cargo check --color never }
 Run 'cargo test' { cargo test --color never }
-Run 'cargo clean -p win_state_diag --release' { cargo clean -p win_state_diag --release }
+if (-not $PreserveBuildCache) { Run 'cargo clean -p win_state_diag --release' { cargo clean -p win_state_diag --release } }
 Run 'cargo build --release' { cargo build --release --color never }
 
-$buildExe = Join-Path $root 'target\release\win_state_diag.exe'
+$targetRoot = $env:CARGO_TARGET_DIR
+if (-not $targetRoot) { $targetRoot = Join-Path $root 'target' }
+elseif (-not [IO.Path]::IsPathRooted($targetRoot)) { $targetRoot = Join-Path $root $targetRoot }
+$buildExe = Join-Path $targetRoot 'release\win_state_diag.exe'
 if (-not (Test-Path $buildExe)) { Fail "build output missing: $buildExe" }
 $buildItem = Get-Item $buildExe
 if ($buildItem.LastWriteTime -lt $started) { Fail "target EXE is older than this run ($($buildItem.LastWriteTime))" }
@@ -86,13 +89,16 @@ if (-not ("$fileVersion" -eq "$version" -and "$productVersion" -eq "$version")) 
 }
 
 # 5. copy into the versioned portable folder
-$releaseDir = Join-Path $dist "WinStateDiag-v$version"
-$releaseExe = Join-Path $releaseDir 'WinStateDiag.exe'
+$releaseDir = Join-Path $dist "WinDiag-v$version"
+$releaseExe = Join-Path $releaseDir 'WinDiag.exe'
 if ((Test-Path $releaseExe) -and -not $Force) {
     Fail "$releaseExe already exists (use -Force to replace this version's EXE)"
 }
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 Copy-Item -LiteralPath $buildExe -Destination $releaseExe -Force
+
+# Runtime, notices and corresponding sources are embedded in the EXE.
+# Reports is created lazily by an actual export. Evidence is outside dist.
 
 # 6. verification
 $distItem = Get-Item $releaseExe
@@ -102,7 +108,7 @@ $match = ($shaBuild -eq $shaDist) -and ($distItem.Length -eq $buildItem.Length)
 
 # 7. older releases (reported, never deleted)
 $obsolete = @(Get-ChildItem -LiteralPath $dist -Force | Where-Object {
-    $_.Name -ne "WinStateDiag-v$version" -and $_.Name -ne '.gitkeep'
+    $_.Name -ne "WinDiag-v$version" -and $_.Name -ne '.gitkeep'
 } | ForEach-Object { $_.Name })
 
 $lines = @(
@@ -120,7 +126,7 @@ $lines = @(
     "SHA_MATCH=$(if ($match) { 'YES' } else { 'NO' })",
     "FILE_VERSION=$fileVersion",
     "PRODUCT_VERSION=$productVersion",
-    "CURRENT_RELEASE=dist\WinStateDiag-v$version\WinStateDiag.exe",
+    "CURRENT_RELEASE=dist\WinDiag-v$version\WinDiag.exe",
     "OBSOLETE_RELEASES=$(if ($obsolete.Count) { $obsolete -join '; ' } else { 'none' })",
     "BUILT_AT=$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
 )

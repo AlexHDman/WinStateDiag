@@ -1,0 +1,21 @@
+{
+  "name": "egui",
+  "version": "0.36.2",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/emilk/egui",
+  "authors": [
+    "Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": "Apache-2.0",
+  "license_files": [
+    "licenses\\egui-0.36.2\\LICENSE-APACHE"
+  ],
+  "provenance_note": "crate omits license text; standard Apache-2.0 text from resolved registry package; upstream identity/authors below",
+  "vcs": {
+    "git": {
+      "sha1": "49682f8baa058bf49e011035cfbd6e825f88a5ef"
+    },
+    "path_in_vcs": "crates/egui"
+  }
+}

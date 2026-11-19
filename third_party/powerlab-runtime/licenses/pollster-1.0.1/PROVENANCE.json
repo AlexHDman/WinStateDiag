@@ -1,0 +1,22 @@
+{
+  "name": "pollster",
+  "version": "1.0.1",
+  "license": "Apache-2.0/MIT",
+  "repository": "https://github.com/zesterer/pollster",
+  "authors": [
+    "Joshua Barretto <joshua@jsbarretto.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\pollster-1.0.1\\LICENSE-APACHE",
+    "licenses\\pollster-1.0.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "6a1a148208326e9c5b231b16f199f5227c550774"
+    },
+    "path_in_vcs": ""
+  }
+}

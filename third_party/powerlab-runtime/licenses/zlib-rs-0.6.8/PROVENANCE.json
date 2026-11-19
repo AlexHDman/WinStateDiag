@@ -1,0 +1,19 @@
+{
+  "name": "zlib-rs",
+  "version": "0.6.8",
+  "license": "Zlib",
+  "repository": "https://github.com/trifectatechfoundation/zlib-rs",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\zlib-rs-0.6.8\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "0254e07204884bfc902d6ebb68c8b703d0ea49cf"
+    },
+    "path_in_vcs": "zlib-rs"
+  }
+}

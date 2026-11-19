@@ -1,0 +1,23 @@
+{
+  "name": "weezl",
+  "version": "0.1.12",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/image-rs/weezl",
+  "authors": [
+    "The image-rs Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\weezl-0.1.12\\LICENSE-APACHE",
+    "licenses\\weezl-0.1.12\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "c75ea1f6d935cc56bad8674396b7cb0dd7275f99",
+      "dirty": true
+    },
+    "path_in_vcs": ""
+  }
+}

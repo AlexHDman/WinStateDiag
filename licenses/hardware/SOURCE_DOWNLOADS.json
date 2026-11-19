@@ -1,0 +1,24 @@
+[
+  {
+    "package": "BlackSharp.Core-1.0.7",
+    "source": "https://codeload.github.com/Blacktempel/BlackSharp/zip/c70b735c6cec123ee8a046ac4a0bc6c606f52cf0",
+    "sha256": "ab50d38c8cfec1cc041d924730bc417b6d9c81b5b0ff542572a03ad9163cdc1e",
+    "bytes": 133878
+  },
+  {
+    "package": "DiskInfoToolkit-1.1.2",
+    "source": "https://codeload.github.com/Blacktempel/DiskInfoToolkit/zip/25319eae5781e75bcf141e844ceab2afe94d40ea",
+    "sha256": "2df4f067370fc3bb338ce60bdee12879c67ee5377d72e6cc8d79167001039102",
+    "bytes": 993083
+  },
+  {
+    "package": "RAMSPDToolkit-NDD-1.4.2",
+    "source": "https://codeload.github.com/Blacktempel/RAMSPDToolkit/zip/3b47b960e0830fef344624ad5e389675d5f0a1ce",
+    "sha256": "a1a0b3c3e94fea2d88a70abb74a08776a7602866b1e2d6ea6c3ab262dda925ba",
+    "bytes": 379926
+  },
+  {
+    "package": "Mono.Posix.NETStandard-1.0.0",
+    "license_url": "https://github.com/mono/mono/blob/main/LICENSE"
+  }
+]

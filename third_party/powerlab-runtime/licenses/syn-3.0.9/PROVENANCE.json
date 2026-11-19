@@ -1,0 +1,22 @@
+{
+  "name": "syn",
+  "version": "3.0.9",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/dtolnay/syn",
+  "authors": [
+    "David Tolnay <dtolnay@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\syn-3.0.9\\LICENSE-APACHE",
+    "licenses\\syn-3.0.9\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "7c44a5565b4421035101cc16184e9af08ab5fc77"
+    },
+    "path_in_vcs": ""
+  }
+}

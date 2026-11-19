@@ -4,6 +4,148 @@
 //! release-script contracts.
 
 use super::*;
+
+#[test]
+fn rc3_automatic_nvme_keeps_two_disks_and_denial_evidence() {
+    struct Denied;
+    impl nvme_health::NvmeLogSource for Denied {
+        fn read_log_page(
+            &self,
+            _: u32,
+            _: u8,
+            _: usize,
+        ) -> Result<nvme_health::LogRead, nvme_health::ProbeError> {
+            Err(nvme_health::ProbeError::AccessDenied)
+        }
+    }
+    let disks = vec![
+        nvme_health::tests::disk(0, "NVMe A", "TEST-A", "NVMe"),
+        nvme_health::tests::disk(1, "NVMe B", "TEST-B", "NVMe"),
+        nvme_health::tests::disk(2, "SATA", "TEST-C", "SATA"),
+    ];
+    let health = collect_automatic_nvme(&disks, &Denied, "2026-10-20T02:00:00");
+    assert_eq!(health.len(), 2);
+    assert_ne!(health[0].physical_identity, health[1].physical_identity);
+    for h in &health {
+        assert_eq!(h.status, nvme_health::ProbeStatus::AccessDenied);
+        assert!(h.smart.is_none());
+        assert!(h.status_detail.is_some());
+        assert!(nvme_health::to_json(h).contains("ACCESS_DENIED"));
+    }
+    let (mut app, exe) = app_in("rc3-auto-nvme-export");
+    app.automatic_nvme = health;
+    app.ata_scan = Some(Vec::new());
+    app.contribute_ata_evidence();
+    let zip = report_package::lock(&app.package_of("ata"))
+        .identity()
+        .unwrap()
+        .zip_path
+        .clone();
+    let entries = report_package::read_zip(&zip).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.name.starts_with("NVMe_Health_"))
+            .count(),
+        2
+    );
+    let manifest = entries.iter().find(|e| e.name == "manifest.json").unwrap();
+    let text = std::str::from_utf8(&manifest.bytes).unwrap();
+    assert!(text.contains("ACCESS_DENIED"));
+    let _ = std::fs::remove_dir_all(exe);
+}
+
+#[test]
+fn rc3_driver_stage_is_not_hardware_or_zip() {
+    let state = RunState::Running {
+        stage: Stage::DriverAudit,
+        step_done: 0,
+        step_total: 0,
+        stage_message: String::new(),
+        rx: std::sync::mpsc::channel().1,
+    };
+    assert!(matches!(hardware_status(&state), ModuleStatus::Done));
+    assert!(matches!(zip_status(&state), ModuleStatus::Pending));
+    assert!(engine::stage_label(&Stage::DriverAudit).contains("Driver Audit"));
+}
+
+#[test]
+#[ignore = "explicit read-only Windows hardware probe"]
+fn rc3_live_nvme_probe() {
+    use storage_topology::TopologySource;
+    let start = std::time::Instant::now();
+    let disks = storage_topology::windows_source::WindowsTopologySource.physical_disks();
+    let health = collect_automatic_nvme(
+        &disks,
+        &nvme_health::windows_source::WindowsNvmeReader,
+        &local_iso(sysinfo::local_time()),
+    );
+    println!(
+        "NVME_DISCOVERED={} ELAPSED_MS={}",
+        health.len(),
+        start.elapsed().as_millis()
+    );
+    for h in &health {
+        println!(
+            "PD={} STATUS={} SMART={} REASON={:?}",
+            h.disk_index,
+            h.status.as_str(),
+            h.smart.is_some(),
+            h.status_detail
+        );
+        assert!(crate::deep_checks::json::parse(&nvme_health::to_json(h)).is_some());
+    }
+    let root = std::env::temp_dir().join(format!(
+        "WsdRc3Live-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    let audit_started = std::time::Instant::now();
+    let report = driver_audit::run_audit_with_cancel(&root.join("audit"), &AtomicBool::new(false));
+    println!(
+        "DRIVER_AUDIT_MS={} SUCCESS={}",
+        audit_started.elapsed().as_millis(),
+        report.is_ok()
+    );
+    let mut files: Vec<_> = health
+        .iter()
+        .map(|h| {
+            EvidenceFile::new(
+                nvme_health::evidence_file_name("fixture", h.disk_index),
+                nvme_health::to_json(h).into_bytes(),
+            )
+        })
+        .collect();
+    if let Ok(report) = report {
+        files.push(EvidenceFile::new(
+            "DriverAudit_fixture.json",
+            driver_audit::to_json(&report).into_bytes(),
+        ));
+    }
+    let mut package = SessionPackage::for_exe_dir(&root);
+    package.bind_session(report_package::SessionIdentity::new(
+        "rc3-live", "TEST", "LOCAL",
+    ));
+    let timer = std::time::Instant::now();
+    let zip = package.contribute("", "", "20-10-26", files).unwrap();
+    println!("ZIP_STAGE_MS={}", timer.elapsed().as_millis());
+    let timer = std::time::Instant::now();
+    package.finalize().unwrap();
+    println!("ZIP_FINALIZE_MS={}", timer.elapsed().as_millis());
+    let entries = report_package::read_zip(&zip).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.name.starts_with("NVMe_Health_"))
+            .count(),
+        health.len()
+    );
+    assert!(!root.join(".WinStateDiag-work").exists());
+    println!("PRIVATE_EVIDENCE={}", zip.display());
+}
 use crate::ui::vm::{SensorCell, StageMark};
 
 fn app_in(tag: &str) -> (WinStateDiagApp, PathBuf) {
@@ -83,7 +225,7 @@ fn sensor_matrix_values_zero_watt_colours_and_duplicate_disks() {
         matches!(&cpu.temp, SensorCell::Value { text, tone } if text == "49°C" && *tone == Tone::Idle)
     );
     assert_eq!(cpu.watt, SensorCell::NoData, "0 W → Нет данных");
-    let gpu = rows.iter().find(|r| r.label == d.sensors_lbl_gpu).unwrap();
+    let gpu = rows.iter().find(|r| r.label.contains("RTX 5060")).unwrap();
     assert!(matches!(&gpu.watt, SensorCell::Value { text, .. } if text.ends_with(" W")));
     // Only rails (ATX band) and disks (drive thresholds) carry a colour.
     for row in &rows {
@@ -169,7 +311,7 @@ fn sata_disks_from_ata_smart_join_the_matrix_as_separate_rows() {
 fn sensor_card_draws_numbers_only_no_status_dots_or_checkmarks() {
     let src = include_str!("ui/pages.rs");
     let a = src.find("pub fn draw_sensors(").unwrap();
-    let b = src.find("pub struct SensorMatrixGeometry").unwrap();
+    let b = src.find("/// v1.0 item 8:").unwrap();
     let body = &src[a..b];
     for forbidden in ["circle_filled", "icon_check", "icon_alert", "icon_warning"] {
         assert!(!body.contains(forbidden), "{forbidden} in the sensor card");
@@ -363,6 +505,18 @@ fn ok_stages_are_qualified_when_another_module_has_significant_evidence() {
 fn hardware_ok_and_system_attention_are_separate_states() {
     let (mut app, exe) = app_in("states");
     app.seed_qa_scene("hardware");
+    if let Some(Ok(inv)) = &mut app.crash.inventory {
+        for b in &mut inv.bugchecks {
+            b.time = local_iso(sysinfo::local_time());
+        }
+    }
+    // v1.1 RC: the scene has 3 NVMe disks, health read for 2 → not an OK.
+    assert_eq!(app.state_codes().1, "PARTIAL");
+    assert_eq!(app.system_state_vm().hardware.tone, Tone::Idle);
+    let third = storage_topology::physical_disk_identity(&app.ssd_candidates[2].disk);
+    let mut h = app.nvme_health.values().next().unwrap().clone();
+    h.physical_identity = third.clone();
+    app.nvme_health.insert(third, h);
     let (system, hardware) = app.state_codes();
     assert_eq!(system, "ATTENTION_BSOD");
     assert_eq!(hardware, "OK");
@@ -550,7 +704,8 @@ fn mixed_ram_capacity_is_info_context_never_a_hardware_warning() {
 #[test]
 fn release_script_names_v1_0_and_never_touches_older_releases() {
     let s = include_str!("../scripts/make_release.ps1");
-    assert!(s.contains("$version = if ($Matches[3] -eq '0')"));
+    assert!(s.contains("$version = if ($Matches[4]) { $semver }"));
+    assert!(s.contains("elseif ($Matches[3] -eq '0')"));
     assert!(s.contains("Get-OtherReleaseHashes"));
     assert!(s.contains("an older dist release changed during this run"));
     assert!(
@@ -699,7 +854,13 @@ fn smart_block_lists_physical_disks_never_a_category_row() {
     let ok = crate::ata_smart::AtaSmart {
         state: crate::ata_smart::AtaState::Ok,
         detail: String::new(),
-        attributes: Vec::new(),
+        attributes: vec![crate::ata_smart::Attribute {
+            id: 5,
+            current: 100,
+            worst: 100,
+            threshold: Some(36),
+            raw: 0,
+        }],
     };
     app.ata_scan = Some(vec![
         AtaDisk {
@@ -732,4 +893,366 @@ fn smart_block_lists_physical_disks_never_a_category_row() {
     assert!(labels.iter().any(|l| l.ends_with("#1")) && labels.iter().any(|l| l.ends_with("#2")));
     assert!(rows.iter().any(|r| r.value.starts_with("SATA · OK")));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------------- v1.1 RC: no OK without a complete basis ----------------
+
+fn clean_inventory(notes: Vec<String>) -> crash_dump::Inventory {
+    crash_dump::Inventory {
+        bugchecks: Vec::new(),
+        dumps: Vec::new(),
+        debugger: crash_dump::DebuggerStatus::NotInstalled,
+        notes,
+        unexpected_shutdowns: 0,
+        incidents: Vec::new(),
+        live_kernel_reports: Vec::new(),
+    }
+}
+
+fn clean_audit() -> AuditReport {
+    let mut r = crate::details::tests::report();
+    r.items.retain(|i| i.status == Severity::Ok);
+    r.overall = Severity::Ok;
+    r
+}
+
+#[test]
+fn system_ok_needs_a_finished_driver_audit() {
+    let (mut app, exe) = app_in("rc_sys");
+    app.crash.inventory = Some(Ok(clean_inventory(Vec::new())));
+    // Crash inventory alone: not OK.
+    assert_eq!(app.state_codes().0, "PARTIAL");
+    assert_eq!(app.system_state_vm().system.tone, Tone::Idle);
+    app.driver_audit = DriverAuditState::Done(Box::new(clean_audit()));
+    app.expc_checks = ["SFC", "DISM", "WHEA", "VSS"]
+        .into_iter()
+        .map(|k| crate::deep_checks::ExpcCheck {
+            key: k.into(),
+            status: "OK".into(),
+            detail: "fixture completed".into(),
+        })
+        .collect();
+    assert_eq!(app.state_codes().0, "OK");
+    // A Driver Audit with collection gaps is not an OK basis.
+    let mut gaps = clean_audit();
+    gaps.errors.push("Win32_SystemDriver: Access denied".into());
+    app.driver_audit = DriverAuditState::Done(Box::new(gaps));
+    assert_eq!(app.state_codes().0, "PARTIAL");
+    // A failed event-evidence read is not an OK basis either.
+    app.driver_audit = DriverAuditState::Done(Box::new(clean_audit()));
+    app.event_evidence = Some(Err("access denied".into()));
+    assert_eq!(app.state_codes().0, "PARTIAL");
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+#[test]
+fn phase04_empty_failed_partial_pnp_and_warning_gaps_never_back_system_ok() {
+    let (mut app, exe) = app_in("phase04_pnp");
+    app.crash.inventory = Some(Ok(clean_inventory(Vec::new())));
+    for (index, (complete, errors, severity, scanned)) in [
+        (true, vec![], Severity::Ok, 0),
+        (false, vec!["PnP access denied".into()], Severity::Ok, 0),
+        (false, vec![], Severity::Ok, 1),
+        (
+            true,
+            vec!["event source denied".into()],
+            Severity::Warning,
+            1,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut r = clean_audit();
+        r.complete = complete;
+        r.errors = errors;
+        r.overall = severity;
+        r.devices_scanned = scanned;
+        if scanned == 0 {
+            r.items.clear();
+        }
+        assert!(!r.coverage_gaps().is_empty());
+        assert_eq!(
+            r.verdict_code(),
+            if severity == Severity::Warning {
+                "WARNING"
+            } else {
+                "INCOMPLETE"
+            }
+        );
+        for d in [&i18n::RU, &i18n::EN] {
+            let text = crate::details::driver_issues_text(&r, d, &str::to_string);
+            assert!(!text.contains(d.driver_issues_none));
+            assert!(text.contains(d.driver_alert_incomplete_note));
+        }
+        let verdict = r.verdict_code();
+        let files = vec![
+            EvidenceFile::new(
+                "DriverAudit_fixture.json",
+                driver_audit::to_json(&r).into_bytes(),
+            ),
+            EvidenceFile::new(
+                "DriverAudit_fixture.txt",
+                driver_audit::to_text(&r).into_bytes(),
+            ),
+        ];
+        app.driver_audit = DriverAuditState::Done(Box::new(r));
+        assert_eq!(
+            app.state_codes().0,
+            if severity >= Severity::Warning {
+                "ATTENTION_DIAG"
+            } else {
+                "PARTIAL"
+            }
+        );
+        let mut pkg = SessionPackage::new(exe.join(format!("fixture-{index}")), None);
+        let (system, hardware) = app.state_codes();
+        pkg.set_states(&system, &hardware);
+        let zip = pkg.contribute("", "fixture", "19-10-26", files).unwrap();
+        let entries = report_package::read_zip(&zip).unwrap();
+        let contents = |name: &str| {
+            String::from_utf8(
+                entries
+                    .iter()
+                    .find(|f| f.name == name)
+                    .unwrap()
+                    .bytes
+                    .clone(),
+            )
+            .unwrap()
+        };
+        assert!(contents("State_Summary.txt").contains(&format!("System: {system}")));
+        let summary = crate::deep_checks::json::parse(&contents("State_Summary.json")).unwrap();
+        assert_eq!(
+            summary.get("system").and_then(|v| v.as_str()),
+            Some(system.as_str())
+        );
+        let manifest = contents("manifest.json");
+        assert!(manifest.contains(&format!("\"system\": \"{system}\"")));
+        assert!(manifest.contains(&format!("\"result_status\": \"{verdict}\"")));
+        pkg.finalize().unwrap();
+    }
+    let mut problem = clean_audit();
+    problem.overall = Severity::Problem;
+    problem.errors.push("source unavailable".into());
+    app.driver_audit = DriverAuditState::Done(Box::new(problem));
+    assert_eq!(app.state_codes().0, "ATTENTION_DRIVER_PROBLEM");
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+#[test]
+fn phase04_sensor_worker_failure_is_exported_not_just_displayed() {
+    use crate::ui::vm::SensorReadVm;
+    let (mut app, exe) = app_in("phase04_sensor");
+    app.sensors = Some(sensors::Snapshot {
+        sensors: sensors::tests::sample(&sensors::tests::msi_reference()),
+        ..Default::default()
+    });
+    app.ata_scan = Some(vec![AtaDisk {
+        index: 0,
+        model: "Fixture SATA".into(),
+        bus: "SATA".into(),
+        smart: crate::ata_smart::AtaSmart {
+            state: crate::ata_smart::AtaState::Ok,
+            detail: String::new(),
+            attributes: vec![crate::ata_smart::Attribute {
+                id: 194,
+                current: 100,
+                worst: 100,
+                threshold: Some(0),
+                raw: 30,
+            }],
+        },
+    }]);
+    assert_eq!(app.state_codes().1, "OK");
+    app.claim_package("sensors");
+    app.sensors_evidence_pending = true;
+    let (tx, rx) = std::sync::mpsc::channel::<sensors::Snapshot>();
+    app.sensors_rx = Some(rx);
+    drop(tx);
+    app.poll_sensors();
+    let reason = "sensor reader ended without a result";
+    assert!(matches!(app.sensors_vm().read, SensorReadVm::Error { .. }));
+    let snap = app.sensors.as_ref().unwrap();
+    assert_eq!(snap.state(), sensors::ProviderState::ProviderError);
+    assert!(app.sensors_details_text(snap).contains(reason));
+    assert!(sensors::to_json(snap).contains(reason));
+    assert_eq!(app.state_codes().1, "PARTIAL");
+    app.sync_manifest_states();
+    let pkg = app.op_packages.get("sensors").unwrap();
+    let files = report_package::read_zip(&pkg.lock().unwrap().final_zip().unwrap()).unwrap();
+    for ext in [".json", ".txt"] {
+        assert!(
+            files
+                .iter()
+                .any(|f| f.name.starts_with(sensors::EVIDENCE_PREFIX)
+                    && f.name.ends_with(ext)
+                    && String::from_utf8_lossy(&f.bytes).contains(reason))
+        );
+    }
+    let manifest = files.iter().find(|f| f.name == "manifest.json").unwrap();
+    let manifest = String::from_utf8_lossy(&manifest.bytes);
+    assert!(manifest.contains(reason));
+    assert!(manifest.contains("PROVIDER_ERROR"));
+    assert!(manifest.contains("\"hardware\": \"PARTIAL\""));
+    assert!(files.iter().any(|f| f.name == "State_Summary.txt"
+        && String::from_utf8_lossy(&f.bytes).contains("Hardware: PARTIAL")));
+    assert!(!app.sensors_evidence_pending);
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+#[test]
+fn unreadable_crash_source_is_not_no_crashes() {
+    let (mut app, exe) = app_in("rc_crash");
+    app.crash.inventory = Some(Ok(clean_inventory(vec![
+        "Dump folder not readable: C:\\Windows\\Minidump".into(),
+    ])));
+    let vm = app.crash_vm();
+    assert_eq!(vm.headline, i18n::RU.crash_incomplete);
+    assert_eq!(vm.tone, Tone::Warning);
+    app.driver_audit = DriverAuditState::Done(Box::new(clean_audit()));
+    assert_eq!(app.state_codes().0, "PARTIAL");
+    let r = crate::crash_report::build(
+        match &app.crash.inventory {
+            Some(Ok(i)) => i,
+            _ => unreachable!(),
+        },
+        &[],
+        true,
+    );
+    let txt = crate::crash_report::to_text(&r, true);
+    assert!(txt.contains("сбор неполный"), "{txt}");
+    assert!(txt.contains("Minidump"));
+    // A failed scan keeps its reason in the exported details.
+    app.crash.inventory = Some(Err("PowerShell: access denied".into()));
+    assert!(
+        app.crash_details_text()
+            .contains("PowerShell: access denied")
+    );
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+}
+
+#[test]
+fn incomplete_driver_audit_card_is_never_green() {
+    let mut r = clean_audit();
+    r.complete = false;
+    let vm = drivers_vm(&r, &i18n::EN);
+    match vm {
+        DriversVm::Done { overall, alert, .. } => {
+            assert_eq!(overall, Tone::Warning);
+            let (tone, text, _) = alert.expect("incomplete alert");
+            assert_eq!(tone, Tone::Warning);
+            assert!(text.contains("incomplete"), "{text}");
+        }
+        _ => panic!("done expected"),
+    }
+    assert_eq!(
+        driver_verdict_label(&i18n::EN, &r),
+        i18n::EN.driver_status_incomplete
+    );
+}
+
+#[test]
+fn rc9_diag_findings_gui_json_txt_zip_share_all_reasons() {
+    let (mut app, exe) = app_in("rc9-diag");
+    app.include_hardware = false;
+    app.crash.inventory = Some(Ok(clean_inventory(Vec::new())));
+    app.driver_audit = DriverAuditState::Done(Box::new(clean_audit()));
+    app.expc_checks = [
+        ("SFC", "ATTENTION"),
+        ("DISM", "ATTENTION"),
+        ("WHEA", "ERROR"),
+        ("VSS Shadow Storage", "ATTENTION"),
+    ]
+    .into_iter()
+    .map(|(key, status)| crate::deep_checks::ExpcCheck {
+        key: key.into(),
+        status: status.into(),
+        detail: format!("{key} confirmed fixture finding"),
+    })
+    .collect();
+    assert_ne!(app.state_codes().0, "OK");
+    assert_eq!(app.done_verdict(&i18n::RU).1, Tone::Warning);
+    assert_eq!(app.system_state_vm().system.tone, Tone::Warning);
+    let reasons = app.state_reasons();
+    let (system, hardware) = app.state_codes();
+    let mut pkg = SessionPackage::new(exe.join("rc9-evidence"), None);
+    pkg.set_states(&system, &hardware);
+    pkg.set_state_reasons(reasons.clone());
+    let zip = pkg
+        .contribute(
+            "",
+            "TEST",
+            "27-10-26",
+            vec![EvidenceFile::new("evidence.txt", b"fixture".to_vec())],
+        )
+        .unwrap();
+    for name in ["State_Summary.json", "State_Summary.txt"] {
+        let entries = report_package::read_zip(&zip).unwrap();
+        let content = String::from_utf8(
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .bytes
+                .clone(),
+        )
+        .unwrap();
+        for key in ["SFC", "DISM", "WHEA", "VSS"] {
+            assert!(content.contains(key), "{name}: {key}");
+        }
+        assert!(content.contains(&system));
+    }
+    for key in ["SFC", "DISM", "WHEA", "VSS"] {
+        assert!(app.system_state_vm().note.contains(key));
+    }
+    pkg.set_state_reasons(vec!["new evidence while status unchanged".into()]);
+    pkg.refresh_states(&system, &hardware).unwrap();
+    let entries = report_package::read_zip(&zip).unwrap();
+    assert!(
+        String::from_utf8_lossy(
+            &entries
+                .iter()
+                .find(|e| e.name == "State_Summary.json")
+                .unwrap()
+                .bytes
+        )
+        .contains("new evidence while status unchanged")
+    );
+    pkg.finalize().unwrap();
+}
+
+#[test]
+fn rc9_old_bsod_is_history_and_missing_temperature_is_not_ok() {
+    let (mut app, _) = app_in("rc9-history");
+    app.driver_audit = DriverAuditState::Done(Box::new(clean_audit()));
+    app.expc_checks = ["SFC", "DISM", "WHEA", "VSS"]
+        .into_iter()
+        .map(|key| crate::deep_checks::ExpcCheck {
+            key: key.into(),
+            status: "OK".into(),
+            detail: "fixture".into(),
+        })
+        .collect();
+    let mut inv = clean_inventory(Vec::new());
+    inv.bugchecks.push(crash_dump::BugcheckEvent {
+        time: "2020-01-01T00:00:00".into(),
+        code: 0x139,
+        params: Vec::new(),
+        dump_path: None,
+        source: crash_dump::BugcheckSource::Wer1001,
+    });
+    app.crash.inventory = Some(Ok(inv));
+    assert_eq!(app.state_codes().0, "HISTORICAL");
+    if let Some(Ok(inv)) = &mut app.crash.inventory {
+        inv.bugchecks[0].time = local_iso(sysinfo::local_time());
+    }
+    assert_eq!(app.state_codes().0, "ATTENTION_BSOD");
+    app.sensors = Some(sensors::Snapshot::default());
+    assert_ne!(app.state_codes().1, "OK");
+    assert!(
+        app.state_reasons()
+            .iter()
+            .any(|r| r.contains("CPU TEMPERATURE"))
+    );
 }

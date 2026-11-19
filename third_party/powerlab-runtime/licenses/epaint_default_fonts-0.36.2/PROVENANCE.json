@@ -1,0 +1,24 @@
+{
+  "name": "epaint_default_fonts",
+  "version": "0.36.2",
+  "license": "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0",
+  "repository": "https://github.com/emilk/egui/tree/main/crates/epaint_default_fonts",
+  "authors": [
+    "Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\epaint_default_fonts-0.36.2\\fonts\\emoji-icon-font-mit-license.txt",
+    "licenses\\epaint_default_fonts-0.36.2\\fonts\\Hack-Regular.txt",
+    "licenses\\epaint_default_fonts-0.36.2\\fonts\\OFL.txt",
+    "licenses\\epaint_default_fonts-0.36.2\\fonts\\UFL.txt"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "49682f8baa058bf49e011035cfbd6e825f88a5ef"
+    },
+    "path_in_vcs": "crates/epaint_default_fonts"
+  }
+}

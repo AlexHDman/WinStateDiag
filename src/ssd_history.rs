@@ -118,6 +118,7 @@ pub fn history_file_path(exe_dir: &Path) -> PathBuf {
 pub fn load_all_history(reports_root: &Path) -> Vec<HistoryEntry> {
     let name = "ssd_benchmark_history.log";
     let mut all = load_history(&reports_root.join(name));
+    all.extend(load_history(&canonical_history_path(reports_root)));
     if let Ok(rd) = fs::read_dir(reports_root) {
         for e in rd.flatten() {
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -148,7 +149,7 @@ pub fn load_all_history(reports_root: &Path) -> Vec<HistoryEntry> {
 /// stays so later benchmarks still compare against earlier results.
 /// `load_all_history` reads it like any report folder's history.
 pub fn canonical_history_path(reports_root: &Path) -> PathBuf {
-    reports_root
+    crate::report_package::persistent_dir(reports_root)
         .join("History")
         .join("ssd_benchmark_history.log")
 }

@@ -1,0 +1,21 @@
+{
+  "name": "clipboard-win",
+  "version": "5.4.1",
+  "license": "BSL-1.0",
+  "repository": "https://github.com/DoumanAsh/clipboard-win",
+  "authors": [
+    "Douman <douman@gmx.se>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": "BSL-1.0",
+  "license_files": [
+    "licenses\\clipboard-win-5.4.1\\LICENSE-BOOST"
+  ],
+  "provenance_note": "standard Boost Software License 1.0 text from resolved registry package",
+  "vcs": {
+    "git": {
+      "sha1": "3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342"
+    },
+    "path_in_vcs": ""
+  }
+}

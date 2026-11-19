@@ -1,0 +1,21 @@
+{
+  "name": "simd-adler32",
+  "version": "0.3.10",
+  "license": "MIT",
+  "repository": "https://github.com/mcountryman/simd-adler32",
+  "authors": [
+    "Marvin Countryman <me@maar.vin>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\simd-adler32-0.3.10\\LICENSE.md"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "d93164f98d7fe2daf883f2e1bec82778dd26199a"
+    },
+    "path_in_vcs": ""
+  }
+}

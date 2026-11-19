@@ -1,0 +1,20 @@
+{
+  "name": "libc",
+  "version": "0.2.190",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/rust-lang/libc",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\libc-0.2.190\\LICENSE-APACHE",
+    "licenses\\libc-0.2.190\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "7b0ab5528dc7f361f3a0b4c06c2cad9971617f75"
+    },
+    "path_in_vcs": ""
+  }
+}

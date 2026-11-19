@@ -209,6 +209,10 @@ impl AtaSmart {
             .any(|id| self.count(*id).is_some_and(|c| c > 0))
         {
             "SMART: ATTENTION (sector counters)"
+        } else if self.attributes.iter().all(|a| a.threshold.is_none()) {
+            // v1.1 RC: without the drive's thresholds there is no threshold
+            // verdict — partial data, never "SMART: OK".
+            "SMART: PARTIAL (thresholds not readable)"
         } else {
             "SMART: OK"
         }

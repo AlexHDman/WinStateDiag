@@ -1,0 +1,22 @@
+{
+  "name": "fearless_simd",
+  "version": "0.4.1",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/linebender/fearless_simd",
+  "authors": [
+    "Raph Levien <raph.levien@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\fearless_simd-0.4.1\\LICENSE-APACHE",
+    "licenses\\fearless_simd-0.4.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "0e8e242aaa8031cdc9708f99334e8998d4725916"
+    },
+    "path_in_vcs": "fearless_simd"
+  }
+}

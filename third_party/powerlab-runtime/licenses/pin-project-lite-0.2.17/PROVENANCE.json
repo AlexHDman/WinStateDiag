@@ -1,0 +1,20 @@
+{
+  "name": "pin-project-lite",
+  "version": "0.2.17",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/taiki-e/pin-project-lite",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\pin-project-lite-0.2.17\\LICENSE-APACHE",
+    "licenses\\pin-project-lite-0.2.17\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "3bdf763446aa78f90e3bdac1ef583e014832ab4c"
+    },
+    "path_in_vcs": ""
+  }
+}

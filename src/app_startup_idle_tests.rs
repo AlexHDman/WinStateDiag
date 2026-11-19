@@ -23,6 +23,33 @@ fn app_in(tag: &str) -> (WinStateDiagApp, PathBuf) {
     (app, exe)
 }
 
+#[test]
+fn rc4_client_survives_full_module_new_session_and_restart() {
+    for (client, computer) in [("AlexHDman", "MSI"), ("VESK", "SERVER")] {
+        let (mut app, exe) = app_in(&format!("rc4-client-{computer}"));
+        app.client_name = client.into();
+        app.computer_name = computer.into();
+        app.persist_client_name();
+        app.begin_operation(true);
+        assert_eq!(session(&app).unwrap().client, client);
+        app.begin_operation(false); // Standalone hardware/module entry.
+        assert_eq!(session(&app).unwrap().client, client);
+        app.begin_operation(true);
+        assert_eq!(session(&app).unwrap().client, client);
+        let mut restarted = WinStateDiagApp::default();
+        restarted.client_name = load_client_name(&exe);
+        restarted.language_pref_dir = exe.clone();
+        restarted.saved_client_name = restarted.client_name.clone();
+        restarted.begin_operation(true);
+        assert_eq!(session(&restarted).unwrap().client, client);
+        restarted.client_name.clear();
+        restarted.persist_client_name();
+        assert_eq!(load_client_name(&exe), "");
+        std::fs::write(exe.join("WinStateDiag.client"), [0xff]).unwrap();
+        assert_eq!(load_client_name(&exe), "");
+    }
+}
+
 /// One frame without a window: the per-frame polls of `logic()` and the
 /// dashboard drawn headlessly; any action it emits is applied, as `ui()`.
 fn frame(app: &mut WinStateDiagApp, ctx: &egui::Context) {
@@ -74,7 +101,47 @@ fn headless_ctx() -> egui::Context {
 
 /// The report ZIP of `base` under the package's own Reports folder.
 fn zip_in(exe: &Path, base: &str) -> PathBuf {
-    exe.join("Reports").join(base).join(format!("{base}.zip"))
+    let (prefix, index) = base
+        .strip_suffix(" (2)")
+        .map(|b| (b, 1))
+        .unwrap_or((base, 0));
+    let parts = prefix.split(" - ").collect::<Vec<_>>();
+    let prefix = match parts.as_slice() {
+        [computer, date] => format!("{computer}-{}-", date.replace('-', ".")),
+        [client, computer, date] => format!("{client}-{computer}-{}-", date.replace('-', ".")),
+        _ => prefix.to_owned(),
+    };
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(exe.join("Reports"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|e| e == "zip")
+                && p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+        })
+        .collect();
+    matches.sort_by_key(|p| {
+        let name = p.file_stem().unwrap().to_string_lossy();
+        let (stamp, suffix) = name
+            .rsplit_once(" (")
+            .map(|(a, b)| {
+                (
+                    a.to_string(),
+                    b.trim_end_matches(')').parse::<u32>().unwrap_or(1),
+                )
+            })
+            .unwrap_or((name.to_string(), 1));
+        (stamp, suffix)
+    });
+    matches
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| exe.join("Reports").join(format!("{base} NOT_CREATED.zip")))
 }
 
 fn session(app: &WinStateDiagApp) -> Option<SessionIdentity> {
@@ -172,6 +239,7 @@ fn crypto_check_reports_inventory_and_hash_with_origin_and_time() {
             product_code: "{50F91F80-D397-437C-B0C8-62128DE3B55E}".into(),
             license: cryptopro::LicenseKey::Installed {
                 masked: "5050Z-*****".into(),
+                full: cryptopro::SerialKey::new("5050Z-ABCDE-FGHIJ-KLMNO-PQRST"),
             },
             term: cryptopro::LicenseTerm::NotDetermined,
         }),
@@ -265,14 +333,15 @@ fn the_launch_code_path_starts_only_the_read_only_preflight() {
     let at = src.find("    fn start_preflight(&mut self) {").unwrap();
     let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
     for needed in [
-        "self.driver_origin = CheckOrigin::Preflight;",
-        "self.driver_audit = start_driver_audit(self.new_driver_cancel());",
+        "self.start_passport();",
         "self.start_crypto_check_as(CheckOrigin::Preflight);",
         "self.start_crash_scan_as(CheckOrigin::Preflight);",
     ] {
         assert!(body.contains(needed), "preflight lacks `{needed}`");
     }
     for forbidden in [
+        "start_driver_audit",
+        "request_driver_audit",
         "begin_operation",
         "claim_package",
         "contribute",
@@ -281,7 +350,6 @@ fn the_launch_code_path_starts_only_the_read_only_preflight() {
         "start_crash_analysis",
         "start_crypto_rehash",
         "start_sensor_read",
-        "start_passport",
         "start_gpo_check",
         "start_ata_scan",
         "start_event_collection",
@@ -411,7 +479,10 @@ fn start_freezes_client_and_computer_into_session_manifest_and_evidence() {
     assert_eq!(str_of(ms, "session_id"), s.session_id);
     assert_eq!(str_of(ms, "client_name"), "Иванов Иван");
     assert_eq!(str_of(&m, "computer_name"), "MSI");
-    assert_eq!(str_of(&m, "package"), format!("{base}.zip"));
+    assert_eq!(
+        str_of(&m, "package"),
+        zip.file_name().unwrap().to_string_lossy()
+    );
     let names: Vec<String> = report_package::read_zip(&zip)
         .unwrap()
         .into_iter()
@@ -527,11 +598,17 @@ fn a_running_module_keeps_the_session_it_was_started_in() {
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .collect();
     assert_eq!(loose.len(), 1, "only the verified ZIP stays: {loose:?}");
-    // The hidden session marker names A's session.
+    // Identity survives cleanup in the manifest, not a marker in Reports.
     assert_eq!(
-        std::fs::read_to_string(a_zip.parent().unwrap().join(report_package::SESSION_MARKER))
-            .unwrap(),
+        str_of(manifest(&a_zip).get("session").unwrap(), "session_id"),
         a.session_id
+    );
+    assert!(
+        !a_zip
+            .parent()
+            .unwrap()
+            .join(report_package::SESSION_MARKER)
+            .exists()
     );
     let _ = std::fs::remove_dir_all(exe.parent().unwrap());
 }
@@ -653,9 +730,21 @@ fn a_storage_run_keeps_its_session_after_another_benchmark_starts() {
     assert!(!zip_in(&exe, &format!("Клиент Б - MSI - {}", today())).exists());
     // The storage history record names A's session, never B's.
     let history =
-        std::fs::read_to_string(app.reports_root.join(crate::storage_history::FILE_NAME)).unwrap();
+        std::fs::read_to_string(report_package::storage_history_path(&app.reports_root)).unwrap();
     assert!(history.contains(&a.session_id), "{history}");
     assert!(!history.contains(&b.session_id), "{history}");
+    let entries = report_package::read_zip(&a_zip).unwrap();
+    let archived = entries
+        .iter()
+        .find(|e| e.name == "WinStateDiagStorageHistory.json")
+        .expect("completed storage assessment must export history");
+    assert_eq!(archived.bytes, history.as_bytes());
+    // Re-finalizing the completed assessment cannot append another record.
+    app.finalize_assessment("DISK-1");
+    assert_eq!(
+        std::fs::read_to_string(report_package::storage_history_path(&app.reports_root)).unwrap(),
+        history
+    );
     let _ = std::fs::remove_dir_all(exe.parent().unwrap());
 }
 

@@ -1,0 +1,22 @@
+{
+  "name": "bit-vec",
+  "version": "0.9.1",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/contain-rs/bit-vec",
+  "authors": [
+    "Alexis Beingessner <a.beingessner@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\bit-vec-0.9.1\\LICENSE-APACHE",
+    "licenses\\bit-vec-0.9.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "2fb0305422ff7fd915a107b91209abbff9fce50f"
+    },
+    "path_in_vcs": ""
+  }
+}

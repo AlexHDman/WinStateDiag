@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "lhm_version": "0.9.6",
+  "lhm_commit": "3d331e3370efb858411f19511373eff65a218701",
+  "modules_version": "0.2.2",
+  "modules_source": "https://github.com/namazso/PawnIO.Modules/tree/0.2.2",
+  "min_pawnio_version": "2.2.0",
+  "lhm_sha256": "8ECD2AB7D0E015C6E3FB434C989E18B5FF049F0BE2EDBFC38C03F6175F00C16A",
+  "modules": [
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.AMDFamily0F.bin",
+      "size": 8404,
+      "sha256": "1788550C02100AD6BBC91604399ED6E055058EA0F6C0C828C02D9B01A09AD27F"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.AMDFamily10.bin",
+      "size": 16836,
+      "sha256": "79BE1396621AA44EB149C5DC6D1BAB4519B9CFA49A32AF5E022CB9F9CA887658"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.AMDFamily17.bin",
+      "size": 9300,
+      "sha256": "099DC01D6DB97EA997FEC4A461E191CC64B9D7CE47C9D2153C451C56C2ADCF50"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.IntelMSR.bin",
+      "size": 4068,
+      "sha256": "ED41A0D0DE082F4668A9CACCB9681EBBAD97A8ED3452C41918DDA1EB454B77A9"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.IsaBridgeEC.bin",
+      "size": 51628,
+      "sha256": "7218C633384BD019CCE09E8DF91F74996F980765AC44DDE0F22B0B5318C20F03"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.LpcACPIEC.bin",
+      "size": 2612,
+      "sha256": "C38FD116E7AFF4D1FDB0A494E296BE0A6708E5A22FC72F14587442FB7F8F7906"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.LpcCrOSEC.bin",
+      "size": 19692,
+      "sha256": "277ED6CE6B5F647D5DAE9B06C83ED39E904974B06F95598D49F4737237974776"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.LpcIO.bin",
+      "size": 17172,
+      "sha256": "3DCF8B2BC80FF642D97C4608511A818642B5BF315FF53DF3DF393D043E71D101"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.RyzenSMU.bin",
+      "size": 38036,
+      "sha256": "0CF0FE1296C5C38F4BEE0F96352B35F14D32AB97CB58FD17600646D98507D8AA"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.SmbusI801.bin",
+      "size": 40788,
+      "sha256": "76B082A144027244FE7BBF3CA0E987E7DFA279AA87E0CCC2A6A918E10E2038E1"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.SmbusNCT6793.bin",
+      "size": 17548,
+      "sha256": "385BD1B229FAA44AEFE2EB1F938AC629F6D897F1A4931DAB5341B18B3BD432C1"
+    },
+    {
+      "name": "LibreHardwareMonitor.Resources.PawnIo.SmbusPIIX4.bin",
+      "size": 37260,
+      "sha256": "3F8B44C93EB030D59FB68C6FDC6857C61313EAB2B6AA0ED64595396D71BF3EA3"
+    }
+  ],
+  "installer": {
+    "version": "2.2.0",
+    "url": "https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe",
+    "sha256": "1F519A22E47187F70A1379A48CA604981C4FCF694F4E65B734AAA74A9FBA3032",
+    "publisher": "E=admin@namazso.eu, CN=namazso.eu, O=namazso, L=Debrecen, C=HU",
+    "thumbprint": "F380DCC9F706E2756A5047B832FFE719E1BC35F5"
+  },
+  "lhm_flavour": "EXPC monitor-only fork of 0.9.6; source patches included"
+}

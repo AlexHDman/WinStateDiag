@@ -1,0 +1,22 @@
+{
+  "name": "tiff",
+  "version": "0.11.3",
+  "license": "MIT",
+  "repository": "https://github.com/image-rs/image-tiff",
+  "authors": [
+    "The image-rs Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\tiff-0.11.3\\LICENSE",
+    "licenses\\tiff-0.11.3\\tests\\COPYRIGHT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "e41159ce058bf193718b017599e2d7d53e9ccc92"
+    },
+    "path_in_vcs": ""
+  }
+}

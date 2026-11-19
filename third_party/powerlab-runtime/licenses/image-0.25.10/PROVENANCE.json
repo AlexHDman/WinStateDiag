@@ -1,0 +1,22 @@
+{
+  "name": "image",
+  "version": "0.25.10",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/image-rs/image",
+  "authors": [
+    "The image-rs Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\image-0.25.10\\LICENSE-APACHE",
+    "licenses\\image-0.25.10\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "76e57184f22772dad1138e96954e57945406b15e"
+    },
+    "path_in_vcs": ""
+  }
+}

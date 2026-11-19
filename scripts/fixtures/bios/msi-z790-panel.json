@@ -1,0 +1,170 @@
+{
+  "result": {
+    "category": "mb",
+    "title": "MAG Z790 TOMAHAWK WIFI",
+    "downloads": {
+      "AMI BIOS": [
+        {
+          "download_version": "7D91vHJ",
+          "download_release": "2026-10-08",
+          "download_file": "mb/7D91vHJ.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHJ.zip"
+        },
+        {
+          "download_version": "7D91vHI",
+          "download_release": "2026-04-22",
+          "download_file": "mb/7D91vHI.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHI.zip"
+        },
+        {
+          "download_version": "7D91vHH",
+          "download_release": "2025-08-29",
+          "download_file": "mb/7D91vHH.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHH.zip"
+        },
+        {
+          "download_version": "7D91vHH1(Beta version)",
+          "download_release": "2025-05-22",
+          "download_file": "mb/7D91vHH1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHH1.zip"
+        },
+        {
+          "download_version": "7D91vHG",
+          "download_release": "2025-04-22",
+          "download_file": "mb/7D91vHG.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHG.zip"
+        },
+        {
+          "download_version": "7D91vHF",
+          "download_release": "2025-03-13",
+          "download_file": "mb/7D91vHF.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHF.zip"
+        },
+        {
+          "download_version": "7D91vHE",
+          "download_release": "2024-11-01",
+          "download_file": "mb/7D91vHE.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHE.zip"
+        },
+        {
+          "download_version": "7D91vHE1(Beta version)",
+          "download_release": "2024-09-26",
+          "download_file": "mb/7D91vHE1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHE1.zip"
+        },
+        {
+          "download_version": "7D91vHD",
+          "download_release": "2024-08-22",
+          "download_file": "mb/7D91vHD.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHD.zip"
+        },
+        {
+          "download_version": "7D91vHD2(Beta version)",
+          "download_release": "2024-08-13",
+          "download_file": "mb/7D91vHD2.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHD2.zip"
+        },
+        {
+          "download_version": "7D91vHD1(Beta version)",
+          "download_release": "2024-08-09",
+          "download_file": "mb/7D91vHD1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHD1.zip"
+        },
+        {
+          "download_version": "7D91vHC",
+          "download_release": "2024-08-09",
+          "download_file": "mb/7D91vHC.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHC.zip"
+        },
+        {
+          "download_version": "7D91vHC3(Beta version)",
+          "download_release": "2024-06-26",
+          "download_file": "mb/7D91vHC3.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHC3.zip"
+        },
+        {
+          "download_version": "7D91vHC2(Beta version)",
+          "download_release": "2024-06-05",
+          "download_file": "mb/7D91vHC2.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHC2.zip"
+        },
+        {
+          "download_version": "7D91vHB",
+          "download_release": "2024-04-24",
+          "download_file": "mb/7D91vHB.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHB.zip"
+        },
+        {
+          "download_version": "7D91vHB3(Beta version)",
+          "download_release": "2024-03-18",
+          "download_file": "mb/7D91vHB3.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHB3.zip"
+        },
+        {
+          "download_version": "7D91vHB2(Beta version)",
+          "download_release": "2024-02-27",
+          "download_file": "mb/7D91vHB2.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHB2.zip"
+        },
+        {
+          "download_version": "7D91vHA",
+          "download_release": "2024-01-29",
+          "download_file": "mb/7D91vHA.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vHA.zip"
+        },
+        {
+          "download_version": "7D91vH9",
+          "download_release": "2023-11-08",
+          "download_file": "mb/7D91vH9.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH9.zip"
+        },
+        {
+          "download_version": "7D91vH8",
+          "download_release": "2023-09-14",
+          "download_file": "mb/7D91vH8.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH8.zip"
+        },
+        {
+          "download_version": "7D91vH6",
+          "download_release": "2023-05-19",
+          "download_file": "mb/7D91vH6.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH6.zip"
+        },
+        {
+          "download_version": "7D91vH5",
+          "download_release": "2023-04-19",
+          "download_file": "mb/7D91vH5.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH5.zip"
+        },
+        {
+          "download_version": "7D91vH4",
+          "download_release": "2023-03-28",
+          "download_file": "mb/7D91vH4.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH4.zip"
+        },
+        {
+          "download_version": "7D91vH2",
+          "download_release": "2023-01-06",
+          "download_file": "mb/7D91vH2.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH2.zip"
+        },
+        {
+          "download_version": "7D91vH1",
+          "download_release": "2022-11-21",
+          "download_file": "mb/7D91vH1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH1.zip"
+        },
+        {
+          "download_version": "7D91vH0",
+          "download_release": "2022-09-26",
+          "download_file": "mb/7D91vH0.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D91vH0.zip"
+        }
+      ]
+    }
+  },
+  "status": {
+    "code": 200,
+    "response": "ok"
+  }
+}

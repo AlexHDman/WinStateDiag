@@ -1,0 +1,23 @@
+{
+  "name": "unicode-ident",
+  "version": "1.0.27",
+  "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+  "repository": "https://github.com/dtolnay/unicode-ident",
+  "authors": [
+    "David Tolnay <dtolnay@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\unicode-ident-1.0.27\\LICENSE-APACHE",
+    "licenses\\unicode-ident-1.0.27\\LICENSE-MIT",
+    "licenses\\unicode-ident-1.0.27\\LICENSE-UNICODE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "c1ac3afb721f3cea6527bc2255340a04d0de3ca0"
+    },
+    "path_in_vcs": ""
+  }
+}

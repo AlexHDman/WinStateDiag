@@ -1,0 +1,24 @@
+{
+  "name": "glow",
+  "version": "0.17.0",
+  "license": "MIT OR Apache-2.0 OR Zlib",
+  "repository": "https://github.com/grovesNL/glow",
+  "authors": [
+    "Joshua Groves <josh@joshgroves.com>",
+    "Dzmitry Malyshau <kvarkus@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\glow-0.17.0\\LICENSE-APACHE",
+    "licenses\\glow-0.17.0\\LICENSE-MIT",
+    "licenses\\glow-0.17.0\\LICENSE-ZLIB"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "0983efbc97fa4815f18990ef2a59540ede94f6f6"
+    },
+    "path_in_vcs": ""
+  }
+}

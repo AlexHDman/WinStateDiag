@@ -1,0 +1,22 @@
+{
+  "name": "ahash",
+  "version": "0.8.12",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/tkaitchuck/ahash",
+  "authors": [
+    "Tom Kaitchuck <Tom.Kaitchuck@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\ahash-0.8.12\\LICENSE-APACHE",
+    "licenses\\ahash-0.8.12\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "9aa1ba20f05ed582eda04ea625d5658c92195a57"
+    },
+    "path_in_vcs": ""
+  }
+}

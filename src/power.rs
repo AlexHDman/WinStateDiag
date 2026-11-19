@@ -43,23 +43,17 @@ impl Rail {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        if n.contains("5VSB") || n.contains("VSB") || n.contains("STANDBY") || n.contains("+5VSTBY")
-        {
-            return Some(Rail::V5Sb);
+        // Exact provider labels only. Channel indices and board names are not
+        // a nominal: +3V Standby / AVSB must never become the ATX +5VSB rail.
+        match n.as_str() {
+            "+12V" | "12V" | "+12" => Some(Rail::V12),
+            "+5V" | "5V" | "5VCC" => Some(Rail::V5),
+            "+3.3V" | "3.3V" | "+3,3V" | "3,3V" | "3VCC" | "+3.3" => Some(Rail::V3_3),
+            "5VSB" | "+5VSB" | "+5VSTBY" | "5VSTBY" | "+5VSTANDBY" | "5VSTANDBY" => {
+                Some(Rail::V5Sb)
+            }
+            _ => None,
         }
-        if n.contains("12V") || n == "+12" || n.contains("VIN12") {
-            return Some(Rail::V12);
-        }
-        if n.contains("3.3V") || n.contains("3,3V") || n.contains("3VCC") || n.contains("+3.3") {
-            return Some(Rail::V3_3);
-        }
-        if (n.contains("+5V") || n == "5V" || n.contains("5VCC"))
-            && !n.contains("1.5V")
-            && !n.contains("2.5V")
-        {
-            return Some(Rail::V5);
-        }
-        None
     }
 }
 
@@ -121,6 +115,29 @@ mod tests {
         assert_eq!(Rail::from_sensor_name("CPU Core"), None);
         assert_eq!(Rail::from_sensor_name("+1.5V"), None);
         assert_eq!(Rail::ALL.len(), 4);
+    }
+
+    #[test]
+    fn rc8_standby_and_substring_aliases_never_invent_a_nominal() {
+        for name in [
+            "+3V Standby",
+            "+3.3V Standby",
+            "AVSB",
+            "VSB",
+            "Standby",
+            "Voltage #11",
+            "VIN12",
+            "-12V",
+            "+1.5V",
+            "+2.5V",
+            "+15VSB",
+            "+12V CPU Input",
+        ] {
+            assert_eq!(Rail::from_sensor_name(name), None, "{name}");
+        }
+        for name in ["+5V Standby", "5VSB", "+5VSB", "+5V STBY"] {
+            assert_eq!(Rail::from_sensor_name(name), Some(Rail::V5Sb));
+        }
     }
 
     #[test]

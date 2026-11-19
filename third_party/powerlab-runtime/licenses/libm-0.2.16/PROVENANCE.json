@@ -1,0 +1,24 @@
+{
+  "name": "libm",
+  "version": "0.2.16",
+  "license": "MIT",
+  "repository": "https://github.com/rust-lang/compiler-builtins",
+  "authors": [
+    "Alex Crichton <alex@alexcrichton.com>",
+    "Amanieu d'Antras <amanieu@gmail.com>",
+    "Jorge Aparicio <japaricious@gmail.com>",
+    "Trevor Gross <tg@trevorgross.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\libm-0.2.16\\LICENSE.txt"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "dfd2203a4d6110820ad7bb65cafe1bf331a03a3d"
+    },
+    "path_in_vcs": "libm"
+  }
+}

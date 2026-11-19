@@ -130,13 +130,14 @@ pub struct Aggregate {
 /// Key fields that are ATTRIBUTES (collected distinct values), never the
 /// identity of an aggregate: SCM timeouts / error texts, Code Integrity
 /// full paths and correlated signature details.
-pub const ATTRIBUTE_KEYS: [&str; 6] = [
+pub const ATTRIBUTE_KEYS: [&str; 7] = [
     "TimeoutMs",
     "Error",
     "ProcessPath",
     "FilePath",
     "Signature",
     "LinkedEventIds",
+    "ShutdownEvidence",
 ];
 
 /// Separator of collected attribute values.
@@ -372,16 +373,46 @@ pub fn sxs_fields(e: &RawEvent) -> (String, String) {
 
 /// v1.0 SCM service identity: (service, timeout ms) of one SCM event.
 pub fn scm_service(e: &RawEvent) -> (String, String) {
+    if matches!(e.id, 7031 | 7034)
+        && e.field(&["ServiceName"]).is_none()
+        && let Some(hex) = e.field(&["Binary"])
+        && hex.len() % 4 == 0
+        && hex.is_ascii()
+    {
+        let bytes: Option<Vec<u8>> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect();
+        if let Some(bytes) = bytes {
+            let units: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            if let Ok(name) = String::from_utf16(&units) {
+                let name = name.trim_end_matches('\0');
+                if !name.is_empty()
+                    && name.len() <= 128
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                {
+                    return (name.into(), String::new());
+                }
+            }
+        }
+    }
     if matches!(e.id, 7009 | 7011) {
         let timeout = e.field(&["param1"]).unwrap_or("").to_string();
         let svc = e
-            .field(&["param2", "ServiceName"])
+            .field(&["ServiceName", "param2"])
             .map(str::to_string)
             .unwrap_or_default();
         (svc, timeout)
     } else {
         (
-            e.field(&["param1", "ServiceName"])
+            e.field(&["ServiceName", "param1"])
                 .unwrap_or("")
                 .to_string(),
             String::new(),
@@ -476,6 +507,20 @@ pub fn schannel_code(e: &RawEvent) -> String {
 /// health check passed, provisioning check triggered, Secure Boot keys
 /// updated). Their repetition is boot-time routine, never a failure.
 pub const TPM_INFO_IDS: [u32; 6] = [1025, 1282, 1038, 1041, 18, 1808];
+
+/// TPM-WMI Event IDs of Secure Boot servicing (DB / DBX / SBAT variable
+/// updates, KB5016061): 1795 firmware returned an error, 1796 update of a
+/// Secure Boot variable failed, 1797 / 1798 DBX / boot-manager prerequisites
+/// missing, 1801 updated certificates not applied to the firmware.
+pub const SECURE_BOOT_SERVICING_IDS: [u32; 6] = [1795, 1796, 1797, 1798, 1801, 1803];
+
+fn is_secure_boot_servicing(a: &Aggregate) -> bool {
+    (SECURE_BOOT_SERVICING_IDS.contains(&a.id) || a.id == 1808)
+        || a.latest.iter().any(|m| {
+            let l = m.to_lowercase();
+            l.contains("secure boot") || l.contains("sbat") || l.contains("безопасной загрузки")
+        })
+}
 
 /// Is this TPM event a problem candidate? Level decides when collected
 /// (1–3 = critical / error / warning); without a level, known success IDs
@@ -599,18 +644,36 @@ pub fn vss_category(e: &RawEvent) -> &'static str {
             25 | 35 => "shadow_copies_deleted_storage",
             // Aborted because the storage hit the USER-IMPOSED limit:
             // a configuration consequence, analysed on its own.
-            36 => "shadow_copies_aborted_storage_limit",
+            36 if e.message.to_lowercase().contains("limit")
+                || e.message.to_lowercase().contains("огранич") =>
+            {
+                "shadow_copies_aborted_storage_limit"
+            }
+            95 if e.message.to_lowercase().contains("marked for delete")
+                || e.message
+                    .to_lowercase()
+                    .contains("самая старая теневая копия") =>
+            {
+                "shadow_copy_delete_dependency"
+            }
             // Aborted during detection (volume arrival / offline volume).
             29 => "shadow_copies_aborted_detection",
             _ => "volsnap_other",
         }
     } else {
         match e.id {
-            8193 | 8194 | 12289 | 12293 | 12298 | 13 if vss_shutdown_context(e) => {
-                "vss_shutdown_context"
-            }
             8193 | 8194 | 12289 | 12293 | 12298 | 13 => "vss_operation_failure",
             // VSS service shutting down after its idle timeout: normal.
+            8231 if e
+                .message
+                .to_lowercase()
+                .contains("snapshot creation initiated")
+                || (e.message.to_lowercase().contains("создани")
+                    && (e.message.to_lowercase().contains("начат")
+                        || e.message.to_lowercase().contains("иници"))) =>
+            {
+                "vss_snapshot_initiated"
+            }
             8224 => "vss_idle_shutdown",
             // VSS service stopped by the SCM shutdown event: normal.
             8225 => "vss_scm_shutdown",
@@ -619,9 +682,9 @@ pub fn vss_category(e: &RawEvent) -> &'static str {
     }
 }
 
-/// VSS error raised while Windows was shutting down: HRESULT 0x8007045b
-/// (ERROR_SHUTDOWN_IN_PROGRESS) or the shutdown text. Such an error is a
-/// consequence of the shutdown, not a VSS malfunction.
+/// Shutdown indication only, NOT independent confirmation of shutdown.
+/// The aggregate requires a separate shutdown event in the same ISO-local
+/// calendar minute before giving this error a shutdown-context category.
 pub fn vss_shutdown_context(e: &RawEvent) -> bool {
     let m = e.message.to_lowercase();
     m.contains("0x8007045b")
@@ -631,6 +694,38 @@ pub fn vss_shutdown_context(e: &RawEvent) -> bool {
         || e.data
             .iter()
             .any(|(_, v)| v.to_ascii_lowercase().contains("0x8007045b"))
+}
+
+fn confirmed_vss_shutdown<'a>(e: &RawEvent, events: &'a [RawEvent]) -> Option<&'a RawEvent> {
+    fn minute(t: &str) -> Option<&str> {
+        let b = t.as_bytes();
+        if b.len() != 19
+            || b[4] != b'-'
+            || b[7] != b'-'
+            || b[10] != b'T'
+            || b[13] != b':'
+            || b[16] != b':'
+            || !b
+                .iter()
+                .enumerate()
+                .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16) || c.is_ascii_digit())
+        {
+            return None;
+        }
+        t.get(..16)
+    }
+    if !vss_shutdown_context(e) {
+        return None;
+    }
+    let at = minute(&e.time)?;
+    events.iter().find(|context| {
+        ((context
+            .provider
+            .eq_ignore_ascii_case("Microsoft-Windows-Kernel-General")
+            && context.id == 13)
+            || (context.provider.eq_ignore_ascii_case("VSS") && context.id == 8225))
+            && minute(&context.time) == Some(at)
+    })
 }
 
 /// Volume of a Volsnap message ("volume C:" / "тома C:"); empty if none.
@@ -771,7 +866,13 @@ fn key_of(group: Group, e: &RawEvent) -> (Vec<(String, String)>, String) {
             )
         }
         Group::Tpm => (
-            Vec::new(),
+            if e.message.to_ascii_uppercase().contains("SBAT") {
+                vec![kv("Operation", "SBAT".into())]
+            } else if let Some(op) = e.field(&["UpdateType", "EventType", "VariableName"]) {
+                vec![kv("Operation", op.to_string())]
+            } else {
+                Vec::new()
+            },
             if tpm_is_problem(e) {
                 "tpm_problem".into()
             } else {
@@ -783,7 +884,7 @@ fn key_of(group: Group, e: &RawEvent) -> (Vec<(String, String)>, String) {
 }
 
 /// Day number of an ISO `YYYY-MM-DD…` timestamp (civil → days).
-fn day_number(iso: &str) -> Option<i64> {
+pub(crate) fn day_number(iso: &str) -> Option<i64> {
     let mut it = iso
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty());
@@ -909,7 +1010,34 @@ pub fn aggregate(
             continue;
         }
         let group = group_of(e);
-        let (mut key, category) = key_of(group, e);
+        let (mut key, mut category) = key_of(group, e);
+        if e.provider == "WinStateDiag.HistoryCoverage" {
+            key = e.data.clone();
+            category = "collection_coverage".into();
+        }
+        if group == Group::Vss && category == "vss_operation_failure" {
+            if let Some(context) = confirmed_vss_shutdown(e, events) {
+                category = "vss_shutdown_context".into();
+                key.push((
+                    "ShutdownEvidence".into(),
+                    format!("{} / {} / {}", context.provider, context.id, context.time),
+                ));
+            } else if vss_shutdown_context(e) {
+                category = "vss_shutdown_unconfirmed".into();
+            }
+            // Never merge confirmed shutdown errors with unconfirmed failures.
+            key.push((
+                "ShutdownContext".into(),
+                if category == "vss_shutdown_context" {
+                    "CONFIRMED_SAME_MINUTE"
+                } else if category == "vss_shutdown_unconfirmed" {
+                    "UNCONFIRMED_SHUTDOWN_TEXT"
+                } else {
+                    "NOT_CONFIRMED"
+                }
+                .into(),
+            ));
+        }
         if is_ci(e) && !e.correlation.is_empty() {
             if e.id == 3089 {
                 if let Some((_, id)) = primaries.iter().find(|(c, _)| *c == e.correlation) {
@@ -1095,6 +1223,10 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
         match group {
             Group::Scm => {
                 let svc = key_val(a, "Service");
+                let adguard = svc.to_ascii_lowercase().contains("adguard")
+                    || a.service
+                        .as_ref()
+                        .is_some_and(|s| s.name.to_ascii_lowercase().contains("adguard"));
                 let name = match &a.service {
                     Some(si) if !si.name.is_empty() && !si.name.eq_ignore_ascii_case(svc) => {
                         format!("{} ({svc})", si.name)
@@ -1131,7 +1263,12 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                         );
                     }
                 }
-                let class = if a.count >= RECURRENCE_MIN {
+                if adguard {
+                    title.push_str(" · работоспособность VPN: NOT TESTED; состояние службы/драйвера не подтверждает соединение или трафик");
+                }
+                let class = if adguard && a.count_last_7_days == 0 {
+                    FindingClass::Historical
+                } else if a.count >= RECURRENCE_MIN {
                     FindingClass::SoftwareRecurring
                 } else {
                     FindingClass::Historical
@@ -1170,7 +1307,15 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                 if !module.is_empty() {
                     title.push_str(&format!(" · модуль {module}"));
                 }
-                let class = if a.count >= RECURRENCE_MIN {
+                let name = process.rsplit(['\\', '/']).next().unwrap_or(process);
+                let class = if name.eq_ignore_ascii_case("LEDKeeper2.exe")
+                    || name.eq_ignore_ascii_case("gui_audit.exe")
+                {
+                    title.push_str(" · известный шум/тестовый инструмент; самостоятельного влияния на Windows не доказано");
+                    FindingClass::Informational
+                } else if a.count_last_7_days == 0 {
+                    FindingClass::Historical
+                } else if a.count >= RECURRENCE_MIN {
                     FindingClass::SoftwareRecurring
                 } else {
                     FindingClass::SoftwareSingle
@@ -1204,12 +1349,23 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                     "ci_audit_only" | "ci_catalog_not_loaded" => FindingClass::Informational,
                     _ => FindingClass::Security,
                 };
+                title.push_str(" · блокировка загрузки не доказывает заражение; текущее состояние подписи и устройства проверяется отдельно в A5");
                 out.push(base(class, title));
             }
             Group::Tpm => {
                 // Level / semantics decide, never the count alone.
-                let (class, what) = if a.category == "tpm_problem" {
-                    if a.count >= RECURRENCE_MIN {
+                let secure_boot = is_secure_boot_servicing(a);
+                let (mut class, what) = if a.category == "tpm_problem" {
+                    if secure_boot {
+                        // v1.1 RC: a failed Secure Boot variable / SBAT /
+                        // DBX update is a security-servicing warning (the
+                        // update is not applied), not a hardware fault and
+                        // not "historical" while it is inside the window.
+                        (
+                            FindingClass::Security,
+                            "Secure Boot: отдельная операция обслуживания требует проверки; состояние защиты и сертификатов этим событием не определяется; не аппаратная неисправность",
+                        )
+                    } else if a.count >= RECURRENCE_MIN {
                         (FindingClass::SoftwareRecurring, "предупреждение / ошибка")
                     } else {
                         (FindingClass::Historical, "предупреждение / ошибка")
@@ -1217,10 +1373,38 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                 } else {
                     (FindingClass::Informational, "информационное / успешное")
                 };
-                out.push(base(
-                    class,
-                    format!("{} {} — {}× · {what}", a.provider, a.id, a.count),
-                ));
+                let mut title = format!("{} {} — {}× · {what}", a.provider, a.id, a.count);
+                if a.category == "tpm_problem" {
+                    // Keep the technical reason (newest message head).
+                    if let Some(m) = a.latest.first().map(|m| m.trim()).filter(|m| !m.is_empty()) {
+                        let head: String = m.chars().take(160).collect();
+                        title.push_str(&format!(" · причина: {head}"));
+                    }
+                }
+                if secure_boot {
+                    if a.id == 1808 {
+                        title.push_str(" · CA/keys: обновление подтверждено событием 1808; текущее Secure Boot ON/OFF проверяется отдельно");
+                    } else if let Some(success) = aggs
+                        .iter()
+                        .filter(|e| {
+                            e.group == Some(Group::Tpm)
+                                && e.id == 1808
+                                && e.category != "tpm_problem"
+                        })
+                        .max_by(|a, b| a.last_seen.cmp(&b.last_seen))
+                    {
+                        if matches!(a.id, 1801 | 1803) && success.last_seen > a.last_seen {
+                            class = FindingClass::Historical;
+                            title.push_str(" · более позднее обновление CA/keys подтверждено");
+                        }
+                        title.push_str(&format!(" · CA/keys: 1808 {}, {} последнего события {}; отдельная ошибка SBAT этим не отменяется", success.last_seen, if success.last_seen >= a.last_seen { "после" } else { "до" }, a.id));
+                    } else {
+                        title.push_str(
+                            " · CA/keys: подтверждение 1808 в собранном окне отсутствует",
+                        );
+                    }
+                }
+                out.push(base(class, title));
             }
             Group::Schannel => {
                 let code = key_val(a, "ErrorCode");
@@ -1251,7 +1435,7 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                 out.push(base(
                     class,
                     format!(
-                        "Windows Update 20 — {}{}×{}",
+                        "Windows Update 20 — {}{}×{} · {} · {} · текущие драйвер/PnP: отдельная проверка A5",
                         if kb.is_empty() {
                             String::new()
                         } else {
@@ -1261,7 +1445,9 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                         match key_val(a, "HRESULT") {
                             "" => String::new(),
                             h => format!(" · {h}"),
-                        }
+                        },
+                        key_val(a, "Title"),
+                        if a.wu_resolved == Some(true) {"последующая установка того же обновления подтверждена"} else {"последующая установка того же обновления не подтверждена"}
                     ),
                 ));
             }
@@ -1270,7 +1456,11 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                 // errors; normal activity is INFO, shutdown-time errors and
                 // quota-limit aborts are historical context.
                 let (class, what) = match a.category.as_str() {
-                    "vss_operation_failure" if a.count >= RECURRENCE_MIN => (
+                    "vss_shutdown_unconfirmed" => (
+                        FindingClass::Historical,
+                        "ошибка VSS с shutdown-текстом без независимого подтверждения; причина и результат backup не установлены; ошибка сохранена",
+                    ),
+                    "vss_operation_failure" if a.count_last_7_days >= RECURRENCE_MIN => (
                         FindingClass::SoftwareRecurring,
                         "подтверждённая операционная ошибка VSS",
                     ),
@@ -1284,19 +1474,31 @@ pub fn actionable(aggs: &[Aggregate]) -> Vec<Actionable> {
                     ),
                     "vss_shutdown_context" => (
                         FindingClass::Historical,
-                        "ошибка во время завершения работы Windows (0x8007045b), не сбой VSS",
+                        "ошибка VSS при подтверждённом завершении работы (корреляция в пределах той же минуты); результат backup не проверен",
                     ),
                     "shadow_copies_aborted_storage_limit" => (
-                        FindingClass::Historical,
+                        if a.count_last_7_days > 0 {
+                            FindingClass::SoftwareRecurring
+                        } else {
+                            FindingClass::Historical
+                        },
                         "теневые копии прерваны: достигнут пользовательский лимит хранилища",
                     ),
                     "shadow_copies_aborted_detection" => (
                         FindingClass::Historical,
                         "теневые копии тома прерваны при обнаружении (подключение / отключение тома)",
                     ),
+                    "shadow_copy_delete_dependency" => (
+                        FindingClass::Informational,
+                        "старейшая копия удалена для завершения удаления последующих помеченных копий; квота и состояние backup этим не подтверждены",
+                    ),
                     "restore_point_eviction_quota" => (
                         FindingClass::Informational,
                         "старая теневая копия удалена по квоте — штатно",
+                    ),
+                    "vss_snapshot_initiated" => (
+                        FindingClass::Informational,
+                        "начато создание снимка; завершение не подтверждено этим событием",
                     ),
                     "vss_idle_shutdown" => (
                         FindingClass::Informational,
@@ -1379,10 +1581,19 @@ pub fn aggregate_line(a: &Aggregate) -> String {
     s
 }
 
+/// Full collected EventData/messages; aggregate truncation is display-only.
+pub fn raw_json(events: &[RawEvent]) -> String {
+    let rows=events.iter().map(|e| format!("{{\"provider\":{},\"event_id\":{},\"log\":{},\"time\":{},\"level\":{},\"correlation\":{},\"message\":{},\"data\":[{}]}}",
+        json::string(&e.provider),e.id,json::string(&e.log),json::string(&e.time),e.level,json::string(&e.correlation),json::string(&e.message),
+        e.data.iter().map(|(k,v)|format!("{{\"name\":{},\"value\":{}}}",json::string(k),json::string(v))).collect::<Vec<_>>().join(",")
+    )).collect::<Vec<_>>().join(",\n");
+    format!("{{\"schema\":\"winstatediag.raw_events/1\",\"events\":[{rows}]}}")
+}
+
 /// Evidence JSON (`Event_Evidence_<stamp>.json`).
 pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &str) -> String {
     let items: Vec<String> = aggs
-        .iter()
+        .iter().filter(|a|a.provider!="WinStateDiag.HistoryCoverage")
         .map(|a| {
             let key: Vec<String> = a
                 .key
@@ -1436,8 +1647,20 @@ pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &s
             )
         })
         .collect();
-    format!(
-        "{{\n  \"format\": \"winstatediag.event_evidence/1\",\n  \"status\": \"COLLECTED\",\n  \"collected_at\": {},\n  \"window_days\": {WINDOW_DAYS},\n  \"scope\": {},\n  \"principle\": \"Event count alone does not determine severity; every counter is verifiable here.\",\n  \"windows_update_failure_historical\": {},\n  \"actionable_groups\": [\n{}\n  ],\n  \"aggregate_count\": {},\n  \"aggregates\": [\n{}\n  ]\n}}\n",
+    let base = format!(
+        "{{\n  \"format\": \"winstatediag.event_evidence/1\",\n  \"status\": {},\n  \"collected_at\": {},\n  \"window_days\": {WINDOW_DAYS},\n  \"scope\": {},\n  \"principle\": \"Event count alone does not determine severity; every counter is verifiable here.\",\n  \"windows_update_failure_historical\": {},\n  \"actionable_groups\": [\n{}\n  ],\n  \"aggregate_count\": {},\n  \"aggregates\": [\n{}\n  ]\n}}\n",
+        json::string(
+            if aggs
+                .iter()
+                .any(|a| a.provider == "WinStateDiag.CollectionError"
+                    || (a.provider == "WinStateDiag.HistoryCoverage"
+                        && a.latest.iter().any(|m| m.contains("\"Complete\":false"))))
+            {
+                "PARTIAL"
+            } else {
+                "COLLECTED"
+            }
+        ),
         json::string(collected_at),
         SCOPE_JSON,
         match wu_historical {
@@ -1445,8 +1668,23 @@ pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &s
             None => "null".into(),
         },
         groups.join(",\n"),
-        aggs.len(),
+        aggs.iter()
+            .filter(|a| a.provider != "WinStateDiag.HistoryCoverage")
+            .count(),
         items.join(",\n")
+    );
+    let coverage = aggs
+        .iter()
+        .filter(|a| a.provider == "WinStateDiag.HistoryCoverage")
+        .flat_map(|a| &a.latest)
+        .map(|s| json::string(s))
+        .collect::<Vec<_>>()
+        .join(",");
+    let base = base.trim_end();
+    format!(
+        "{},\"history_coverage\":[{}],\"absence_proves_resolution\":false}}\n",
+        &base[..base.len() - 1],
+        coverage
     )
 }
 
@@ -1455,7 +1693,7 @@ pub fn to_json(aggs: &[Aggregate], wu_historical: Option<bool>, collected_at: &s
 /// identity key (SCM service, process, module, KB …)". Other modules (EXPC
 /// stages: 14 days, Level 1–2; Driver Audit: its device-scoped queries)
 /// count different scopes — never compare counters without the scope.
-pub const SCOPE_JSON: &str = "{\"window_days\": 30, \"logs\": [\"System\", \"Application\", \"Microsoft-Windows-CodeIntegrity/Operational\"], \"queries\": [\"System/Schannel\", \"System/Microsoft-Windows-WindowsUpdateClient 19,20\", \"System/Microsoft-Windows-TPM-WMI\", \"System/TPM\", \"System/Service Control Manager 7000,7001,7009,7011,7023,7024,7031,7034\", \"Application/SideBySide 33,35,59,63,80\", \"CodeIntegrity/Operational 3001,3002,3004,3010,3023,3033,3034,3063,3077,3089\", \"Application/VSS\", \"System/volsnap\", \"Application/Application Error 1000\", \"Application/Application Hang 1002\", \"Application/.NET Runtime 1026\"], \"max_events_per_query\": 1500, \"grouping\": \"provider + event id + identity key (SCM: service name, timeout and error text are attributes; applications: process + module + exception, process from EventData or the message, otherwise INSUFFICIENT DATA keyed by the message head; Code Integrity: process + module, full paths and the 3089 signature details linked by Correlation ActivityID are attributes, 3089 itself is never an incident; Schannel: internal error code + SSPI client process; TPM: Level and Event ID semantics, success / information events are INFO)\", \"classes\": [\"SOFTWARE_RECURRING\", \"SECURITY\", \"SOFTWARE_SINGLE\", \"HISTORICAL\", \"INFO\"]}";
+pub const SCOPE_JSON: &str = "{\"window_days\": 30, \"logs\": [\"System\", \"Application\", \"Microsoft-Windows-CodeIntegrity/Operational\"], \"queries\": [\"System/Schannel\", \"System/Microsoft-Windows-WindowsUpdateClient 19,20\", \"System/Microsoft-Windows-TPM-WMI\", \"System/TPM\", \"System/Microsoft-Windows-WHEA-Logger\", \"System/Service Control Manager 7000,7001,7009,7011,7023,7024,7031,7034\", \"Application/SideBySide 33,35,59,63,80\", \"CodeIntegrity/Operational 3001,3002,3004,3010,3023,3033,3034,3063,3077,3089\", \"Application/VSS\", \"System/volsnap\", \"Application/Application Error 1000\", \"Application/Application Hang 1002\", \"Application/.NET Runtime 1026\"], \"max_events_per_query\": 1500, \"grouping\": \"provider + event id + identity key (SCM: service name, timeout and error text are attributes; applications: process + module + exception, process from EventData or the message, otherwise INSUFFICIENT DATA keyed by the message head; Code Integrity: process + module, full paths and the 3089 signature details linked by Correlation ActivityID are attributes, 3089 itself is never an incident; Schannel: internal error code + SSPI client process; TPM: Level and Event ID semantics, success / information events are INFO)\", \"classes\": [\"SOFTWARE_RECURRING\", \"SECURITY\", \"SOFTWARE_SINGLE\", \"HISTORICAL\", \"INFO\"]}";
 
 /// Read-only collector: one `WSD_EV <json>` line per event and one
 /// `WSD_SVC <json>` per service referenced by SCM events.
@@ -1467,6 +1705,7 @@ $queries = @(
     @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 19, 20 },
     @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-TPM-WMI' },
     @{ LogName = 'System'; ProviderName = 'TPM' },
+    @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger' },
     @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7000, 7001, 7009, 7011, 7023, 7024, 7031, 7034 },
     @{ LogName = 'Application'; ProviderName = 'SideBySide'; Id = 33, 35, 59, 63, 80 },
     @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Id = 3001, 3002, 3004, 3010, 3023, 3033, 3034, 3063, 3077, 3089 },
@@ -1477,12 +1716,33 @@ $queries = @(
     @{ LogName = 'Application'; ProviderName = '.NET Runtime'; Id = 1026 }
 )
 $svcNames = New-Object System.Collections.Generic.HashSet[string]
+$logRanges=@{}
+foreach($log in @($queries|ForEach-Object {$_.LogName}|Sort-Object -Unique)){
+    try{$old=Get-WinEvent -LogName $log -Oldest -MaxEvents 1 -ErrorAction Stop;$logRanges[$log]=$old.TimeCreated}catch{$logRanges[$log]=$null}
+}
 foreach ($q in $queries) {
     $q.StartTime = $since
-    foreach ($e in @(Get-WinEvent -FilterHashtable $q -MaxEvents 1500 -ErrorAction SilentlyContinue)) {
+    $queryOk=$true
+    try { $queried=@(Get-WinEvent -FilterHashtable $q -MaxEvents 1500 -ErrorAction Stop) }
+    catch { if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { $queryOk=$false; 'WSD_EV_ERROR ' + $q.ProviderName + ': ' + $_.Exception.Message }; $queried=@() }
+    $oldest=$logRanges[$q.LogName]
+    $coverage=[ordered]@{Log=$q.LogName;Provider=$q.ProviderName;RequestedFrom=$since.ToString('s');RequestedTo=(Get-Date).ToString('s');OldestAvailable=$(if($oldest){$oldest.ToString('s')}else{$null});FirstReturned=$(if($queried.Count){($queried|Sort-Object TimeCreated|Select-Object -First 1).TimeCreated.ToString('s')}else{$null});LastReturned=$(if($queried.Count){$queried[0].TimeCreated.ToString('s')}else{$null});Returned=$queried.Count;QuerySucceeded=$queryOk;PossiblyTruncated=($queried.Count -ge 1500);Complete=($queryOk -and $null -ne $oldest -and $oldest -le $since -and $queried.Count -lt 1500);AbsenceDoesNotProveResolution=$true}
+    'WSD_EV '+([ordered]@{log='Coverage';p='WinStateDiag.HistoryCoverage';id=0;t=(Get-Date).ToString('s');lvl=4;corr='';m=($coverage|ConvertTo-Json -Compress);d=@([pscustomobject]@{k='Query';v=($q.LogName+'/'+$q.ProviderName)})}|ConvertTo-Json -Compress -Depth 5)
+    foreach ($e in $queried) {
         $data = @()
         try {
             $x = [xml]$e.ToXml()
+            $data += [PSCustomObject]@{k='RawXml';v=$e.ToXml()}
+            $binary = [string]$x.Event.EventData.Binary
+            if ($binary) {
+                $data += [PSCustomObject]@{k='Binary';v=$binary}
+                if ($e.ProviderName -eq 'Service Control Manager' -and [int]$e.Id -in @(7031,7034) -and $binary -match '^(?:[0-9A-Fa-f]{4})+$') {
+                    $bytes = New-Object byte[] ($binary.Length/2)
+                    for($bi=0;$bi -lt $bytes.Length;$bi++){ $bytes[$bi]=[Convert]::ToByte($binary.Substring($bi*2,2),16) }
+                    $decoded=[Text.Encoding]::Unicode.GetString($bytes).Trim([char]0)
+                    if($decoded -match '^[A-Za-z][A-Za-z0-9_.-]{0,127}$' -and !(@($x.Event.EventData.Data | Where-Object Name -eq 'ServiceName').Count)){ $data += [PSCustomObject]@{k='ServiceName';v=$decoded} }
+                }
+            }
             $i = 0
             foreach ($d in @($x.Event.EventData.Data)) {
                 $i++
@@ -1498,8 +1758,10 @@ foreach ($q in $queries) {
         $lvl = 0
         try { $lvl = [int]$e.Level } catch { }
         if ($e.ProviderName -eq 'Service Control Manager' -and $data.Count -gt 0) {
+            $namedData=@($data | Where-Object { $_.k -notin @('RawXml','Binary') })
             $si = if ([int]$e.Id -in @(7009, 7011) -and $data.Count -ge 2) { 1 } else { 0 }
-            [void]$svcNames.Add([string]$data[$si].v)
+            $explicit = $data | Where-Object k -eq 'ServiceName' | Select-Object -First 1
+            [void]$svcNames.Add($(if ($explicit) { [string]$explicit.v } else { [string]$namedData[$si].v }))
         }
         $o = [ordered]@{ log = [string]$e.LogName; p = [string]$e.ProviderName; id = [int]$e.Id; t = $e.TimeCreated.ToString('s'); lvl = $lvl; corr = $corr; m = $msg; d = @($data) }
         'WSD_EV ' + ($o | ConvertTo-Json -Compress -Depth 4)
@@ -1507,6 +1769,7 @@ foreach ($q in $queries) {
 }
 foreach ($s in $svcNames) {
     $w = Get-CimInstance Win32_Service | Where-Object { $_.DisplayName -eq $s -or $_.Name -eq $s } | Select-Object -First 1
+    if (-not $w) { $w = Get-CimInstance Win32_SystemDriver | Where-Object { $_.DisplayName -eq $s -or $_.Name -eq $s } | Select-Object -First 1 }
     if ($w) { 'WSD_SVC ' + ([ordered]@{ name = [string]$w.Name; dn = [string]$w.DisplayName; st = [string]$w.State; sm = [string]$w.StartMode; path = [string]$w.PathName } | ConvertTo-Json -Compress) }
 }
 "#;
@@ -1516,7 +1779,18 @@ pub fn parse_collector(stdout: &str) -> (Vec<RawEvent>, Vec<ServiceInfo>) {
     let mut services = Vec::new();
     for line in stdout.lines() {
         let line = line.trim_start_matches('\u{feff}');
-        if let Some(j) = line.strip_prefix("WSD_EV ").and_then(json::parse) {
+        if let Some(error) = line.strip_prefix("WSD_EV_ERROR ") {
+            events.push(RawEvent {
+                log: "Collection".into(),
+                provider: "WinStateDiag.CollectionError".into(),
+                id: 0,
+                time: String::new(),
+                message: error.into(),
+                data: Vec::new(),
+                level: 0,
+                correlation: String::new(),
+            });
+        } else if let Some(j) = line.strip_prefix("WSD_EV ").and_then(json::parse) {
             let s = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let data = match j.get("d") {
                 Some(json::Value::Arr(a)) => a.clone(),
@@ -1575,15 +1849,197 @@ pub fn parse_collector(stdout: &str) -> (Vec<RawEvent>, Vec<ServiceInfo>) {
 pub fn collect(host: &str) -> Result<(Vec<RawEvent>, Vec<ServiceInfo>), String> {
     let script = format!("& {{ {COLLECTOR_PS1} }} -Days {WINDOW_DAYS}");
     crate::ps_exec::run_powershell(host, &script, std::time::Duration::from_secs(240))
-        .map(|out| parse_collector(&out))
         .map_err(|e| e.to_string())
+        .map(|out| parse_collector(&out))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn rc7_raw_events_keep_full_service_name_and_whea_payload() {
+        let message = "x".repeat(1200);
+        let e = ev(
+            "Microsoft-Windows-WHEA-Logger",
+            17,
+            "2026-10-05T10:00:00",
+            &message,
+            &[("RawData", "43504552"), ("ServiceName", "ScDeviceEnum")],
+        );
+        let text = raw_json(&[e]);
+        assert!(json::parse(&text).is_some());
+        assert!(
+            text.contains(&message) && text.contains("43504552") && text.contains("ScDeviceEnum")
+        );
+    }
+
+    #[test]
+    fn rc7_service_name_overrides_display_name_and_sbat_is_independent() {
+        for id in [7023, 7031] {
+            let raw = ev(
+                "Service Control Manager",
+                id,
+                "2026-10-05T10:00:00",
+                "smart card remote service",
+                &[("ServiceName", "ScDeviceEnum"), ("param1", "TermService")],
+            );
+            assert_eq!(scm_service(&raw).0, "ScDeviceEnum");
+        }
+        let error = ev(
+            "Microsoft-Windows-TPM-WMI",
+            1796,
+            "2026-10-05T10:00:00",
+            "SBAT error Incorrect function",
+            &[],
+        );
+        let success = ev(
+            "Microsoft-Windows-TPM-WMI",
+            1808,
+            "2026-10-04T10:00:00",
+            "This device has updated Secure Boot CA/keys",
+            &[],
+        );
+        let aggs = aggregate(&[error, success], &[], NOW);
+        let f = actionable(&aggs);
+        assert!(
+            f.iter()
+                .any(|f| f.title.contains("CA/keys: 1808") && f.title.contains("до последнего"))
+        );
+        assert!(SECURE_BOOT_SERVICING_IDS.contains(&1803));
+    }
+
+    #[test]
+    fn phase03_b3_recurrence_does_not_confirm_shutdown_or_hide_backup_failure() {
+        for (message, expected) in [
+            ("backup failed 0x8007045b", FindingClass::Historical),
+            (
+                "backup failed 0x80070005 access denied",
+                FindingClass::SoftwareRecurring,
+            ),
+        ] {
+            let rows = vec![ev("VSS", 8193, "2026-10-04T12:00:01", message, &[]); 3];
+            let aggs = aggregate(&rows, &[], NOW);
+            let findings = actionable(&aggs);
+            assert_eq!(findings[0].class, expected);
+            if expected == FindingClass::Historical {
+                assert!(findings[0].title.contains("без независимого подтверждения"));
+                assert!(!findings[0].title.contains("подтверждённая операционная"));
+            }
+            assert_eq!(aggs[0].count, 3);
+            assert!(to_json(&aggs, None, NOW).contains("8193"));
+        }
+    }
+
+    #[test]
+    fn diag_103_hresult_requires_independent_shutdown_evidence() {
+        let failure = ev(
+            "VSS",
+            8193,
+            "2026-10-04T23:59:01",
+            "backup failed 0x8007045b",
+            &[],
+        );
+        assert_eq!(
+            aggregate(&[failure.clone()], &[], NOW)[0].category,
+            "vss_shutdown_unconfirmed"
+        );
+        let context = ev(
+            "VSS",
+            8225,
+            "2026-10-04T23:59:02",
+            "shutdown notification",
+            &[],
+        );
+        let confirmed = aggregate(&[failure.clone(), context.clone()], &[], NOW);
+        let row = confirmed.iter().find(|a| a.id == 8193).unwrap();
+        assert_eq!(row.category, "vss_shutdown_context");
+        assert!(key_val(row, "ShutdownEvidence").contains("VSS / 8225 / 2026-10-04T23:59:02"));
+        let mut unrelated = context;
+        unrelated.time = "2026-10-03T23:59:02".into();
+        assert_eq!(
+            aggregate(&[failure, unrelated], &[], NOW)
+                .iter()
+                .find(|a| a.id == 8193)
+                .unwrap()
+                .category,
+            "vss_shutdown_unconfirmed"
+        );
+        let json = to_json(&confirmed, None, NOW);
+        assert!(json.contains("ShutdownEvidence") && json.contains("vss_shutdown_context"));
+        assert!(
+            actionable(&confirmed)
+                .iter()
+                .any(|a| a.title.contains("backup не проверен"))
+        );
+    }
+
+    #[test]
+    fn diag_104_old_adguard_events_do_not_prove_vpn_health() {
+        let failures: Vec<_> = (1..=4)
+            .map(|d| {
+                ev(
+                    "Service Control Manager",
+                    7000,
+                    &format!("2026-10-0{d}T12:00:00"),
+                    "AdGuard WFP failed",
+                    &[("param1", "AdGuard WFP"), ("param2", "failure")],
+                )
+            })
+            .collect();
+        let services = vec![ServiceInfo {
+            name: "AdGuardWfp".into(),
+            display_name: "AdGuard WFP".into(),
+            state: "Running".into(),
+            ..Default::default()
+        }];
+        let rows = aggregate(&failures, &services, "2026-10-19T12:00:00");
+        let findings = actionable(&rows);
+        assert!(findings.iter().all(|f| f.class == FindingClass::Historical));
+        assert!(findings.iter().all(|f| f.title.contains("VPN: NOT TESTED")));
+        let json = to_json(&rows, None, "2026-10-19T12:00:00");
+        assert!(
+            json.contains("AdGuardWfp")
+                && json.contains("Running")
+                && json.contains("7000")
+                && json.contains("2026-10-04T12:00:00")
+        );
+    }
+
     /// Collection time of the test fixtures.
+    #[test]
+    fn v1214_vss_initiation_is_context_not_snapshot_success() {
+        let e = ev(
+            "VSS",
+            8231,
+            "2026-10-04T12:00:00",
+            "Snapshot creation initiated for Snapshot Set {synthetic}",
+            &[],
+        );
+        assert_eq!(vss_category(&e), "vss_snapshot_initiated");
+        let a = aggregate(&[e], &[], NOW);
+        assert_eq!(actionable(&a)[0].class, FindingClass::Informational);
+        assert!(
+            actionable(&a)[0]
+                .title
+                .contains("завершение не подтверждено")
+        );
+    }
+
+    #[test]
+    fn v1212_old_vss_recurrence_is_historical_but_recent_failures_survive() {
+        for (time, expected) in [
+            ("2026-09-12T12:00:00", FindingClass::Historical),
+            ("2026-10-04T12:00:00", FindingClass::SoftwareRecurring),
+        ] {
+            let events = vec![ev("VSS", 8193, time, "backup failed access denied", &[]); 4];
+            let a = aggregate(&events, &[], NOW);
+            assert_eq!(actionable(&a)[0].class, expected);
+            assert_eq!(a[0].count, 4);
+            assert!(to_json(&a, None, NOW).contains("8193"));
+        }
+    }
+
     const NOW: &str = "2026-10-06T10:00:00";
 
     fn ev(provider: &str, id: u32, time: &str, message: &str, data: &[(&str, &str)]) -> RawEvent {
@@ -2221,6 +2677,11 @@ mod tests {
         let mut events = Vec::new();
         for d in 1..=4 {
             events.push(app(13, &format!("2026-10-0{d}T23:59:00"), "Volume Shadow Copy Service information: The COM Server with CLSID {4e14fba2-2e22-11d1-9964-00c04fbbb345} and name CEventSystem cannot be started. [0x8007045b, Идет завершение работы системы. ]"));
+            events.push(app(
+                8225,
+                &format!("2026-10-0{d}T23:59:02"),
+                "SCM shutdown notification",
+            ));
         }
         events.push(app(8193, "2026-10-04T23:59:01", "Volume Shadow Copy Service error: Unexpected error calling routine CoCreateInstance. hr = 0x8007045b, Идет завершение работы системы. ."));
         events.push(app(8225, "2026-10-04T23:59:02", "The VSS service is shutting down due to shutdown event from the Service Control Manager."));
@@ -2248,14 +2709,18 @@ mod tests {
         let act = actionable(&aggs);
         assert!(
             act.iter()
+                .filter(|g| !g.title.starts_with("volsnap 36"))
                 .all(|g| g.class != FindingClass::SoftwareRecurring),
-            "no confirmed VSS failure: {act:?}"
+            "only Volsnap36 is an operational finding: {act:?}"
         );
         let v29 = act
             .iter()
             .find(|g| g.title.starts_with("volsnap 29"))
             .unwrap();
         assert!(v29.title.contains("том F:"), "{}", v29.title);
+        assert!(act.iter().any(
+            |g| g.title.starts_with("volsnap 36") && g.class == FindingClass::SoftwareRecurring
+        ));
         let v36 = act
             .iter()
             .find(|g| g.title.starts_with("volsnap 36"))
@@ -2267,7 +2732,7 @@ mod tests {
         );
         let s13 = act.iter().find(|g| g.title.starts_with("VSS 13")).unwrap();
         assert_eq!(s13.class, FindingClass::Historical);
-        assert!(s13.title.contains("0x8007045b"), "{}", s13.title);
+        assert!(s13.title.contains("подтверждённом"), "{}", s13.title);
         // A confirmed operational error outside shutdown stays a failure.
         let real: Vec<RawEvent> = (1..=3)
             .map(|d| app(8193, &format!("2026-10-0{d}T10:00:00"), "Volume Shadow Copy Service error: Unexpected error querying for the IVssWriterCallback interface. hr = 0x80070005, Access is denied."))
@@ -2355,10 +2820,10 @@ mod tests {
             .map(|d| {
                 lvl(
                     ev(
-                        "Microsoft-Windows-TPM-WMI",
-                        1796,
+                        "TPM",
+                        14,
                         &format!("2026-10-0{d}T08:00:00"),
-                        "The Secure Boot update failed",
+                        "The TPM command failed",
                         &[],
                     ),
                     2,
@@ -2371,10 +2836,10 @@ mod tests {
         );
         // Without a level, a single failure message is historical context.
         let one = [ev(
-            "Microsoft-Windows-TPM-WMI",
-            1796,
+            "TPM",
+            14,
             "2026-10-01T08:00:00",
-            "The Secure Boot update failed",
+            "The TPM command failed",
             &[],
         )];
         assert_eq!(
@@ -2818,5 +3283,74 @@ mod tests {
             crate::deep_checks::json::parse(SCOPE_JSON).is_some(),
             "valid scope JSON"
         );
+    }
+
+    // ---- v1.1 RC: Secure Boot servicing (TPM-WMI 1796 / SBAT) ----
+
+    #[test]
+    fn tpm_wmi_1796_is_security_with_reason_once_or_recurring() {
+        let msg = "The Secure Boot update failed to update a Secure Boot variable with error Secure Boot is not enabled on this machine..";
+        for n in [1u32, 3] {
+            let evs: Vec<RawEvent> = (1..=n)
+                .map(|d| {
+                    lvl(
+                        ev(
+                            "Microsoft-Windows-TPM-WMI",
+                            1796,
+                            &format!("2026-10-0{d}T08:00:00"),
+                            msg,
+                            &[],
+                        ),
+                        2,
+                    )
+                })
+                .collect();
+            let act = actionable(&aggregate(&evs, &[], NOW));
+            assert_eq!(act[0].class, FindingClass::Security, "{n}");
+            assert!(act[0].title.contains("1796"));
+            assert!(act[0].title.contains("Microsoft-Windows-TPM-WMI"));
+            assert!(act[0].title.contains("не аппаратная неисправность"));
+            assert!(
+                act[0]
+                    .title
+                    .contains("причина: The Secure Boot update failed")
+            );
+            assert_eq!(act[0].first_seen, "2026-10-01T08:00:00");
+        }
+    }
+
+    #[test]
+    fn sbat_message_without_known_id_is_security() {
+        let e = lvl(
+            ev(
+                "Microsoft-Windows-TPM-WMI",
+                1033,
+                "2026-10-01T08:00:00",
+                "SBAT update failed: the firmware rejected the SBAT level",
+                &[],
+            ),
+            3,
+        );
+        assert_eq!(
+            actionable(&aggregate(&[e], &[], NOW))[0].class,
+            FindingClass::Security
+        );
+    }
+
+    #[test]
+    fn secure_boot_success_1808_stays_info() {
+        let e = lvl(
+            ev(
+                "Microsoft-Windows-TPM-WMI",
+                1808,
+                "2026-10-01T08:00:00",
+                "This device has updated Secure Boot CA/keys.",
+                &[],
+            ),
+            4,
+        );
+        let act = actionable(&aggregate(&[e], &[], NOW));
+        assert_eq!(act[0].class, FindingClass::Informational);
+        assert!(!act[0].title.contains("причина"));
     }
 }

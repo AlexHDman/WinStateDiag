@@ -1,0 +1,1 @@
+EXPC proprietary internal source, copied from PowerLab 0.3 core at research/powerlab-codex-night01 HEAD 2b77dad5ddad581166d0f81b6afd61aa050be5a4 plus preserved dirty work. Changes: Russian summary captions in present.rs. Original source workspace remains unchanged.\n

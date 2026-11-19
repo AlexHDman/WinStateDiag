@@ -1,0 +1,22 @@
+{
+  "name": "codespan-reporting",
+  "version": "0.13.1",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/brendanzab/codespan",
+  "authors": [
+    "Brendan Zabarauskas <bjzaba@yahoo.com.au>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\codespan-reporting-0.13.1\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "ef354877a16c83e678051830b260a8f9a53778bd",
+      "dirty": true
+    },
+    "path_in_vcs": "codespan-reporting"
+  }
+}

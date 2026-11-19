@@ -1,0 +1,24 @@
+{
+  "name": "adler2",
+  "version": "2.0.1",
+  "license": "0BSD OR MIT OR Apache-2.0",
+  "repository": "https://github.com/oyvindln/adler2",
+  "authors": [
+    "Jonas Schievink <jonasschievink@gmail.com>",
+    "oyvindln <oyvindln@users.noreply.github.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\adler2-2.0.1\\LICENSE-0BSD",
+    "licenses\\adler2-2.0.1\\LICENSE-APACHE",
+    "licenses\\adler2-2.0.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "89a031a0f42eeff31c70dc598b398cbf31f1680f"
+    },
+    "path_in_vcs": ""
+  }
+}

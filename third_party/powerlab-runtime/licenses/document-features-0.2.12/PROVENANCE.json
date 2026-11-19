@@ -1,0 +1,22 @@
+{
+  "name": "document-features",
+  "version": "0.2.12",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/slint-ui/document-features",
+  "authors": [
+    "Slint Developers <info@slint.dev>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\document-features-0.2.12\\LICENSE-APACHE",
+    "licenses\\document-features-0.2.12\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "721e708012254b81760bd2befdae0970e7a2615e"
+    },
+    "path_in_vcs": ""
+  }
+}

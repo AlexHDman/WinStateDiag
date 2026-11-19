@@ -1,0 +1,20 @@
+{
+  "name": "font-types",
+  "version": "0.12.7",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/googlefonts/fontations",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\font-types-0.12.7\\LICENSE-APACHE",
+    "licenses\\font-types-0.12.7\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "ef666662f5985965bbbb726c4f77d15481831a1b"
+    },
+    "path_in_vcs": "font-types"
+  }
+}

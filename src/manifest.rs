@@ -40,6 +40,8 @@
 //!                                         (crash_dump_analysis, additive)
 //!       "result_status"   (group_policy_admx_health, hardware_sensors, additive)
 //!       "provider", "sensor_count"           (hardware_sensors, v0.4.5 additive)
+//!       "health", "coverage", "provider_availability" (hardware_sensors, additive; null for old evidence)
+//!       "result_status" (driver_audit: canonical verdict, including INCOMPLETE)
 //!       "result_status", "incident_count"    (freeze_hang_incidents, v0.4.5 additive)
 //!       "disks": [   (ssd_benchmark, nvme_health, storage_correlation; additive)
 //!         { "disk_key": "<FNV-1a of the physical identity>",
@@ -61,10 +63,41 @@ use crate::ui::sysinfo::LocalTime;
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SCHEMA_VERSION: &str = "1.0";
-pub const PRODUCER: &str = "WinStateDiag";
+pub const PRODUCER: &str = "WinDiag";
 /// The canonical application version (Cargo.toml `[package] version`,
 /// release form "1.0" — see build.rs `display_version`).
 pub const PRODUCER_VERSION: &str = env!("WSD_DISPLAY_VERSION");
+
+/// Hash the running binary once, not a caller-supplied sidecar. Failure is null.
+fn binary_sha256() -> Option<&'static str> {
+    #[cfg(all(windows, not(test)))]
+    {
+        static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        HASH.get_or_init(|| {
+            let path = std::env::current_exe()
+                .ok()?
+                .to_string_lossy()
+                .replace('\'', "''");
+            let script = format!(
+                "(Get-FileHash -LiteralPath '{path}' -Algorithm SHA256 -ErrorAction Stop).Hash"
+            );
+            let value = crate::ps_exec::run_powershell(
+                "powershell.exe",
+                &script,
+                std::time::Duration::from_secs(10),
+            )
+            .ok()?;
+            let value = value.trim();
+            (value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| value.to_ascii_uppercase())
+        })
+        .as_deref()
+    }
+    #[cfg(any(not(windows), test))]
+    {
+        None
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ManifestContext {
@@ -417,7 +450,12 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             .copied()
             .filter(|n| module_of(n) == Some(m))
             .collect();
-        if files.is_empty() {
+        let interrupted = entries
+            .iter()
+            .find(|e| e.name == "Session_Execution.json")
+            .and_then(|e| json_field(&e.bytes, &["failed_module"]))
+            .is_some_and(|name| name == module_name(m));
+        if files.is_empty() && !interrupted {
             continue;
         }
         let completed = files.iter().any(|n| !n.contains(USER_CANCELLED));
@@ -425,7 +463,13 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             format!("      \"name\": {}", json::string(module_name(m))),
             format!(
                 "      \"status\": {}",
-                json::string(if completed { "completed" } else { "cancelled" })
+                json::string(if interrupted {
+                    "failed"
+                } else if completed {
+                    "completed"
+                } else {
+                    "cancelled"
+                })
             ),
             format!("      \"evidence\": {}", str_list(&files, "      ")),
         ];
@@ -454,6 +498,26 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             str_list(&latest, "      ")
         ));
         if m == EvidenceModule::Expc {
+            let execution = entries
+                .iter()
+                .filter(|e| latest.contains(&e.name.as_str()))
+                .find_map(|e| json_field(&e.bytes, &["ExecutionStatus"]))
+                .unwrap_or_else(|| if completed { "UNKNOWN" } else { "CANCELLED" }.into());
+            fields.push(format!(
+                "      \"execution_status\": {}",
+                json::string(&execution)
+            ));
+            for (field, source) in [
+                ("coverage_status", "CoverageStatus"),
+                ("findings_status", "FindingsStatus"),
+            ] {
+                let value = entries
+                    .iter()
+                    .filter(|e| latest.contains(&e.name.as_str()))
+                    .find_map(|e| json_field(&e.bytes, &[source]))
+                    .unwrap_or_else(|| "UNKNOWN".into());
+                fields.push(format!("      \"{field}\": {}", json::string(&value)));
+            }
             let run = deep_checks::from_evidence_files(
                 entries
                     .iter()
@@ -590,6 +654,11 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
                     )
                 })
                 .collect();
+            if m == EvidenceModule::NvmeHealth && disks.is_empty() {
+                fields[1] = "      \"status\": \"incomplete\"".into();
+                fields.push("      \"result_status\": \"NO_DATA\"".into());
+                fields.push("      \"reason\": \"No identifiable disk evidence; collection completion is not disk health\"".into());
+            }
             fields.push(if disks.is_empty() {
                 "      \"disks\": []".into()
             } else {
@@ -635,6 +704,7 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
         if matches!(
             m,
             EvidenceModule::GroupPolicyAdmx
+                | EvidenceModule::DriverAudit
                 | EvidenceModule::HardwareSensors
                 | EvidenceModule::FreezeIncidents
                 | EvidenceModule::EventEvidence
@@ -645,7 +715,16 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
                 .filter(|n| n.ends_with(".json"))
                 .find_map(|n| entries.iter().find(|e| e.name == *n));
             let status = newest
-                .and_then(|e| json_field(&e.bytes, &["status"]))
+                .and_then(|e| {
+                    json_field(
+                        &e.bytes,
+                        &[if m == EvidenceModule::DriverAudit {
+                            "verdict"
+                        } else {
+                            "status"
+                        }],
+                    )
+                })
                 .map(|v| json::string(&v))
                 .unwrap_or_else(|| "null".into());
             fields.push(format!("      \"result_status\": {status}"));
@@ -660,6 +739,18 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
                     .unwrap_or_else(|| "null".into());
                 fields.push(format!("      \"provider\": {provider}"));
                 fields.push(format!("      \"sensor_count\": {count}"));
+                for axis in [
+                    "health",
+                    "coverage",
+                    "provider_availability",
+                    "failure_reason",
+                ] {
+                    let value = newest
+                        .and_then(|e| json_field(&e.bytes, &[axis]))
+                        .map(|v| json::string(&v))
+                        .unwrap_or_else(|| "null".into());
+                    fields.push(format!("      {}: {value}", json::string(axis)));
+                }
             }
             if m == EvidenceModule::EventEvidence {
                 let count = newest
@@ -692,6 +783,14 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
     ));
     out.push_str(&format!("  \"producer\": {},\n", json::string(PRODUCER)));
     out.push_str(&format!(
+        "  \"producer_commit\": {},\n  \"build_source_dirty\": {},\n  \"build_exe_sha256\": {},\n",
+        json::string(env!("WSD_PRODUCER_COMMIT")),
+        json::string(env!("WSD_SOURCE_DIRTY")),
+        binary_sha256()
+            .map(json::string)
+            .unwrap_or_else(|| "null".into())
+    ));
+    out.push_str(&format!(
         "  \"producer_version\": {},\n",
         json::string(&ctx.producer_version)
     ));
@@ -723,6 +822,46 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             json::string(hw)
         ));
     }
+    let repairs: Vec<_> = entries
+        .iter()
+        .filter(|e| e.name.starts_with("Repair_") && e.name.ends_with(".json"))
+        .map(|e| {
+            format!(
+                "{{\"source_file\":{},\"status\":{},\"check\":{}}}",
+                json::string(&e.name),
+                json::string(
+                    &json_field(&e.bytes, &["status"]).unwrap_or_else(|| "UNKNOWN".into())
+                ),
+                json::string(&json_field(&e.bytes, &["check"]).unwrap_or_default())
+            )
+        })
+        .collect();
+    out.push_str(&format!("  \"repairs\": [{}],\n", repairs.join(",")));
+    if !repairs.is_empty() {
+        out.push_str("  \"current_assessment_source\": \"State_Summary.json\",\n  \"expc_evidence_scope\": \"original_diagnostic; subsequent checks are in Repair_*.json\",\n");
+    }
+    let execution = entries
+        .iter()
+        .find(|e| e.name == "State_Summary.json")
+        .and_then(|e| json_field(&e.bytes, &["execution_status"]))
+        .unwrap_or_else(|| "NOT_STARTED".into());
+    out.push_str(&format!(
+        "  \"execution_status\": {},\n",
+        json::string(&execution)
+    ));
+    for field in [
+        "coverage_status",
+        "findings_status",
+        "repair_status",
+        "packaging_status",
+    ] {
+        let value = entries
+            .iter()
+            .find(|e| e.name == "State_Summary.json")
+            .and_then(|e| json_field(&e.bytes, &[field]))
+            .unwrap_or_else(|| "UNKNOWN".into());
+        out.push_str(&format!("  \"{field}\": {},\n", json::string(&value)));
+    }
     if modules.is_empty() {
         out.push_str("  \"modules\": [],\n");
     } else {
@@ -731,6 +870,36 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
             modules.join(",\n")
         ));
     }
+    let servicing: Vec<_> = entries
+        .iter()
+        .filter(|e| e.name.starts_with("WindowsServicingLogs/") && e.name.ends_with("/Result.json"))
+        .map(|e| {
+            let status = json_field(&e.bytes, &["status"]).unwrap_or_else(|| "UNKNOWN".into());
+            format!(
+                "{{\"metadata\":{},\"status\":{}}}",
+                json::string(&e.name),
+                json::string(&status)
+            )
+        })
+        .collect();
+    out.push_str(&format!(
+        "  \"windows_servicing_logs\": [{}],\n",
+        servicing.join(",")
+    ));
+    let history_metadata = entries
+        .iter()
+        .find(|e| e.name == "StorageHistory_Export.json")
+        .and_then(|e| std::str::from_utf8(&e.bytes).ok())
+        .filter(|s| matches!(json::parse(s), Some(json::Value::Obj(_))));
+    let history_fallback = if names.contains(&"WinStateDiagStorageHistory.json") {
+        "{\"status\":\"INCLUDED\",\"archive_entry\":\"WinStateDiagStorageHistory.json\"}"
+    } else {
+        "{\"status\":\"NOT_EXPORTED\",\"reason\":\"No storage history snapshot or source observation was supplied to manifest\"}"
+    };
+    out.push_str(&format!(
+        "  \"storage_history\": {},\n",
+        history_metadata.unwrap_or(history_fallback)
+    ));
     out.push_str(&format!(
         "  \"shared_files\": {}\n",
         str_list(&shared, "  ")
@@ -742,6 +911,26 @@ pub fn build(ctx: &ManifestContext, entries: &[EvidenceFile]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase06_empty_nvme_is_not_health_and_provenance_is_explicit() {
+        let files = vec![EvidenceFile::new(
+            "NVMe_Health_19.10.26_10-00.json",
+            br#"{"status":"COMPLETED","disks":[]}"#.to_vec(),
+        )];
+        let v = parsed(&build(&ctx(), &files));
+        let modules = v.get("modules").unwrap().as_arr().unwrap();
+        let nvme = modules
+            .iter()
+            .find(|m| s(m, "name") == "nvme_health")
+            .unwrap();
+        assert_eq!(s(nvme, "status"), "incomplete");
+        assert_eq!(s(nvme, "result_status"), "NO_DATA");
+        assert!(s(nvme, "reason").contains("No identifiable disk evidence"));
+        assert_eq!(s(&v, "producer_commit"), env!("WSD_PRODUCER_COMMIT"));
+        assert!(v.get("build_source_dirty").is_some());
+        assert!(matches!(v.get("build_exe_sha256"), Some(Value::Null)));
+    }
     use crate::deep_checks::json::{self as j, Value};
 
     fn ctx() -> ManifestContext {
@@ -811,14 +1000,13 @@ mod tests {
         let lock = include_str!("../Cargo.lock").replace("\r\n", "\n");
         let package = toml.split("[dependencies]").next().unwrap();
         assert!(package.contains("name = \"win_state_diag\""));
-        assert!(package.contains("\nversion = \"1.1.0\"\n"), "{package}");
-        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"1.1.0\"\n"));
-        // v1.1: displayed / manifest / folder version is "1.1".
-        assert_eq!(PRODUCER_VERSION, "1.1");
-        assert_eq!(crate::APP_VERSION, "1.1");
+        assert!(package.contains("\nversion = \"1.12.0\"\n"), "{package}");
+        assert!(lock.contains("name = \"win_state_diag\"\nversion = \"1.12.0\"\n"));
+        assert_eq!(PRODUCER_VERSION, "1.12");
+        assert_eq!(crate::APP_VERSION, "1.12");
         let main = include_str!("lib.rs").replace("\r\n", "\n");
         assert!(main.contains("pub const APP_VERSION: &str = env!(\"WSD_DISPLAY_VERSION\");"));
-        assert!(main.contains("format!(\"WinStateDiag — v{APP_VERSION}\")"));
+        assert!(main.contains("format!(\"EXPC WinDiag — v{APP_VERSION}\")"));
         let build = include_str!("../build.rs");
         assert!(build.contains("res.set(\"FileVersion\", &display);"));
         assert!(build.contains("res.set(\"ProductVersion\", &display);"));
@@ -834,7 +1022,7 @@ mod tests {
         );
         let release = include_str!("../scripts/make_release.ps1");
         assert!(release.contains("Join-Path $root 'Cargo.toml'"));
-        assert!(release.contains("\"WinStateDiag-v$version\""));
+        assert!(release.contains("\"WinDiag-v$version\""));
     }
 
     #[test]
@@ -843,7 +1031,7 @@ mod tests {
         assert!(!bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "no BOM");
         let v = parsed(&bytes);
         assert_eq!(s(&v, "schema_version"), "1.0");
-        assert_eq!(s(&v, "producer"), "WinStateDiag");
+        assert_eq!(s(&v, "producer"), "WinDiag");
         assert_eq!(s(&v, "producer_version"), PRODUCER_VERSION);
         assert_eq!(s(&v, "package"), "Алексей - MSI - 28-09-26.zip");
         assert_eq!(s(&v, "computer_name"), "MSI");
@@ -1202,6 +1390,10 @@ mod tests {
         let f = |n: &str, b: &str| EvidenceFile::new(n, b.as_bytes().to_vec());
         let files = vec![
             f(
+                "DriverAudit_19-10-26_12-00-00.json",
+                "{\"verdict\":\"INCOMPLETE\",\"overall\":\"INCOMPLETE\"}",
+            ),
+            f(
                 "CrashDump_Dump_04.10.26_10-00_01_100326-10421-01.dmp",
                 "MDMP",
             ),
@@ -1221,7 +1413,7 @@ mod tests {
             f("GroupPolicy_ADMX_Health_04.10.26_10-01.txt", "x"),
             f(
                 "Hardware_Sensors_04.10.26_10-02.json",
-                "{\"status\": \"PARTIAL\", \"provider\": \"nvidia-smi\", \"sensor_count\": 7}",
+                "{\"status\": \"PARTIAL\", \"provider\": \"nvidia-smi\", \"sensor_count\": 7, \"health\": \"NOT TESTED\", \"coverage\": \"PARTIAL\", \"provider_availability\": \"AVAILABLE\"}",
             ),
         ];
         let v = parsed(&build(&ctx(), &files));
@@ -1234,6 +1426,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{n}"))
         };
         let crash = m("crash_dump_analysis");
+        assert_eq!(s(m("driver_audit"), "result_status"), "INCOMPLETE");
         assert_eq!(crash.get("dump_count"), Some(&Value::Num(1.0)));
         assert_eq!(crash.get("analyzed_count"), Some(&Value::Num(1.0)));
         assert_eq!(s(crash, "analysis_status"), "TIMED_OUT", "newest summary");
@@ -1256,6 +1449,9 @@ mod tests {
         assert_eq!(s(hs, "result_status"), "PARTIAL");
         assert_eq!(s(hs, "provider"), "nvidia-smi");
         assert_eq!(hs.get("sensor_count"), Some(&Value::Num(7.0)));
+        assert_eq!(s(hs, "health"), "NOT TESTED");
+        assert_eq!(s(hs, "coverage"), "PARTIAL");
+        assert_eq!(s(hs, "provider_availability"), "AVAILABLE");
         assert_eq!(names(hs, "latest_evidence").len(), 1);
         // Hardware_Sensors_* is not mistaken for the Hardware Report.
         assert!(names(hs, "evidence")[0].starts_with("Hardware_Sensors_"));

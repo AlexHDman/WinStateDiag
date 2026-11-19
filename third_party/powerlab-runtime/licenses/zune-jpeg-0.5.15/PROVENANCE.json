@@ -1,0 +1,23 @@
+{
+  "name": "zune-jpeg",
+  "version": "0.5.15",
+  "license": "MIT OR Apache-2.0 OR Zlib",
+  "repository": "https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg",
+  "authors": [
+    "caleb <etemesicaleb@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\zune-jpeg-0.5.15\\LICENSE-APACHE",
+    "licenses\\zune-jpeg-0.5.15\\LICENSE-MIT",
+    "licenses\\zune-jpeg-0.5.15\\LICENSE-ZLIB"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "31d81fed7551c8ccea456d9d8e2b1fd8bebb6995"
+    },
+    "path_in_vcs": "crates/zune-jpeg"
+  }
+}

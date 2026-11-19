@@ -117,7 +117,15 @@ mod imp {
     }
 
     pub fn current_version_value(name: &str) -> Option<String> {
-        let key = wide("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+        registry_string("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", name)
+    }
+
+    pub fn system_manufacturer() -> Option<String> {
+        registry_string("HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemManufacturer")
+    }
+
+    fn registry_string(key: &str, name: &str) -> Option<String> {
+        let key = wide(key);
         let val = wide(name);
         let mut buf = vec![0u16; 256];
         let mut len = (buf.len() * 2) as u32;
@@ -179,6 +187,10 @@ mod imp {
         }
     }
     pub fn current_version_value(_name: &str) -> Option<String> {
+        None
+    }
+
+    pub fn system_manufacturer() -> Option<String> {
         None
     }
     pub fn current_version_dword(_name: &str) -> Option<u32> {
@@ -247,6 +259,12 @@ pub fn format_full_build(build: &str, ubr: Option<u32>) -> String {
 
 /// v0.4.0 footer / manifest: ("Windows 11 Pro", "26200.7462"). The plain
 /// build of `windows_edition_and_build` stays unchanged for its other users.
+pub fn system_manufacturer() -> String {
+    imp::system_manufacturer()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "UnknownManufacturer".into())
+}
+
 pub fn windows_edition_and_full_build() -> (String, String) {
     let (product, build) = windows_edition_and_build();
     let full = format_full_build(&build, imp::current_version_dword("UBR"));

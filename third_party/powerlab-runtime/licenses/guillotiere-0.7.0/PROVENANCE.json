@@ -1,0 +1,22 @@
+{
+  "name": "guillotiere",
+  "version": "0.7.0",
+  "license": "MIT/Apache-2.0",
+  "repository": "https://github.com/nical/guillotiere",
+  "authors": [
+    "Nicolas Silva <nical@fastmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\guillotiere-0.7.0\\LICENSE-APACHE",
+    "licenses\\guillotiere-0.7.0\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "11f558ba8a2c80c23e6adb5934d73b352d81eee8"
+    },
+    "path_in_vcs": ""
+  }
+}

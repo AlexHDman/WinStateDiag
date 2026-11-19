@@ -69,6 +69,25 @@ pub fn draw(
     // v0.4.4: common header (title, Start, page tabs, RU/EN, EXPC) and two
     // pages. Existing cards are reused unchanged, placed by origin shift.
     draw_header(ui, o, vm);
+    let about_rect = Rect::from_min_size(o + vec2(390., 8.), vec2(150., 27.));
+    if paint::button(
+        ui,
+        about_rect,
+        "about_header",
+        if vm.lang == crate::i18n::Language::Ru {
+            "О программе"
+        } else {
+            "About"
+        },
+        ButtonKind::Secondary,
+        true,
+        ButtonIcon::None,
+        t::BUTTON_TEXT_SMALL,
+    )
+    .clicked()
+    {
+        actions.push(Action::About);
+    }
     draw_language_switch(ui, o, vm, actions);
     draw_start(ui, o, vm, actions);
     super::pages::draw_tabs(ui, o, vm, actions);
@@ -78,17 +97,27 @@ pub fn draw(
     let shift = |s: [f32; 2]| o + vec2(s[0], s[1]);
     match vm.page {
         Page::Diagnostics => {
-            draw_client(ui, o, vm, ctl, actions);
-            draw_diagnostic(ui, o, vm, ctl);
-            draw_crypto(ui, o, vm, actions);
-            draw_drivers(ui, shift(l::DIAG_DRIVERS_SHIFT), vm, actions);
-            super::pages::draw_passport(ui, o, vm);
-            super::pages::draw_gpo_compact(ui, o, vm, actions);
+            // v1.1 UI contract, page A: the computer passport first, then
+            // client / CryptoPro / EXPC mode / drivers, the journal, and
+            // Group Policy at the bottom (cards unchanged, origin-shifted).
+            let top = shift(l::DIAG_TOP_GROUP_SHIFT);
+            super::pages::draw_passport_actions(ui, shift(l::DIAG_PASSPORT_SHIFT), vm, actions);
+            draw_client(ui, top, vm, ctl, actions);
+            draw_diagnostic(ui, top, vm, ctl);
+            draw_crypto(ui, top, vm, actions);
+            draw_drivers(
+                ui,
+                top + vec2(l::DIAG_DRIVERS_SHIFT[0], l::DIAG_DRIVERS_SHIFT[1]),
+                vm,
+                actions,
+            );
             // v1.0: no idle report block; report actions sit in the journal.
-            super::pages::draw_journal_compact(ui, o, vm, actions);
-            draw_overall(ui, o, vm);
+            super::pages::draw_journal_compact(ui, shift(l::DIAG_JOURNAL_SHIFT), vm, actions);
+            super::pages::draw_gpo_compact(ui, shift(l::DIAG_GPO_SHIFT), vm, actions);
+            draw_overall(ui, o, vm, actions);
             super::pages::draw_stages_table(ui, o, vm, actions);
         }
+        Page::Repair => {}
         Page::Hardware => {
             draw_hardware(ui, shift(l::HW_HARDWARE_SHIFT), vm, ctl, actions);
             super::pages::draw_system_state(ui, o, vm);
@@ -100,7 +129,97 @@ pub fn draw(
             super::pages::draw_crash(ui, o, vm, actions);
         }
     }
+    // v1.1: compact yellow block indices (A1… / B1…) on top of the cards.
+    let p = ui.painter().clone();
+    for (index, rect) in block_index_rects(o, vm.page) {
+        draw_block_index(&p, rect, &index);
+    }
     draw_status_bar(ui, o, vm);
+}
+
+/// v1.1 UI contract: the blocks of a page in reading order (left column
+/// top→bottom, then right column top→bottom) with their card rects in
+/// canvas coordinates (`o` = body origin). Index = position in this list.
+pub fn block_rects(o: Pos2, page: Page) -> Vec<(BlockId, Rect)> {
+    let at = |v: l::R, s: [f32; 2]| r(o + vec2(s[0], s[1]), v);
+    let none = [0.0, 0.0];
+    let top = l::DIAG_TOP_GROUP_SHIFT;
+    let drivers = [
+        top[0] + l::DIAG_DRIVERS_SHIFT[0],
+        top[1] + l::DIAG_DRIVERS_SHIFT[1],
+    ];
+    match page {
+        Page::Diagnostics => vec![
+            (
+                BlockId::Passport,
+                at(l::PASSPORT_CARD, l::DIAG_PASSPORT_SHIFT),
+            ),
+            (BlockId::Client, at(l::CLIENT_CARD, top)),
+            (BlockId::CryptoPro, at(l::CRYPTO_CARD, top)),
+            (BlockId::ExpcMode, at(l::DIAGNOSTIC_CARD, top)),
+            (BlockId::Drivers, at(l::DRIVERS_CARD, drivers)),
+            (
+                BlockId::Journal,
+                at(l::JOURNAL_COMPACT_CARD, l::DIAG_JOURNAL_SHIFT),
+            ),
+            (
+                BlockId::GroupPolicy,
+                at(l::GPO_COMPACT_CARD, l::DIAG_GPO_SHIFT),
+            ),
+            (BlockId::Overall, at(l::OVERALL_CARD, none)),
+            (BlockId::ExpcStages, at(l::STAGE_TABLE_CARD, none)),
+        ],
+        Page::Repair => Vec::new(),
+        Page::Hardware => vec![
+            (
+                BlockId::HardwareReport,
+                at(l::HARDWARE_CARD, l::HW_HARDWARE_SHIFT),
+            ),
+            (BlockId::SystemState, at(l::SYSTEM_STATE_CARD, none)),
+            (BlockId::Sensors, at(l::POWER_CARD, none)),
+            (BlockId::Smart, at(l::SMART_CARD, none)),
+            (BlockId::SsdBenchmark, at(l::SSD_CARD, l::HW_SSD_SHIFT)),
+            (BlockId::CrashAnalyzer, at(l::CRASH_CARD, none)),
+        ],
+    }
+}
+
+/// «A1»… on page A (Диагностика), «B1»… on page B (Оборудование).
+pub fn block_index_rects(o: Pos2, page: Page) -> Vec<(String, Rect)> {
+    let letter = match page {
+        Page::Diagnostics => 'A',
+        Page::Hardware => 'B',
+        Page::Repair => 'C',
+    };
+    block_rects(o, page)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, card))| (format!("{letter}{}", i + 1), card))
+        .collect()
+}
+
+/// The badge rect of a card: on the top border, left aligned.
+pub fn block_index_badge(card: Rect) -> Rect {
+    Rect::from_min_size(
+        egui::pos2(
+            card.left() + l::BLOCK_INDEX_DX,
+            card.top() - l::BLOCK_INDEX_H / 2.0,
+        ),
+        vec2(l::BLOCK_INDEX_W, l::BLOCK_INDEX_H),
+    )
+}
+
+fn draw_block_index(p: &Painter, card: Rect, index: &str) {
+    let badge = block_index_badge(card);
+    paint::text(
+        p,
+        badge.center().x,
+        badge.center().y + t::BLOCK_INDEX.size * 0.36,
+        Align::Center,
+        index,
+        t::BLOCK_INDEX,
+        Color32::from_rgb(174, 157, 81),
+    );
 }
 
 /// Origin of the page body (cards, status bar): the canvas origin moved
@@ -176,10 +295,11 @@ pub(crate) fn lang_button_colors(active: bool) -> (Color32, Color32) {
 /// baked into its pixels; `scripts/key_logo.py` removes only the neutral
 /// checker (every opaque artwork pixel keeps its RGB), keeps the 3:1 aspect
 /// and downsamples alpha-correctly. 545x208 RGBA = 2x the 272.41x104 slot.
-const EXPC_HEADER_LOGO_RGBA: &[u8] = include_bytes!("../../assets/expc-header-logo-full.rgba");
+pub(crate) const EXPC_HEADER_LOGO_RGBA: &[u8] =
+    include_bytes!("../../assets/expc-header-logo-full.rgba");
 pub(crate) const EXPC_HEADER_LOGO_DIM: [usize; 2] = [545, 208];
 
-fn expc_header_logo(ctx: &egui::Context) -> egui::TextureHandle {
+pub(crate) fn expc_header_logo(ctx: &egui::Context) -> egui::TextureHandle {
     let id = egui::Id::new("expc_header_logo");
     if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         return t;
@@ -594,6 +714,44 @@ fn draw_crypto(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>
             c::TEXT_MUTED,
         );
     }
+
+    // v1.1 UI contract: compact CSP status under the name.
+    paint::text(
+        &p,
+        name_x,
+        my(o, l::CRYPTO_CSP_BASELINE),
+        Align::Min,
+        &vm.crypto_csp,
+        fit_style(
+            &p,
+            &vm.crypto_csp,
+            t::SSD_NOTE,
+            name_max + l::CRYPTO_RECHECK_D,
+        ),
+        match vm.crypto_csp_tone {
+            Tone::Idle => c::TEXT_MUTED,
+            tone => super::pages::tone_color(tone),
+        },
+    );
+    // v1.1 UI contract: the round ReHash button next to the HASH state.
+    // It only opens the confirmation; nothing runs before «Да».
+    let rehash = paint::round_glyph_button(
+        ui,
+        mpos(o, l::CRYPTO_REHASH_CENTER[0], l::CRYPTO_REHASH_CENTER[1]),
+        l::CRYPTO_RECHECK_D,
+        "crypto_rehash",
+        vm.crypto_rehash_enabled,
+        "#",
+        c::YELLOW_WARNING,
+    );
+    if rehash.clicked() && vm.crypto_rehash_enabled {
+        actions.push(Action::CryptoRehashRequest);
+    }
+    rehash.on_hover_text(if vm.crypto_rehash_enabled {
+        d.crypto_rehash_round_tip
+    } else {
+        d.crypto_rehash_round_disabled_tip
+    });
 
     // Re-check: a fresh read-only check (never ReHash); only when idle.
     let recheck = paint::round_refresh_button(
@@ -1146,7 +1304,11 @@ fn draw_drivers(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action
                 mx(o, l::DRIVER_NAME_X),
                 row_b(1),
                 Align::Min,
-                d.driver_readonly_note,
+                if vm.drivers_progress.is_empty() {
+                    d.driver_readonly_note
+                } else {
+                    &vm.drivers_progress
+                },
                 t::CAPTION,
                 c::TEXT_MUTED,
             );
@@ -1511,7 +1673,12 @@ fn draw_result(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>
 
 fn draw_start(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
-    let full = r(o, l::START_BUTTON);
+    let tabs = super::pages::page_tab_rects(o, d);
+    let old = r(o, l::START_BUTTON);
+    let full = Rect::from_min_max(
+        egui::pos2(tabs[0].left(), old.top()),
+        egui::pos2(tabs[2].right(), old.bottom()),
+    );
     // While EXPC runs, a compact square Stop button takes the right end of
     // the start button's own slot (no other element moves).
     let rect = if vm.stop_enabled {
@@ -1602,7 +1769,7 @@ fn tone_color(tone: Tone) -> Color32 {
     }
 }
 
-fn draw_overall(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
+fn draw_overall(ui: &mut Ui, o: Pos2, vm: &DashboardVm, actions: &mut Vec<Action>) {
     let d = i18n::t(vm.lang);
     let p = ui.painter().clone();
     let ov = &vm.overall;
@@ -1638,6 +1805,8 @@ fn draw_overall(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
             match tone {
                 Tone::Success => paint::intensity(c::GREEN_SUCCESS, k),
                 Tone::Error => paint::intensity(c::RED_ERROR, k.max(0.8)),
+                // v1.1: a finished run with findings / gaps is amber.
+                Tone::Warning => paint::intensity(c::YELLOW_WARNING, k.max(0.8)),
                 _ => {
                     let base = paint::conic(
                         &[
@@ -1671,120 +1840,69 @@ fn draw_overall(ui: &mut Ui, o: Pos2, vm: &DashboardVm) {
         t::METRIC_LARGE,
         c::TEXT_HEADLINE,
     );
-    paint::text(
+    // A8: the ring contains only the percentage. Text is bounded to its right.
+    let status_rect = mrect(o, 815.0, 166.0, 520.0, 85.0);
+    ui.scope_builder(UiBuilder::new().max_rect(status_rect), |ui| {
+        ui.set_clip_rect(status_rect.intersect(ui.clip_rect()));
+        ui.label(
+            egui::RichText::new(&ov.status_text)
+                .size(21.0)
+                .color(tone_color(ov.tone)),
+        );
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&ov.detail)
+                    .size(15.0)
+                    .color(c::TEXT_SECONDARY),
+            )
+            .wrap(),
+        );
+    });
+    for (i, module) in ov.modules.iter().take(3).enumerate() {
+        let y = 268.0 + i as f32 * 23.0;
+        paint::text_clipped(
+            &p,
+            mx(o, 815.0),
+            my(o, y),
+            290.0,
+            &module.label,
+            t::MUTED,
+            c::TEXT_PRIMARY,
+        );
+        paint::text_clipped(
+            &p,
+            mx(o, 1120.0),
+            my(o, y),
+            215.0,
+            &module.status_text,
+            t::MUTED,
+            if module.state == ModuleState::Error {
+                c::RED_ERROR
+            } else {
+                c::TEXT_SECONDARY
+            },
+        );
+    }
+    paint::text_clipped(
         &p,
-        center.x,
-        my(o, l::OVERALL_STATUS_BASELINE),
-        Align::Center,
-        &ov.status_text,
-        t::RING_STATUS,
-        c::TEXT_PRIMARY,
-    );
-
-    // Time block.
-    paint::icon_clock(&p, r(o, l::TIME_ICON_CLOCK), c::ICON_TIME);
-    paint::icon_hourglass(&p, r(o, l::TIME_ICON_HOURGLASS), c::ICON_TIME);
-    let tx = mx(o, l::TIME_TEXT_X);
-    paint::text(
-        &p,
-        tx,
-        my(o, l::TIME_LABEL_BASELINES[0]),
-        Align::Min,
-        d.overall_elapsed,
-        t::TIME_LABEL,
+        mx(o, 815.0),
+        my(o, 347.0),
+        320.0,
+        &format!(
+            "{} {} · {} {}",
+            d.overall_elapsed, ov.elapsed, d.overall_eta, ov.eta
+        ),
+        t::MUTED,
         c::TEXT_MUTED,
     );
-    paint::text(
-        &p,
-        tx,
-        my(o, l::TIME_VALUE_BASELINES[0]),
-        Align::Min,
-        &ov.elapsed,
-        t::METRIC_SMALL,
-        c::TEXT_PRIMARY,
-    );
-    paint::text(
-        &p,
-        tx,
-        my(o, l::TIME_LABEL_BASELINES[1]),
-        Align::Min,
-        d.overall_eta,
-        t::TIME_LABEL,
-        c::TEXT_SECONDARY,
-    );
-    paint::text(
-        &p,
-        tx,
-        my(o, l::TIME_VALUE_BASELINES[1]),
-        Align::Min,
-        &ov.eta,
-        t::METRIC_SMALL,
-        c::TEXT_PRIMARY,
-    );
-
-    // Modules (inner card inside the same overall card).
-    paint::inner_card(&p, r(o, l::MODULES_CARD));
-    paint::text(
-        &p,
-        mx(o, l::MODULES_TITLE_X),
-        my(o, l::MODULES_TITLE_BASELINE),
-        Align::Min,
-        d.overall_modules_title,
-        t::SECTION_TITLE,
-        c::TEXT_TITLE,
-    );
-    for (i, m) in ov.modules.iter().take(3).enumerate() {
-        let row = mrect(
-            o,
-            l::MODULE_ROW_X,
-            l::MODULE_ROWS_Y[i],
-            l::MODULE_ROW_W,
-            l::MODULE_ROW_H,
-        );
-        let fill = if m.state == ModuleState::Running {
-            c::BG_ROW_ACTIVE_SOFT
-        } else {
-            c::BG_ROW
-        };
-        p.rect_filled(row, CornerRadius::same(l::ROW_RADIUS), fill);
-        let ic = egui::pos2(mx(o, l::MODULE_ICON_CENTER_X), row.center().y);
-        let md = l::MODULE_ICON_DIAMETER;
-        match m.state {
-            ModuleState::Done => paint::icon_check_circle(&p, ic, md, c::GREEN_SUCCESS),
-            ModuleState::Running => paint::icon_radio_active(&p, ic, md, c::BLUE_ACCENT),
-            ModuleState::Pending => paint::icon_ring(&p, ic, md, c::PENDING_MODULE),
-            ModuleState::NotSelected => paint::icon_ring(&p, ic, md, c::RADIO_UNSELECTED),
-            ModuleState::Error => paint::icon_error(&p, ic, md),
-        }
-        let baseline = row.top() + l::MODULE_TEXT_BASELINE_DY;
-        let label_col = if m.state == ModuleState::NotSelected {
-            c::TEXT_MUTED
-        } else {
-            c::TEXT_PRIMARY
-        };
-        paint::text(
-            &p,
-            mx(o, l::MODULE_LABEL_X),
-            baseline,
-            Align::Min,
-            &m.label,
-            t::BODY,
-            label_col,
-        );
-        let status_col = match m.state {
-            ModuleState::Done => c::GREEN_SUCCESS,
-            ModuleState::Running => c::BLUE_STATUS,
-            ModuleState::Error => c::RED_ERROR,
-            ModuleState::Pending | ModuleState::NotSelected => c::TEXT_MUTED,
-        };
-        paint::text(
-            &p,
-            mx(o, l::MODULE_STATUS_RIGHT_X),
-            baseline,
-            Align::Max,
-            &m.status_text,
-            t::MUTED,
-            status_col,
+    if ov.retry_export {
+        ui.scope_builder(
+            UiBuilder::new().max_rect(mrect(o, 1150.0, 325.0, 185.0, 28.0)),
+            |ui| {
+                if ui.button("Повторить экспорт ZIP").clicked() {
+                    actions.push(Action::RetryExport);
+                }
+            },
         );
     }
 }
@@ -2958,6 +3076,99 @@ pub(crate) fn lang_button_rects_for_tests() -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn client_edit_unicode_selection_copy_paste_cut_and_focus() {
+        use egui::{Event, Modifiers, PointerButton, Pos2, Rect, Vec2};
+        let ctx = egui::Context::default();
+        let mut value = String::new();
+        let rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(400.0, 32.0));
+        let frame = |value: &mut String, events: Vec<Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| super::single_line_edit(ui, rect, value, true, "Клиент", "client_name"),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let _ = frame(&mut value, vec![]);
+        for pressed in [true, false] {
+            let _ = frame(
+                &mut value,
+                vec![
+                    Event::PointerMoved(rect.center()),
+                    Event::PointerButton {
+                        pos: rect.center(),
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let focused = ctx.memory(|m| m.focused());
+        assert!(focused.is_some());
+        let _ = frame(&mut value, vec![Event::Text("Alex Алексей ёЁ".into())]);
+        assert_eq!(value, "Alex Алексей ёЁ");
+        let select_all = || Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        };
+        let out = frame(&mut value, vec![select_all(), Event::Copy]);
+        assert!(out.platform_output.commands.iter().any(
+            |c| matches!(c, egui::OutputCommand::CopyText(text) if text == "Alex Алексей ёЁ")
+        ));
+        let _ = frame(&mut value, vec![Event::Paste("VESK-СЕРВЕР".into())]);
+        assert_eq!(value, "VESK-СЕРВЕР");
+        let out = frame(&mut value, vec![select_all(), Event::Cut]);
+        assert_eq!(value, "");
+        assert!(
+            out.platform_output
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text == "VESK-СЕРВЕР"))
+        );
+        let _ = frame(&mut value, vec![Event::Paste("AlexHDman".into())]);
+        for _ in 0..10 {
+            let _ = frame(&mut value, vec![]);
+        }
+        assert_eq!(value, "AlexHDman");
+        assert_eq!(ctx.memory(|m| m.focused()), focused);
+    }
+
+    #[test]
+    fn phase06_index_is_text_only_without_badge() {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::install(&ctx);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            super::draw_block_index(
+                ui.painter(),
+                egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(300.0, 200.0)),
+                "A1",
+            );
+        });
+        out.textures_delta.clear();
+        assert!(
+            !out.shapes
+                .iter()
+                .any(|s| matches!(s.shape, egui::Shape::Rect(_)))
+        );
+        assert!(
+            out.shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "A1"))
+        );
+    }
+    #[test]
     fn hardware_report_gold_runner_stays_on_the_button_border() {
         let b = Rect::from_min_size(egui::pos2(10.0, 20.0), vec2(150.0, 40.0));
         for phase in [0.0, 0.3, 0.77, 0.99] {
@@ -2994,6 +3205,7 @@ mod tests {
                 result_text: String::new(),
                 short_finding: String::new(),
                 duration: String::new(),
+                repair_available: false,
             })
             .collect()
     }
@@ -3129,5 +3341,88 @@ mod tests {
         assert_eq!(stage_window_start(&rows(Some(2)), 5), 0);
         assert_eq!(stage_window_start(&rows(Some(7)), 5), 5);
         assert_eq!(stage_window_start(&rows(Some(13)), 5), 9);
+    }
+}
+
+#[cfg(test)]
+mod fieldfix_a8_tests {
+    use super::*;
+    #[test]
+    fn fieldfix_a8_text_is_bounded_outside_ring_at_all_dpi() {
+        for dpi in [1.0, 1.25, 1.5, 2.0] {
+            for (percent, title, detail) in [
+                (
+                    "100%",
+                    "Диагностика завершена",
+                    "Выбранные проверки завершены",
+                ),
+                (
+                    "100%",
+                    "Диагностика завершена",
+                    "Обнаружены замечания · см. результаты проверок",
+                ),
+                (
+                    "100%",
+                    "Диагностика завершена",
+                    "Режим: Основная · глубокие проверки не выбирались",
+                ),
+                (
+                    "100%",
+                    "Диагностика завершена",
+                    "Часть данных недоступна или не поддерживается · см. этапы",
+                ),
+                (
+                    "89%",
+                    "Ошибка формирования отчёта",
+                    "Подробности в журнале · доступен повторный экспорт",
+                ),
+                (
+                    "89%",
+                    "Проверка не выполнена",
+                    "Некоторые проверки не удались · подробности в этапах",
+                ),
+            ] {
+                let ctx = egui::Context::default();
+                crate::ui::fonts::install(&ctx);
+                ctx.set_pixels_per_point(dpi);
+                let mut vm = crate::ui::fixture::master_vm();
+                vm.overall.percent_text = percent.into();
+                vm.overall.status_text = title.into();
+                vm.overall.detail = detail.into();
+                let origin = Pos2::ZERO;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(origin, vec2(1376.0, 1200.0))),
+                        ..Default::default()
+                    },
+                    |ui| draw_overall(ui, origin, &vm, &mut Vec::new()),
+                );
+                output.textures_delta.clear();
+                let status_rect = mrect(origin, 815.0, 166.0, 520.0, 85.0);
+                let ring = Rect::from_center_size(
+                    mpos(origin, l::OVERALL_RING_CENTER[0], l::OVERALL_RING_CENTER[1]),
+                    vec2(
+                        l::OVERALL_RING_OUTER_DIAMETER,
+                        l::OVERALL_RING_OUTER_DIAMETER,
+                    ),
+                );
+                assert!(!status_rect.intersects(ring));
+                let mut found = 0;
+                for shape in output.shapes {
+                    if let egui::Shape::Text(text) = shape.shape {
+                        if text.galley.text() == title || text.galley.text() == detail {
+                            found += 1;
+                            let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                            assert!(!bounds.intersects(ring), "{dpi} {title}");
+                            assert!(
+                                status_rect.contains_rect(bounds),
+                                "text clipped at {dpi}: {bounds:?}"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(found, 2);
+            }
+        }
     }
 }

@@ -1,0 +1,22 @@
+{
+  "name": "range-alloc",
+  "version": "0.1.5",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/gfx-rs/range-alloc",
+  "authors": [
+    "the gfx-rs Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\range-alloc-0.1.5\\LICENSE.APACHE",
+    "licenses\\range-alloc-0.1.5\\LICENSE.MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "34a5b93f04850e25315f87841d2555f2c0e0ed80"
+    },
+    "path_in_vcs": ""
+  }
+}

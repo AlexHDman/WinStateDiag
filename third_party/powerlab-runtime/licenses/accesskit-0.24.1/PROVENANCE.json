@@ -1,0 +1,21 @@
+{
+  "name": "accesskit",
+  "version": "0.24.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/AccessKit/accesskit",
+  "authors": [
+    "The AccessKit contributors"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": "Apache-2.0",
+  "license_files": [
+    "licenses\\accesskit-0.24.1\\LICENSE-APACHE"
+  ],
+  "provenance_note": "crate omits license text; standard Apache-2.0 text from resolved registry package; upstream identity/authors below",
+  "vcs": {
+    "git": {
+      "sha1": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969"
+    },
+    "path_in_vcs": "common"
+  }
+}

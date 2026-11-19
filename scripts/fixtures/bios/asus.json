@@ -1,0 +1,233 @@
+{
+  "Status": "SUCCESS",
+  "Result": {
+    "Model": "PRIME B760-PLUS D4",
+    "Obj": [
+      {
+        "Name": "BIOS",
+        "Files": [
+          {
+            "Version": "1836",
+            "ReleaseDate": "2026/05/26",
+            "IsRelease": "1",
+            "Title": "",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1836.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1825",
+            "ReleaseDate": "2025/11/04",
+            "IsRelease": "1",
+            "Title": "",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1825.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1820",
+            "ReleaseDate": "2025/05/27",
+            "IsRelease": "1",
+            "Title": "",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1820.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1805",
+            "ReleaseDate": "2024/11/22",
+            "IsRelease": "1",
+            "Title": "",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1805.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1666",
+            "ReleaseDate": "2024/09/30",
+            "IsRelease": "0",
+            "Title": "",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1666.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1663",
+            "ReleaseDate": "2024/08/15",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1663",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1663.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1661",
+            "ReleaseDate": "2024/07/11",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1661",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1661.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1658",
+            "ReleaseDate": "2024/05/31",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1658",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1658.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1656",
+            "ReleaseDate": "2024/04/19",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1656",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1656.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1646",
+            "ReleaseDate": "2024/03/27",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1646",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1646.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1641",
+            "ReleaseDate": "2024/02/22",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1641",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1641.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1612",
+            "ReleaseDate": "2024/02/05",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1612",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/MB/BIOS/PRIME-B760-PLUS-D4-ASUS-1612.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1604",
+            "ReleaseDate": "2023/12/28",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1604",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1604.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1601",
+            "ReleaseDate": "2023/12/13",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1601",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1601.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1402",
+            "ReleaseDate": "2023/09/18",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1402",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1402.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1220",
+            "ReleaseDate": "2023/08/18",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1220",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1220.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1205",
+            "ReleaseDate": "2023/07/06",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1205",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1205.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1030",
+            "ReleaseDate": "2023/06/21",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1030",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1030.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "1002",
+            "ReleaseDate": "2023/05/05",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 1002",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-1002.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "0810",
+            "ReleaseDate": "2023/03/15",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 0810",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-0810.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "0807",
+            "ReleaseDate": "2022/12/19",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 0807",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-0807.zip",
+              "China": null
+            }
+          },
+          {
+            "Version": "0402",
+            "ReleaseDate": "2022/10/25",
+            "IsRelease": "1",
+            "Title": "PRIME B760-PLUS D4 BIOS 0402",
+            "DownloadUrl": {
+              "Global": "/pub/ASUS/mb/BIOS/PRIME-B760-PLUS-D4-ASUS-0402.zip",
+              "China": null
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

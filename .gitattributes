@@ -1,0 +1,6 @@
+# Preserve byte-identical runtime resources and third-party inputs.
+assets/** -text
+embedded/** -text
+licenses/** -text
+third_party/** -text
+scripts/fixtures/** -text

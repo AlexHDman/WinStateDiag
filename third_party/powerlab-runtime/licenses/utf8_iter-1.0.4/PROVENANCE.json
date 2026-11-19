@@ -1,0 +1,23 @@
+{
+  "name": "utf8_iter",
+  "version": "1.0.4",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/hsivonen/utf8_iter",
+  "authors": [
+    "Henri Sivonen <hsivonen@hsivonen.fi>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\utf8_iter-1.0.4\\COPYRIGHT",
+    "licenses\\utf8_iter-1.0.4\\LICENSE-APACHE",
+    "licenses\\utf8_iter-1.0.4\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "6b604ea2365bd535fb66eb4bfe92a9e00e333090"
+    },
+    "path_in_vcs": ""
+  }
+}

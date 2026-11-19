@@ -142,6 +142,7 @@ impl WinStateDiagApp {
                 product_code: "{50F91F80-D397-437C-B0C8-62128DE3B55E}".into(),
                 license: cryptopro::LicenseKey::Installed {
                     masked: "5050Z-*****".into(),
+                    full: cryptopro::SerialKey::new("5050Z-QA000-QA000-QA000-QA000"),
                 },
                 term: cryptopro::LicenseTerm::NotDetermined,
             }),
@@ -156,7 +157,8 @@ impl WinStateDiagApp {
         });
         self.crypto_checked = Some(qa_stamp(CheckOrigin::Preflight, "2026-10-13 16:05:09"));
         self.crypto_rehash_confirm = confirm;
-        self.crypto_details_open = true;
+        // v1.1: the confirmation is its own window (from the card button).
+        self.crypto_details_open = !confirm;
     }
 
     /// v1.0 QA: the three NVMe disks of the reference machine as physical
@@ -417,6 +419,7 @@ pub(super) fn qa_summary(
 
 fn qa_snapshot() -> sensors::Snapshot {
     sensors::Snapshot {
+        hardware_metadata: None,
         captured_at: "2026-10-06T11:00:00".into(),
         samples: 10,
         interval_ms: 1000,
@@ -834,14 +837,18 @@ mod polish_tests {
         let d = i18n::t(Language::Ru);
         let mut last = 0;
         for t in [
-            d.crash_sec_state,
-            d.crash_sec_found,
-            d.crash_sec_incidents,
-            d.crash_sec_cause,
-            d.crash_sec_why,
-            d.crash_sec_check,
+            "Краткий итог",
+            "Найденные события",
+            "Последний подтверждённый инцидент",
+            "История",
+            "LiveKernelReports",
+            "Технические детали",
+            "Рекомендации",
         ] {
-            let at = shown.find(t).unwrap_or_else(|| panic!("{t} in {shown}"));
+            let at = last
+                + shown[last..]
+                    .find(t)
+                    .unwrap_or_else(|| panic!("{t} in {shown}"));
             assert!(at >= last, "section order: {t}");
             last = at;
         }
@@ -855,8 +862,11 @@ mod polish_tests {
             "WinDbg technical data stays collapsed by default"
         );
         assert!(
-            shown.contains("SYMBOL_NAME: RvNetMP60+2572"),
-            "why lines shown"
+            !shown.contains("SYMBOL_NAME: RvNetMP60+2572")
+                && app
+                    .crash_details_text()
+                    .contains("SYMBOL_NAME: RvNetMP60+2572"),
+            "technical evidence is retained in export, not repeated in summary"
         );
     }
 

@@ -1,0 +1,1 @@
+Synthetic repair eligibility and localized VSS writer fixtures. Names, identifiers and data are generated test vectors. No client report or archive data is included. Original private field fixtures remain preserved locally outside the publication manifest.

@@ -1,0 +1,22 @@
+{
+  "name": "smallvec",
+  "version": "1.16.3",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/servo/rust-smallvec",
+  "authors": [
+    "The Servo Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\smallvec-1.16.3\\LICENSE-APACHE",
+    "licenses\\smallvec-1.16.3\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "bb9e44b68571e28e88196dcdb11fab89f3df5a0a"
+    },
+    "path_in_vcs": ""
+  }
+}

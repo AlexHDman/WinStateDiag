@@ -1,0 +1,20 @@
+{
+  "name": "kurbo",
+  "version": "0.13.1",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/linebender/kurbo",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\kurbo-0.13.1\\LICENSE-APACHE",
+    "licenses\\kurbo-0.13.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "838b69ef35f3381cefc007d86aa8364f5a6dc673"
+    },
+    "path_in_vcs": "kurbo"
+  }
+}

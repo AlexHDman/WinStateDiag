@@ -1,0 +1,9 @@
+[package]
+name="powerlab-core"
+version="0.3.0"
+edition="2021"
+license="proprietary"
+publish=false
+[lib]
+name="powerlab_core"
+path="src/lib.rs"

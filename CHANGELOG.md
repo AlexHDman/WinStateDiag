@@ -1,3 +1,9 @@
+# WinDiag 1.12
+
+- Offline dark and light client posters with A4 preview and Windows printing.
+- ZIP-based AI report with session key handling and regional access status.
+- Smaller single-file package with deduplicated embedded data.
+
 # Changelog
 
 ## [1.1] - unreleased - v1.1 Final Integration

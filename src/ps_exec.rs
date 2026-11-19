@@ -3,6 +3,8 @@
 //! own process tree, with a hard time limit (v0.4.4).
 
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -26,8 +28,12 @@ impl std::fmt::Display for RunError {
 
 /// `-EncodedCommand` payload: base64 of the UTF-16LE script.
 pub fn encoded_command(script: &str) -> String {
-    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64_bytes(&bytes)
+}
+
+fn base64_bytes(bytes: &[u8]) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [
@@ -185,6 +191,35 @@ pub fn run_powershell(host: &str, script: &str, timeout: Duration) -> Result<Str
     run_capture(cmd, timeout).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
+/// Large embedded support scripts remain inside the immutable executable; gzip
+/// keeps the Windows command line bounded, without executing a mutable .ps1.
+pub fn compact_command(script: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut zip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    zip.write_all(format!("{PS_PRELUDE}{script}").as_bytes())
+        .map_err(|e| e.to_string())?;
+    let data = base64_bytes(&zip.finish().map_err(|e| e.to_string())?);
+    let command = format!(
+        "$b=[Convert]::FromBase64String('{data}');$m=[IO.MemoryStream]::new($b);$z=[IO.Compression.GZipStream]::new($m,[IO.Compression.CompressionMode]::Decompress);$r=[IO.StreamReader]::new($z,[Text.Encoding]::UTF8);try {{$s=$r.ReadToEnd()}} finally {{$r.Dispose();$z.Dispose();$m.Dispose()}};& ([scriptblock]::Create($s))"
+    );
+    if command.len() > 28000 {
+        return Err("Hardware support command exceeds Windows limit".into());
+    }
+    Ok(command)
+}
+pub fn run_powershell_compact(
+    host: &str,
+    script: &str,
+    timeout: Duration,
+) -> Result<String, RunError> {
+    let mut command = Command::new(host);
+    command
+        .env_remove("PSModulePath")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(compact_command(script).map_err(RunError::Spawn)?);
+    run_capture(command, timeout).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 /// The line after `marker` in a collector's output (collectors print one
 /// `MARKER <json>` line so stray host output never breaks parsing).
 pub fn marked_line<'a>(stdout: &'a str, marker: &str) -> Option<&'a str> {
@@ -203,6 +238,87 @@ pub fn test_host() -> Option<String> {
     } else {
         std::env::var("WSD_PWSH").ok()
     }
+}
+
+/// Hardware readers finish their current transaction on EOF. Never force-kill a
+/// protected read; a named interlock in the reader prevents another reader.
+pub fn run_powershell_hardware(
+    host: &str,
+    script: &str,
+    timeout: Duration,
+) -> Result<String, RunError> {
+    use std::io::Write;
+    let mut cmd = Command::new(host);
+    cmd.env_remove("PSModulePath")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(compact_command(script).map_err(RunError::Spawn)?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x09000000);
+    }
+    let spawned = cmd.spawn();
+    #[cfg(windows)]
+    let spawned = match spawned {
+        Err(e) if e.raw_os_error() == Some(5) => {
+            // An enclosing job refuses breakaway: reduce capabilities, never
+            // bypass containment or run protected I/O in a killable worker.
+            cmd.env("WSD_HARDWARE_RESTRICTED", "1")
+                .creation_flags(0x08000000);
+            cmd.spawn()
+        }
+        other => other,
+    };
+    let mut child = spawned.map_err(|e| RunError::Spawn(e.to_string()))?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| RunError::Io("missing reader stdin".into()))?;
+    input
+        .write_all(b"start\n")
+        .map_err(|e| RunError::Io(e.to_string()))?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| RunError::Io("missing reader stdout".into()))?;
+    let errpipe = child.stderr.take();
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(pipe) = errpipe {
+            let _ = pipe.take(65536).read_to_end(&mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = output.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes);
+        let status = child.wait().and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "hardware reader exit {s}; {}",
+                    errors.join().unwrap_or_default()
+                )))
+            }
+        });
+
+        let result = if bytes.len() > 8 * 1024 * 1024 {
+            Err(RunError::Io("sensor output cap exceeded".into()))
+        } else {
+            read.and(status)
+                .map(|_| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|e| RunError::Io(e.to_string()))
+        };
+        let _ = tx.send(result);
+    });
+    let result = rx.recv_timeout(timeout).unwrap_or(Err(RunError::TimedOut));
+    drop(input); // EOF requests cooperative stop, including when the GUI is closed.
+    result
 }
 
 #[cfg(test)]

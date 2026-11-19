@@ -15,12 +15,50 @@ pub struct Passport {
     pub board: String,
     /// v1.0: `Win32_BIOS.SMBIOSBIOSVersion` (+ release date when reported).
     pub bios: String,
+    pub bios_identity: crate::bios::Identity,
     /// v1.0 item 34: on-board (soldered) LPDDR — the number of SMBIOS
     /// memory devices (channels/packages), never shown as "N×module".
     pub ram_onboard_devices: Option<usize>,
 }
 
 impl Passport {
+    /// Compact UI only; `bios` retains the original vendor for Details/export.
+    pub fn bios_display(&self) -> String {
+        if !self.bios_identity.version.is_empty() || !self.bios_identity.date.is_empty() {
+            return self
+                .bios_identity
+                .display(crate::bios::confirmed_public(&self.bios_identity).as_deref());
+        }
+        let mut raw = self.bios.trim();
+        for maker in [
+            "American Megatrends International, LLC.",
+            "American Megatrends International LLC.",
+            "American Megatrends International, LLC",
+            "American Megatrends International LLC",
+            "American Megatrends Inc.",
+            "American Megatrends",
+            "AMI",
+        ] {
+            if let Some(v) = raw.strip_prefix(maker)
+                && (v.is_empty() || v.starts_with(char::is_whitespace))
+            {
+                raw = v.trim();
+                break;
+            }
+        }
+        let mut id = crate::bios::Identity {
+            version: raw.into(),
+            ..Default::default()
+        };
+        if let Some((v, date)) = raw.rsplit_once(" (")
+            && let Some(date) = date.strip_suffix(')')
+            && crate::bios::date_display(date).is_some()
+        {
+            id.version = v.into();
+            id.date = date.into();
+        }
+        id.display(None)
+    }
     /// RAM line with the localised on-board LPDDR topology suffix.
     pub fn ram_text(&self, ru: bool) -> String {
         match (self.ram.is_empty(), self.ram_onboard_devices) {
@@ -36,14 +74,19 @@ pub const MARKER: &str = "WSD_PASSPORT ";
 /// Read-only collector. Emits one `WSD_PASSPORT {json}` line.
 pub const COLLECTOR_PS1: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
-$os = Get-CimInstance Win32_OperatingSystem
+$os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-$cpu = @(Get-CimInstance Win32_Processor)
-$mem = @(Get-CimInstance Win32_PhysicalMemory)
-$bb = Get-CimInstance Win32_BaseBoard
-$bios = Get-CimInstance Win32_BIOS | Select-Object -First 1
+$cpu = @(Get-CimInstance Win32_Processor -OperationTimeoutSec 3)
+$mem = @(Get-CimInstance Win32_PhysicalMemory -OperationTimeoutSec 3)
+$bb = Get-CimInstance Win32_BaseBoard -OperationTimeoutSec 3
+$bios = Get-CimInstance Win32_BIOS -OperationTimeoutSec 3 | Select-Object -First 1
+$cs = Get-CimInstance Win32_ComputerSystem -OperationTimeoutSec 3 | Select-Object -First 1
 $biosDate = ''
-try { if ($bios.ReleaseDate) { $biosDate = ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } } catch { }
+# Raw DMTF keeps the BIOS calendar date; never round-trip through local/UTC time.
+try { $biosDate = [string](Get-WmiObject Win32_BIOS -ErrorAction Stop | Select-Object -First 1).ReleaseDate } catch { }
+if (!$biosDate) { try { $biosDate = [string](Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS' -ErrorAction Stop).BIOSReleaseDate } catch { } }
+$biosFull = (@([string]$bios.Version) + @($bios.BIOSVersion) | Where-Object { $_ }) -join ' | '
+
 $mods = New-Object System.Collections.Generic.List[object]
 foreach ($m in $mem) {
   $mods.Add([ordered]@{
@@ -64,9 +107,16 @@ $o = [ordered]@{
   threads = [int](($cpu | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
   mem = $mods.ToArray()
   total = [double]$os.TotalVisibleMemorySize
+  system_maker = [string]$cs.Manufacturer
+  system_model = [string]$cs.Model
+  system_sku = [string]$cs.SystemSKUNumber
+  mobile = ([int]$cs.PCSystemType -eq 2)
+  board_revision = [string]$bb.Version
+  bios_full = $biosFull
   board_maker = [string]$bb.Manufacturer
   board = [string]$bb.Product
   bios = [string]$bios.SMBIOSBIOSVersion
+  bios_maker = [string]$bios.Manufacturer
   bios_date = $biosDate
 }
 'WSD_PASSPORT ' + ($o | ConvertTo-Json -Compress -Depth 4)
@@ -106,16 +156,26 @@ pub fn is_onboard_lpddr(code: i64) -> bool {
 /// "32 GB DDR5-6000 (2×16 GB)": total, type and configured speed when the
 /// modules report them, module layout when there are several.
 pub fn format_ram(modules: &[(f64, i64, i64)], visible_kib: f64) -> String {
-    let total: f64 = modules.iter().map(|m| m.0).sum();
-    let total = if total > 0.0 {
-        total
+    let listed: f64 = modules.iter().map(|m| m.0).sum();
+    let visible = visible_kib * 1024.0;
+    // v1.1 RC (KNOWN_BUGS X79G): Windows sees materially more memory than
+    // the SMBIOS module list adds up to → the module list is incomplete.
+    // The total is then the OS-visible size (a lower bound), never the
+    // module sum, and the list is marked incomplete (no module invented).
+    let incomplete = listed > 0.0 && visible > listed * 1.05;
+    let total = if incomplete || listed <= 0.0 {
+        visible
     } else {
-        visible_kib * 1024.0
+        listed
     };
     if total <= 0.0 {
         return String::new();
     }
-    let mut s = gib(total);
+    let mut s = if incomplete {
+        format!("≥{}", gib(total))
+    } else {
+        gib(total)
+    };
     let ty = modules.iter().find_map(|m| memory_type_name(m.1));
     let speed = modules.iter().map(|m| m.2).filter(|v| *v > 0).min();
     match (ty, speed) {
@@ -136,6 +196,13 @@ pub fn format_ram(modules: &[(f64, i64, i64)], visible_kib: f64) -> String {
                 .collect();
             s.push_str(&format!(" ({} GB)", parts.join("+")));
         }
+    }
+    if incomplete {
+        s.push_str(&format!(
+            " · SMBIOS: {}× = {} — incomplete module list",
+            modules.len(),
+            gib(listed)
+        ));
     }
     s
 }
@@ -202,6 +269,10 @@ pub fn parse_output(stdout: &str) -> Option<Passport> {
             crate::ui::sysinfo::format_full_build(&build, (ubr > 0).then_some(ubr))
         ));
     }
+    let arch = s("arch");
+    if !arch.is_empty() {
+        windows.push_str(&format!(" · {arch}"));
+    }
     let mut cpu = s("cpu");
     let cores = n(v.get("cores")) as u32;
     let threads = n(v.get("threads")) as u32;
@@ -244,9 +315,13 @@ pub fn parse_output(stdout: &str) -> Option<Passport> {
         .any(|m| is_onboard_lpddr(m.1))
         .then_some(modules.len());
     let mut bios = s("bios");
+    let bios_maker = s("bios_maker");
+    if !bios_maker.is_empty() {
+        bios = format!("{bios_maker} {bios}").trim().to_string();
+    }
     let bios_date = s("bios_date");
-    if !bios.is_empty() && !bios_date.is_empty() {
-        bios.push_str(&format!(" ({bios_date})"));
+    if !bios_date.is_empty() {
+        bios = format!("{bios} ({bios_date})").trim().to_string();
     }
     Some(Passport {
         windows,
@@ -255,15 +330,18 @@ pub fn parse_output(stdout: &str) -> Option<Passport> {
         board,
         bios,
         ram_onboard_devices,
+        bios_identity: crate::bios::Identity::from_passport(&v),
     })
 }
 
-/// Runs the collector (Windows: powershell.exe), 60 s guard.
+/// Hard process-tree deadline; individual CIM queries also have a time limit.
+pub const COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Runs the collector on a worker (Windows: hidden powershell.exe).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn collect(host: &str) -> Result<Passport, String> {
-    let out =
-        crate::ps_exec::run_powershell(host, COLLECTOR_PS1, std::time::Duration::from_secs(60))
-            .map_err(|e| e.to_string())?;
+    let out = crate::ps_exec::run_powershell(host, COLLECTOR_PS1, COLLECT_TIMEOUT)
+        .map_err(|e| e.to_string())?;
     parse_output(&out).ok_or_else(|| "passport collector produced no result".into())
 }
 
@@ -287,13 +365,72 @@ pub fn client_clipboard_text(client: &str, computer: &str, ru: bool) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn phase06_ami_is_display_only() {
+        let raw = "American Megatrends International LLC 1.23 (2026-01-02)";
+        let p = Passport {
+            bios: raw.into(),
+            ..Default::default()
+        };
+        assert_eq!(p.bios_display(), "1.23 (02.01.2026)");
+        assert_eq!(p.bios, raw);
+        let other = Passport {
+            bios: "LENOVO 1.5".into(),
+            ..Default::default()
+        };
+        assert_eq!(other.bios_display(), "LENOVO 1.5 (дата неизвестна)");
+        for vendor in [
+            "American Megatrends International, LLC.",
+            "American Megatrends International, LLC",
+            "American Megatrends Inc.",
+            "American Megatrends",
+            "AMI",
+        ] {
+            let raw = format!("{vendor} 1.AE0 (2026-06-24)");
+            let p = Passport {
+                bios: raw.clone(),
+                ..Default::default()
+            };
+            assert_eq!(p.bios_display(), "1.AE0 (24.06.2026)");
+            assert_eq!(p.bios, raw);
+        }
+    }
+
+    #[test]
+    fn phase05_bios_identity_arch_and_missing_fields() {
+        let out = MSI.replace("\"board\":", "\"bios_maker\":\"American Megatrends\",\"bios\":\"1.23\",\"bios_date\":\"2026-01-02\",\"board\":");
+        let p = parse_output(&out).unwrap();
+        assert_eq!(p.bios, "American Megatrends 1.23 (2026-01-02)");
+        assert!(p.windows.ends_with("64-bit"));
+        let partial = parse_output(r#"WSD_PASSPORT {"bios_date":"2026-01-02"}"#).unwrap();
+        assert_eq!(partial.bios, "(2026-01-02)");
+        assert!(partial.cpu.is_empty() && partial.ram.is_empty());
+        assert_eq!(COLLECT_TIMEOUT, std::time::Duration::from_secs(20));
+        assert_eq!(COLLECTOR_PS1.matches("-OperationTimeoutSec 3").count(), 6);
+    }
+
+    #[test]
+    fn phase05_timeout_stops_owned_collector_without_waiting_for_sleep() {
+        let Some(host) = crate::ps_exec::test_host() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let result = crate::ps_exec::run_powershell(
+            &host,
+            "Start-Sleep -Seconds 30",
+            std::time::Duration::from_millis(200),
+        );
+        assert_eq!(result, Err(crate::ps_exec::RunError::TimedOut));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
     const MSI: &str = r#"noise
 WSD_PASSPORT {"caption":"Microsoft Windows 11 Pro","display":"25H2","build":"26200","ubr":6584,"arch":"64-bit","cpu":"Intel(R) Core(TM) i7-14700K   ","cores":20,"threads":28,"mem":[{"cap":17179869184,"type":34,"speed":6000,"rated":6400},{"cap":17179869184,"type":34,"speed":6000,"rated":6400}],"total":33275904,"board_maker":"Micro-Star International Co., Ltd.","board":"PRO Z790-P WIFI (MS-7E06)"}"#;
 
     #[test]
     fn parses_windows_cpu_ram_and_board_only() {
         let p = parse_output(MSI).expect("parsed");
-        assert_eq!(p.windows, "Windows 11 Pro 25H2 (26200.6584)");
+        assert_eq!(p.windows, "Windows 11 Pro 25H2 (26200.6584) · 64-bit");
         let ru = MSI.replace("Microsoft Windows", "Майкрософт Windows");
         assert_eq!(
             parse_output(&ru).unwrap().windows,
@@ -321,6 +458,17 @@ WSD_PASSPORT {"caption":"Microsoft Windows 11 Pro","display":"25H2","build":"262
         assert_eq!(memory_type_name(34), Some("DDR5"));
         assert_eq!(memory_type_name(2), None);
         assert_eq!(format_ram(&[], 16_000_000.0), "15.3 GB");
+        // v1.1 RC X79G: 2×4 GB listed, ~16 GB visible → incomplete list.
+        let g = 1024f64.powi(3);
+        let x79 = format_ram(&[(4.0 * g, 24, 1600), (4.0 * g, 24, 1600)], 16_700_000.0);
+        assert!(x79.starts_with('≥'), "{x79}");
+        assert!(
+            x79.contains("incomplete module list") && x79.contains("2×"),
+            "{x79}"
+        );
+        // Normal: visible slightly below the module sum → module total.
+        let ok = format_ram(&[(8.0 * g, 26, 3200), (8.0 * g, 26, 3200)], 16_600_000.0);
+        assert!(ok.starts_with("16") && !ok.contains("incomplete"), "{ok}");
     }
 
     #[test]

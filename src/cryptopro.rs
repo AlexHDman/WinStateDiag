@@ -84,6 +84,56 @@ pub fn detect(roots: &[PathBuf]) -> Detection {
     }
 }
 
+/// v1.1 RC: detection that agrees with the registry inventory. A CSP
+/// installed outside `<ProgramFiles*>\Crypto Pro\CSP` is looked up in its
+/// Uninstall `InstallLocation`; when the inventory says "installed" but no
+/// folder is found, the result is a CHECK ERROR (verifier not found), never
+/// "not installed" next to "installed". Read-only.
+pub fn detect_consistent(
+    roots: &[PathBuf],
+    install_location: Option<PathBuf>,
+    inventory_installed: bool,
+) -> Detection {
+    let det = detect(roots);
+    if det != Detection::NotInstalled {
+        return det;
+    }
+    if let Some(dir) = install_location.filter(|d| !d.as_os_str().is_empty()) {
+        let exe = dir.join("cpverify.exe");
+        if exe.is_file() {
+            return Detection::Installed(exe);
+        }
+        if inventory_installed || dir.is_dir() {
+            return Detection::NoVerifier(dir);
+        }
+    }
+    if inventory_installed {
+        return Detection::NoVerifier(PathBuf::from("<InstallLocation не указан>"));
+    }
+    Detection::NotInstalled
+}
+
+/// `InstallLocation` of the CryptoPro CSP Uninstall entry (read-only).
+pub fn install_location(reg: &dyn RegistryView) -> Option<PathBuf> {
+    for root in UNINSTALL_ROOTS {
+        for key in reg.subkeys(root) {
+            let path = format!("{root}\\{key}");
+            let Some(name) = reg.string(&path, "DisplayName") else {
+                continue;
+            };
+            if !is_csp_name(&name) {
+                continue;
+            }
+            return reg
+                .string(&path, "InstallLocation")
+                .map(|l| l.trim().trim_matches('"').to_string())
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from);
+        }
+    }
+    None
+}
+
 /// `%ProgramW6432%`, `%ProgramFiles%`, `%ProgramFiles(x86)%` (deduplicated).
 pub fn program_files_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -315,6 +365,11 @@ pub trait RegistryView {
     fn subkeys(&self, path: &str) -> Vec<String>;
     /// A REG_SZ value of `path` under HKLM.
     fn string(&self, path: &str, name: &str) -> Option<String>;
+    /// v1.1: like [`string`], but a read failure other than "not found"
+    /// (e.g. access denied) is an error, never an absent value.
+    fn string_checked(&self, path: &str, name: &str) -> Result<Option<String>, String> {
+        Ok(self.string(path, name))
+    }
 }
 
 pub const UNINSTALL_ROOTS: [&str; 2] = [
@@ -324,15 +379,42 @@ pub const UNINSTALL_ROOTS: [&str; 2] = [
 const INSTALLER_PRODUCTS: &str =
     "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products";
 
+/// v1.1 UI contract: the full licence serial, held in memory for the
+/// CryptoPro Details window (display + exact Copy) only. It has no
+/// `Display`, and `Debug` is redacted, so it cannot slip into a journal
+/// line, a log or diagnostic evidence by formatting; those use `masked`.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct SerialKey(String);
+
+impl SerialKey {
+    pub fn new(serial: &str) -> Self {
+        SerialKey(serial.trim().to_string())
+    }
+    /// The exact key as read from the registry (Details window / Copy).
+    pub fn reveal(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SerialKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SerialKey(<redacted>)")
+    }
+}
+
 /// Licence key installed for the CSP product.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LicenseKey {
-    /// A serial number is registered; only its first group is kept
-    /// (`5050Z-*****`) — the full key never enters journal or evidence.
+    /// A serial number is registered. `masked` (`5050Z-*****`) is the only
+    /// form that enters journal or evidence; `full` is shown in Details.
     Installed {
         masked: String,
+        full: SerialKey,
     },
     NotFound,
+    /// v1.1: the registry value could not be read (e.g. access denied) —
+    /// never reported as "not found".
+    Unreadable(String),
 }
 
 /// Licence term. Windows CryptoPro CSP has no documented read-only source
@@ -376,8 +458,9 @@ impl Inventory {
             p.version.clone()
         };
         let license = match &p.license {
-            LicenseKey::Installed { masked } => format!("ключ установлен ({masked})"),
+            LicenseKey::Installed { masked, .. } => format!("ключ установлен ({masked})"),
             LicenseKey::NotFound => "ключ в реестре не найден".to_string(),
+            LicenseKey::Unreadable(e) => format!("ключ не прочитан ({e})"),
         };
         vec![
             format!("[INFO] CryptoPro CSP обнаружен: {version}."),
@@ -439,17 +522,20 @@ pub fn inventory(reg: &dyn RegistryView) -> Inventory {
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let serial = packed_product_code(&key).and_then(|packed| {
-                reg.string(
+            let serial = match packed_product_code(&key) {
+                Some(packed) => reg.string_checked(
                     &format!("{INSTALLER_PRODUCTS}\\{packed}\\InstallProperties"),
                     "ProductID",
-                )
-            });
-            let license = match serial.filter(|s| !s.trim().is_empty()) {
-                Some(s) => LicenseKey::Installed {
+                ),
+                None => Ok(None),
+            };
+            let license = match serial {
+                Ok(Some(s)) if !s.trim().is_empty() => LicenseKey::Installed {
                     masked: mask_serial(&s),
+                    full: SerialKey::new(&s),
                 },
-                None => LicenseKey::NotFound,
+                Ok(_) => LicenseKey::NotFound,
+                Err(e) => LicenseKey::Unreadable(e),
             };
             return Inventory {
                 product: Some(CspProduct {
@@ -581,6 +667,35 @@ mod winreg {
         let chars = (len as usize / 2).saturating_sub(1).min(buf.len());
         Some(String::from_utf16_lossy(&buf[..chars]))
     }
+
+    /// v1.1: `ERROR_FILE_NOT_FOUND` (2) = absent; any other failure (e.g.
+    /// `ERROR_ACCESS_DENIED` 5) is reported with its code.
+    pub fn string_checked(path: &str, name: &str) -> Result<Option<String>, String> {
+        let p = wide(path);
+        let n = wide(name);
+        let mut buf = vec![0u16; 1024];
+        let mut len = (buf.len() * 2) as u32;
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                p.as_ptr(),
+                n.as_ptr(),
+                RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        match rc {
+            0 => {
+                let chars = (len as usize / 2).saturating_sub(1).min(buf.len());
+                Ok(Some(String::from_utf16_lossy(&buf[..chars])))
+            }
+            2 | 3 => Ok(None),
+            5 => Err("доступ к реестру запрещён (код 5)".into()),
+            other => Err(format!("ошибка чтения реестра (код {other})")),
+        }
+    }
 }
 
 impl RegistryView for SystemRegistry {
@@ -604,6 +719,17 @@ impl RegistryView for SystemRegistry {
         {
             let _ = (path, name);
             None
+        }
+    }
+    fn string_checked(&self, path: &str, name: &str) -> Result<Option<String>, String> {
+        #[cfg(windows)]
+        {
+            winreg::string_checked(path, name)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (path, name);
+            Ok(None)
         }
     }
 }
@@ -851,6 +977,48 @@ mod tests {
         (p.into(), n.into(), v.into())
     }
 
+    /// v1.1 RC: CSP in a non-default folder — the registry says installed,
+    /// so detection never says "not installed" next to it.
+    #[test]
+    fn non_default_install_location_is_detected_or_check_error() {
+        let base = std::env::temp_dir().join(format!("wsd-cp-loc-{}", std::process::id()));
+        let none = base.join("pf");
+        let csp = base.join("D Soft").join("КриптоПро CSP");
+        std::fs::create_dir_all(&csp).unwrap();
+        let u = UNINSTALL_ROOTS[0];
+        let key = format!("{u}\\{{50F91F80-D397-437C-B0C8-62128DE3B55E}}");
+        let reg = FakeReg(vec![
+            entry(&key, "DisplayName", "КриптоПро CSP"),
+            entry(&key, "InstallLocation", &format!("\"{}\"", csp.display())),
+        ]);
+        let loc = install_location(&reg);
+        assert_eq!(loc.as_deref(), Some(csp.as_path()));
+        // Folder present, verifier missing → CHECK ERROR with the folder.
+        let det = detect_consistent(std::slice::from_ref(&none), loc.clone(), true);
+        assert_eq!(det, Detection::NoVerifier(csp.clone()));
+        assert!(matches!(
+            check(&det, &Fake::new(vec![], None)),
+            HashState::CheckError(_)
+        ));
+        // Verifier present → Installed.
+        std::fs::write(csp.join("cpverify.exe"), b"").unwrap();
+        assert_eq!(
+            detect_consistent(std::slice::from_ref(&none), loc, true),
+            Detection::Installed(csp.join("cpverify.exe"))
+        );
+        // Installed per registry, no location at all → CHECK ERROR.
+        assert!(matches!(
+            detect_consistent(std::slice::from_ref(&none), None, true),
+            Detection::NoVerifier(_)
+        ));
+        // Not in the registry and nothing on disk → NOT INSTALLED.
+        assert_eq!(
+            detect_consistent(std::slice::from_ref(&none), None, false),
+            Detection::NotInstalled
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// v1.0: the startup inventory of the real MSI layout — CSP 5.0.13800
     /// under the 64-bit Uninstall key, the browser plug-in next to it, the
     /// licence serial under the packed product code.
@@ -880,9 +1048,13 @@ mod tests {
         assert_eq!(
             p.license,
             LicenseKey::Installed {
-                masked: "5050Z-*****".into()
+                masked: "5050Z-*****".into(),
+                full: SerialKey::new("5050Z-ABCDE-FGHIJ-KLMNO-PQRST"),
             }
         );
+        // v1.1: the full key is in memory for Details only — never in a
+        // journal line or a Debug dump.
+        assert!(!format!("{:?}", p.license).contains("ABCDE"));
         assert_eq!(p.term, LicenseTerm::NotDetermined);
         let j = inv.journal().join("\n");
         assert!(j.contains("5.0.13800"), "{j}");
@@ -969,7 +1141,7 @@ mod tests {
         eprintln!("live CryptoPro inventory: {inv:?}");
         if let Some(p) = &inv.product {
             assert!(is_csp_name(&p.name), "{p:?}");
-            if let LicenseKey::Installed { masked } = &p.license {
+            if let LicenseKey::Installed { masked, .. } = &p.license {
                 assert!(masked.ends_with("-*****"));
             }
         }

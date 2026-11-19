@@ -129,6 +129,10 @@ pub struct Dict {
     pub driver_alert_warning_fmt: &'static str,
     pub driver_alert_warning_note: &'static str,
     pub driver_ok_line_fmt: &'static str,
+    /// v1.1 RC: Driver Audit found nothing but its collection had gaps.
+    pub driver_alert_incomplete_fmt: &'static str,
+    pub driver_alert_incomplete_note: &'static str,
+    pub driver_status_incomplete: &'static str,
 
     // ---- Result ----
     pub result_title: &'static str,
@@ -152,6 +156,10 @@ pub struct Dict {
     pub overall_status_waiting: &'static str,
     pub overall_status_running: &'static str,
     pub overall_status_done: &'static str,
+    /// v1.1: finished, but with findings / incomplete data / a problem.
+    pub overall_status_done_attention: &'static str,
+    pub overall_status_done_partial: &'static str,
+    pub overall_status_done_problem: &'static str,
     pub overall_status_stopped: &'static str,
     pub overall_eta_calculating: &'static str,
     pub overall_modules_title: &'static str,
@@ -263,6 +271,8 @@ pub struct Dict {
     pub state_attention: &'static str,
     pub state_critical: &'static str,
     pub state_no_data: &'static str,
+    /// v1.1 RC: some sources were not read; never shown as OK.
+    pub state_partial: &'static str,
     pub sys_bsod_fmt: &'static str,
     pub sys_driver_problem: &'static str,
     pub system_state_note: &'static str,
@@ -333,6 +343,8 @@ pub struct Dict {
     pub smart_sata_na: &'static str,
     pub crash_title: &'static str,
     pub crash_none: &'static str,
+    /// v1.1 RC: nothing found, but a crash source was not readable.
+    pub crash_incomplete: &'static str,
     pub crash_no_dump: &'static str,
     pub crash_found_fmt: &'static str,
     /// v0.4.5 crash counts, incidents.
@@ -542,6 +554,9 @@ pub struct Dict {
     pub sensors_cpu_note: &'static str,
     pub sensors_cpu_none: &'static str,
     pub gpo_local_short: &'static str,
+    /// v1.1: GPO collection failure / missing rights.
+    pub gpo_error: &'static str,
+    pub gpo_access_denied: &'static str,
     /// v1.0 Disk Benchmark Details window.
     pub disk_details_title: &'static str,
     pub disk_det_identity: &'static str,
@@ -646,6 +661,16 @@ pub struct Dict {
     pub crypto_det_license: &'static str,
     pub crypto_det_license_key_fmt: &'static str,
     pub crypto_det_license_none: &'static str,
+    /// v1.1 UI contract: licence number in Details (full) + Copy.
+    pub crypto_det_license_unreadable_fmt: &'static str,
+    pub crypto_license_copy: &'static str,
+    pub crypto_license_copied: &'static str,
+    pub crypto_card_csp_fmt: &'static str,
+    pub crypto_card_csp_absent: &'static str,
+    pub crypto_card_csp_unknown: &'static str,
+    pub crypto_rehash_round_tip: &'static str,
+    pub crypto_rehash_round_disabled_tip: &'static str,
+    pub crypto_rehash_from_card_note: &'static str,
     pub crypto_det_term: &'static str,
     pub crypto_det_term_unknown: &'static str,
     pub crypto_det_hash: &'static str,
@@ -745,7 +770,7 @@ pub struct Dict {
 }
 
 pub static RU: Dict = Dict {
-    app_title: "WinStateDiag",
+    app_title: "WinDiag",
     header_subtitle: "Диагностический центр состояния Windows",
 
     client_label: "Клиент",
@@ -786,8 +811,8 @@ pub static RU: Dict = Dict {
         "Антивирус и Defender",
         "SFC /verifyonly",
         "DISM /ScanHealth",
-        "CHKDSK /scan",
-        "BIOS, драйверы, микропрограммы",
+        "CHKDSK (только чтение)",
+        "BIOS / Драйверы / Firmware",
     ],
     stage_scope: [
         "Сведения о системе: ожидающая перезагрузка, сборка Windows",
@@ -860,6 +885,9 @@ pub static RU: Dict = Dict {
     driver_alert_warning_fmt: "Есть предупреждения по драйверам ({warnings}).",
     driver_alert_warning_note: "Неисправность не подтверждена; подробности — «Подробнее» и отчёт.",
     driver_ok_line_fmt: "Явных проблем с драйверами не обнаружено (устройств: {devices}).",
+    driver_alert_incomplete_fmt: "Сбор данных о драйверах неполный ({gaps}).",
+    driver_alert_incomplete_note: "Отсутствие находок не подтверждает исправность; подробности — «Подробнее».",
+    driver_status_incomplete: "Неполные данные",
 
     result_title: "РЕЗУЛЬТАТ",
     result_idle: "Диагностика не выполнялась.",
@@ -881,6 +909,9 @@ pub static RU: Dict = Dict {
     overall_status_waiting: "Ожидание",
     overall_status_running: "Выполняется",
     overall_status_done: "Завершено",
+    overall_status_done_attention: "Есть замечания",
+    overall_status_done_partial: "Завершено · покрытие ограничено",
+    overall_status_done_problem: "Проблема",
     overall_status_stopped: "Остановлено",
     overall_eta_calculating: "рассчитывается…",
     overall_modules_title: "Модули диагностики",
@@ -982,6 +1013,7 @@ pub static RU: Dict = Dict {
     state_attention: "ВНИМАНИЕ",
     state_critical: "КРИТИЧНО",
     state_no_data: "нет данных",
+    state_partial: "неполные данные",
     sys_bsod_fmt: "ВНИМАНИЕ — обнаружен BSOD ({n})",
     sys_driver_problem: "ВНИМАНИЕ — проблемы драйверов",
     system_state_note: "«OK» оборудования не означает, что компьютер полностью исправен.",
@@ -992,7 +1024,7 @@ pub static RU: Dict = Dict {
     sensors_ref_dynamic: "динамический",
     sensors_col_name: "Наименование",
     sensors_ref_cpu_gpu_temp: "CPU / GPU T°C",
-    sensors_power_state_label: "Состояние ПИТАНИЯ:",
+    sensors_power_state_label: "Опрос датчиков:",
     sensors_sec_temps: "ТЕМПЕРАТУРЫ",
     sensors_sec_rails: "ПИТАНИЕ",
     sensors_temps: "Температуры",
@@ -1021,7 +1053,7 @@ pub static RU: Dict = Dict {
     sensors_col_conf: "Достоверность",
     sensors_col_device: "Устройство",
     sensors_col_status: "Статус",
-    sensors_session_note: "* Мин/Макс — значения выборки WinStateDiag (около 10 с, без нагрузки), а не за всё время работы оборудования.",
+    sensors_session_note: "* Мин/Макс — значения выборки WinDiag (около 10 с, без нагрузки), а не за всё время работы оборудования.",
     sensors_mismatch: "РАСХОЖДЕНИЕ ИСТОЧНИКОВ",
     sensors_dynamic_note: "Динамические напряжения (Vcore, VID, VCCSA, GPU) — справочно, без оценки по номиналу.",
     sensors_lbl_cpu: "CPU",
@@ -1049,6 +1081,7 @@ pub static RU: Dict = Dict {
     smart_sata_na: "SMART недоступен (SATA): нет данных, не отказ",
     crash_title: "АНАЛИЗ BSOD / ДАМПОВ ПАМЯТИ",
     crash_none: "Голубых экранов не обнаружено",
+    crash_incomplete: "Сбоев не найдено, но часть источников не прочитана",
     crash_no_dump: "BugCheck обнаружен, dump не найден.",
     crash_found_fmt: "BSOD обнаружен · Dump найден · {status}",
     crash_counts_fmt: "Неожиданные выключения: {s} · BugCheck / BSOD: {b} · Дампы: {d}",
@@ -1133,7 +1166,7 @@ pub static RU: Dict = Dict {
     nvme_error_log: "Журнал ошибок контроллера",
     nvme_error_log_read_fmt: "прочитано записей: {n}",
     ssd_retest_note_fmt: "Контрольный повтор: 1-й замер {first}",
-    ssd_retest_waiting_fmt: "Повтор через {s} с",
+    ssd_retest_waiting_fmt: "Повтор через {s} сек",
     ssd_retest_pending: "выполняется",
     ssd_retest_not_run: "не выполнен",
     ssd_runs_note_fmt: "1-й {first}, повтор {second}",
@@ -1149,7 +1182,7 @@ pub static RU: Dict = Dict {
     driver_popup_retry: "Повторить проверку",
     driver_popup_run: "Запустить проверку",
     driver_popup_rerun: "Проверить заново",
-    driver_popup_summary_fmt: "Итог: {status} — проблем: {problems}, предупреждений: {warnings}, без замечаний: {ok}; устройств: {devices}; события за {days} дн.; {generated}",
+    driver_popup_summary_fmt: "Итог: {status} — записи устройств: проблем {problems}, предупреждений {warnings}, без замечаний {ok}; устройств: {devices}; события за {days} дн.; {generated}",
     driver_popup_note: "Статус ставится только по конкретным признакам (ошибка PnP, сбой в модуле драйвера, Code Integrity, отказ загрузки). Возраст драйвера сам по себе не считается проблемой.",
     driver_popup_device_fmt: "Устройство: {device}",
     driver_popup_provider_fmt: "Поставщик драйвера: {provider}; дата: {date}; INF: {inf}; служба: {service}",
@@ -1165,7 +1198,7 @@ pub static RU: Dict = Dict {
     report_not_ready_error: "Итоговый отчёт ещё не создан.",
     hw_journal_saved: "сохранён в отчёт сессии",
     hw_journal_refreshed: "обновлён в отчёте сессии",
-    driver_journal_summary_fmt: "Проверка драйверов: {status} (проблем: {problems}, предупреждений: {warnings})",
+    driver_journal_summary_fmt: "Проверка драйверов: {status} (записи устройств: проблем {problems}, предупреждений {warnings})",
     driver_journal_added_fmt: "Проверка драйверов: данные добавлены в отчёт сессии ({path}).",
     client_field_hint: "необязательно",
     ssd_cancel_button: "Отменить",
@@ -1184,8 +1217,8 @@ pub static RU: Dict = Dict {
     journal_clear_button: "Очистить",
     journal_empty: "Журнал пуст.",
     journal_open_button: "Открыть",
-    journal_report_button: "Отчёт",
-    journal_viewer_title: "Журнал WinStateDiag",
+    journal_report_button: "Отчёт для ИИ",
+    journal_viewer_title: "Журнал WinDiag",
     journal_viewer_save: "Сохранить",
     journal_viewer_copy: "Копировать",
     journal_viewer_close: "Закрыть",
@@ -1194,8 +1227,8 @@ pub static RU: Dict = Dict {
     journal_viewer_copied: "Журнал скопирован в буфер обмена",
     journal_viewer_dropped_fmt: "Более ранние строки не сохранены (ограничение памяти): {count}",
     driver_summary_title: "ИТОГ",
-    driver_sum_problems: "Проблем",
-    driver_sum_warnings: "Предупреждений",
+    driver_sum_problems: "Проблем устройств",
+    driver_sum_warnings: "Предупр. устройств",
     driver_sum_ok: "Проверено без замечаний",
     driver_sum_devices: "Устройств",
     driver_sum_events: "Событий всего",
@@ -1206,7 +1239,7 @@ pub static RU: Dict = Dict {
     driver_copy_issues: "Скопировать ошибки",
     driver_save_issues: "Сохранить ошибки",
     driver_issues_none: "Проблем и предупреждений нет.",
-    driver_export_title: "WinStateDiag — Проверка драйверов",
+    driver_export_title: "WinDiag — Проверка драйверов",
     driver_export_version: "Версия",
     driver_export_provider: "Поставщик",
     driver_export_date: "Дата драйвера",
@@ -1235,6 +1268,8 @@ pub static RU: Dict = Dict {
     sensors_cpu_note: "Высокая загрузка CPU — контекст показаний, а не неисправность. Топ-5 процессов записывается при загрузке от 50 %.",
     sensors_cpu_none: "Снимок процессов не получен.",
     gpo_local_short: "локально",
+    gpo_error: "ОШИБКА",
+    gpo_access_denied: "ДОСТУП ЗАПРЕЩЁН",
     disk_details_title: "ДЕТАЛИ ЗАМЕРА",
     disk_det_identity: "ДИСК",
     disk_det_model: "Модель",
@@ -1308,7 +1343,7 @@ pub static RU: Dict = Dict {
     ],
     expc_result_label: "Результат",
     expc_suggested_action: "Рекомендуемое действие",
-    expc_not_executed: "WinStateDiag не выполняет эту команду автоматически.",
+    expc_not_executed: "WinDiag не выполняет эту команду автоматически.",
     expc_copy_command: "Копировать команду",
     expc_result_pending: "Этап выполнен; результат появится после завершения диагностики EXPC.",
     expc_no_structured: "Этап выполнен; подробности — в текстовом отчёте EXPC.",
@@ -1337,7 +1372,7 @@ pub static RU: Dict = Dict {
             "CHKDSK: проверка пропущена.",
         ],
     ],
-    deep_check_manual_command_fmt: "{check}: команда для ручного выполнения (WinStateDiag её не запускает): {command}",
+    deep_check_manual_command_fmt: "{check}: команда для ручного выполнения (WinDiag её не запускает): {command}",
     journal_report_finalized: "Отчёт проверен: в папке отчёта оставлен только итоговый ZIP.",
     journal_report_finalize_failed_fmt: "Файлы отчёта сохранены без очистки: {error}",
 
@@ -1366,8 +1401,17 @@ pub static RU: Dict = Dict {
     crypto_det_version: "Версия CSP",
     crypto_det_version_unknown: "Не указана",
     crypto_det_license: "Лицензия",
-    crypto_det_license_key_fmt: "Ключ установлен ({key})",
-    crypto_det_license_none: "Ключ в реестре не найден",
+    crypto_det_license_key_fmt: "{key}",
+    crypto_det_license_none: "Номер лицензии не найден в реестре Windows",
+    crypto_det_license_unreadable_fmt: "Номер лицензии не прочитан: {error}",
+    crypto_license_copy: "Скопировать номер лицензии",
+    crypto_license_copied: "Номер лицензии скопирован.",
+    crypto_card_csp_fmt: "CSP {version}",
+    crypto_card_csp_absent: "CSP не установлен",
+    crypto_card_csp_unknown: "CSP: не проверено",
+    crypto_rehash_round_tip: "ReHash: пересчитать эталонные хэши CryptoPro. Нажатие сразу изменяет систему.",
+    crypto_rehash_round_disabled_tip: "ReHash доступен только при NO HASH и не во время проверки",
+    crypto_rehash_from_card_note: "ReHash: кнопка # на карточке запускает изменение системы.",
     crypto_det_term: "Срок действия лицензии",
     crypto_det_term_unknown: "Не определён: в Windows нет документированного источника только для чтения (см. «Управление лицензиями КриптоПро PKI»)",
     crypto_det_hash: "Состояние HASH",
@@ -1467,7 +1511,7 @@ pub static RU: Dict = Dict {
 };
 
 pub static EN: Dict = Dict {
-    app_title: "WinStateDiag",
+    app_title: "WinDiag",
     header_subtitle: "Windows System Diagnostics Center",
 
     client_label: "Client",
@@ -1582,6 +1626,9 @@ pub static EN: Dict = Dict {
     driver_alert_warning_fmt: "There are driver warnings ({warnings}).",
     driver_alert_warning_note: "Not confirmed as a fault; see \"Details\" and the report.",
     driver_ok_line_fmt: "No clear driver problems found (devices scanned: {devices}).",
+    driver_alert_incomplete_fmt: "Driver data collection is incomplete ({gaps}).",
+    driver_alert_incomplete_note: "No findings does not confirm health; see \"Details\".",
+    driver_status_incomplete: "Incomplete data",
 
     result_title: "RESULT",
     result_idle: "Diagnostics has not run yet.",
@@ -1603,6 +1650,9 @@ pub static EN: Dict = Dict {
     overall_status_waiting: "Waiting",
     overall_status_running: "Running",
     overall_status_done: "Completed",
+    overall_status_done_attention: "Findings",
+    overall_status_done_partial: "Completed · limited coverage",
+    overall_status_done_problem: "Problem",
     overall_status_stopped: "Stopped",
     overall_eta_calculating: "calculating…",
     overall_modules_title: "Diagnostic Modules",
@@ -1704,6 +1754,7 @@ pub static EN: Dict = Dict {
     state_attention: "ATTENTION",
     state_critical: "CRITICAL",
     state_no_data: "no data",
+    state_partial: "incomplete data",
     sys_bsod_fmt: "ATTENTION — BSOD detected ({n})",
     sys_driver_problem: "ATTENTION — driver problems",
     system_state_note: "Hardware OK does not mean the whole computer is healthy.",
@@ -1714,7 +1765,7 @@ pub static EN: Dict = Dict {
     sensors_ref_dynamic: "dynamic",
     sensors_col_name: "Name",
     sensors_ref_cpu_gpu_temp: "CPU / GPU T°C",
-    sensors_power_state_label: "POWER state:",
+    sensors_power_state_label: "Sensor sampling:",
     sensors_sec_temps: "TEMPERATURES",
     sensors_sec_rails: "VOLTAGE",
     sensors_temps: "Temperatures",
@@ -1743,7 +1794,7 @@ pub static EN: Dict = Dict {
     sensors_col_conf: "Confidence",
     sensors_col_device: "Device",
     sensors_col_status: "Status",
-    sensors_session_note: "* Min/Max are WinStateDiag session sample values (about 10 s, no load applied), not lifetime hardware values.",
+    sensors_session_note: "* Min/Max are WinDiag session sample values (about 10 s, no load applied), not lifetime hardware values.",
     sensors_mismatch: "SENSOR SOURCE MISMATCH",
     sensors_dynamic_note: "Dynamic voltages (Vcore, VID, VCCSA, GPU) are informational and not rated against a nominal.",
     sensors_lbl_cpu: "CPU",
@@ -1771,6 +1822,7 @@ pub static EN: Dict = Dict {
     smart_sata_na: "SMART not available (SATA): no data, not a failure",
     crash_title: "BSOD / CRASH DUMP ANALYSIS",
     crash_none: "No blue screens detected",
+    crash_incomplete: "No crashes found, but some sources were not readable",
     crash_no_dump: "BugCheck detected, dump not found.",
     crash_found_fmt: "BSOD detected · Dump found · {status}",
     crash_counts_fmt: "Unexpected shutdowns: {s} · BugCheck / BSOD: {b} · Dumps: {d}",
@@ -1906,8 +1958,8 @@ pub static EN: Dict = Dict {
     journal_clear_button: "Clear",
     journal_empty: "Log is empty.",
     journal_open_button: "Open",
-    journal_report_button: "Report",
-    journal_viewer_title: "WinStateDiag Log",
+    journal_report_button: "AI report",
+    journal_viewer_title: "WinDiag Log",
     journal_viewer_save: "Save",
     journal_viewer_copy: "Copy",
     journal_viewer_close: "Close",
@@ -1928,7 +1980,7 @@ pub static EN: Dict = Dict {
     driver_copy_issues: "Copy issues",
     driver_save_issues: "Save issues",
     driver_issues_none: "No problems or warnings.",
-    driver_export_title: "WinStateDiag — Driver Check",
+    driver_export_title: "WinDiag — Driver Check",
     driver_export_version: "Version",
     driver_export_provider: "Provider",
     driver_export_date: "Driver date",
@@ -1957,6 +2009,8 @@ pub static EN: Dict = Dict {
     sensors_cpu_note: "High CPU load is context for the readings, not a fault. The top 5 processes are recorded from 50 % load.",
     sensors_cpu_none: "No process snapshot was taken.",
     gpo_local_short: "local",
+    gpo_error: "ERROR",
+    gpo_access_denied: "ACCESS DENIED",
     disk_details_title: "BENCHMARK DETAILS",
     disk_det_identity: "DISK",
     disk_det_model: "Model",
@@ -2030,7 +2084,7 @@ pub static EN: Dict = Dict {
     ],
     expc_result_label: "Result",
     expc_suggested_action: "Suggested action",
-    expc_not_executed: "WinStateDiag does not run this command automatically.",
+    expc_not_executed: "WinDiag does not run this command automatically.",
     expc_copy_command: "Copy command",
     expc_result_pending: "Stage completed; the result appears when EXPC diagnostics finish.",
     expc_no_structured: "Stage completed; details are in the EXPC TXT report.",
@@ -2059,7 +2113,7 @@ pub static EN: Dict = Dict {
             "CHKDSK: check skipped.",
         ],
     ],
-    deep_check_manual_command_fmt: "{check}: command for manual use (WinStateDiag does not run it): {command}",
+    deep_check_manual_command_fmt: "{check}: command for manual use (WinDiag does not run it): {command}",
     journal_report_finalized: "Report verified: only the final ZIP remains in the report folder.",
     journal_report_finalize_failed_fmt: "Report files kept without cleanup: {error}",
 
@@ -2088,8 +2142,17 @@ pub static EN: Dict = Dict {
     crypto_det_version: "CSP version",
     crypto_det_version_unknown: "Not reported",
     crypto_det_license: "Licence",
-    crypto_det_license_key_fmt: "Key installed ({key})",
-    crypto_det_license_none: "No key found in the registry",
+    crypto_det_license_key_fmt: "{key}",
+    crypto_det_license_none: "Licence number not found in the registry (Installer ProductID)",
+    crypto_det_license_unreadable_fmt: "Licence number not read: {error}",
+    crypto_license_copy: "Copy license number",
+    crypto_license_copied: "Licence number copied.",
+    crypto_card_csp_fmt: "CSP {version}",
+    crypto_card_csp_absent: "CSP not installed",
+    crypto_card_csp_unknown: "CSP: not checked",
+    crypto_rehash_round_tip: "ReHash: recompute the CryptoPro reference hashes. Clicking immediately changes the system.",
+    crypto_rehash_round_disabled_tip: "ReHash is available only at NO HASH and not during a check",
+    crypto_rehash_from_card_note: "ReHash: # on the card starts a system-changing operation.",
     crypto_det_term: "Licence term",
     crypto_det_term_unknown: "Not determined: Windows has no documented read-only source (see the CryptoPro PKI licence manager)",
     crypto_det_hash: "HASH state",
@@ -2198,8 +2261,8 @@ pub fn t(lang: Language) -> &'static Dict {
     }
 }
 
-/// File the language preference is stored in, next to the portable EXE
-/// (never the registry — the app must stay fully portable). Read/write
+/// File within the caller-provided per-user preference directory.
+/// No registry or adjacent-EXE state. Read/write
 /// failures are always non-fatal: a missing or corrupt file just means
 /// "use the default", never a startup error.
 fn pref_path(exe_dir: &std::path::Path) -> std::path::PathBuf {
@@ -2236,7 +2299,7 @@ mod tests {
 
     #[test]
     fn approved_russian_header_strings_match_exactly() {
-        assert_eq!(RU.app_title, "WinStateDiag");
+        assert_eq!(RU.app_title, "WinDiag");
         assert_eq!(
             RU.header_subtitle,
             "Диагностический центр состояния Windows"
@@ -2245,7 +2308,7 @@ mod tests {
 
     #[test]
     fn approved_english_header_strings_match_exactly() {
-        assert_eq!(EN.app_title, "WinStateDiag");
+        assert_eq!(EN.app_title, "WinDiag");
         assert_eq!(EN.header_subtitle, "Windows System Diagnostics Center");
     }
 
@@ -2459,7 +2522,7 @@ mod tests {
             "ETA",
             "EXPC",
             "Windows",
-            "WinStateDiag",
+            "WinDiag",
             "CPU",
             "GPU",
             "ZIP",
@@ -2475,6 +2538,7 @@ mod tests {
             "Defender",
             "Microsoft",
             "BIOS",
+            "Firmware",
             "PnP",
             "VSS",
             "Volsnap",
@@ -2634,15 +2698,15 @@ mod tests {
             (d.journal_title, "Журнал"),
             (d.journal_clear_button, "Очистить"),
             (d.journal_open_button, "Открыть"),
-            (d.journal_viewer_title, "Журнал WinStateDiag"),
+            (d.journal_viewer_title, "Журнал WinDiag"),
             (d.journal_viewer_save, "Сохранить"),
             (d.journal_viewer_copy, "Копировать"),
             (d.journal_viewer_close, "Закрыть"),
             (d.journal_viewer_saved, "Журнал сохранён"),
             (d.journal_viewer_save_failed, "Не удалось сохранить журнал"),
             (d.driver_summary_title, "ИТОГ"),
-            (d.driver_sum_problems, "Проблем"),
-            (d.driver_sum_warnings, "Предупреждений"),
+            (d.driver_sum_problems, "Проблем устройств"),
+            (d.driver_sum_warnings, "Предупр. устройств"),
             (d.driver_sum_ok, "Проверено без замечаний"),
             (d.driver_sum_devices, "Устройств"),
             (d.driver_sum_events, "Событий всего"),
@@ -2732,7 +2796,7 @@ mod tests {
             (d.journal_title, "Log"),
             (d.journal_clear_button, "Clear"),
             (d.journal_open_button, "Open"),
-            (d.journal_viewer_title, "WinStateDiag Log"),
+            (d.journal_viewer_title, "WinDiag Log"),
             (d.journal_viewer_save, "Save"),
             (d.journal_viewer_copy, "Copy"),
             (d.journal_viewer_close, "Close"),

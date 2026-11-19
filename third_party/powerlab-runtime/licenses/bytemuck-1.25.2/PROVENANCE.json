@@ -1,0 +1,23 @@
+{
+  "name": "bytemuck",
+  "version": "1.25.2",
+  "license": "Zlib OR Apache-2.0 OR MIT",
+  "repository": "https://github.com/Lokathor/bytemuck",
+  "authors": [
+    "Lokathor <zefria@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\bytemuck-1.25.2\\LICENSE-APACHE",
+    "licenses\\bytemuck-1.25.2\\LICENSE-MIT",
+    "licenses\\bytemuck-1.25.2\\LICENSE-ZLIB"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "f363643e951a7ac9e4b9921de982f2b0918902e3"
+    },
+    "path_in_vcs": ""
+  }
+}

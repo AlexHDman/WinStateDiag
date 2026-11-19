@@ -20,6 +20,12 @@ pub(crate) struct CryptoDetailRow {
     pub label: String,
     pub value: String,
     pub tone: Tone,
+    /// v1.1: exact text of the row's own [Копировать] button (the full
+    /// licence number); `None` = no button.
+    pub copy: Option<String>,
+    /// v1.1: what the window-wide Copy text uses instead of `value`
+    /// (the masked licence key); `None` = `value`.
+    pub export_value: Option<String>,
 }
 
 impl WinStateDiagApp {
@@ -31,6 +37,8 @@ impl WinStateDiagApp {
             label: label.to_string(),
             value,
             tone,
+            copy: None,
+            export_value: None,
         };
         let busy = self.crypto_rx.is_some();
         let mut rows = Vec::new();
@@ -58,19 +66,30 @@ impl WinStateDiagApp {
                 },
                 Tone::Idle,
             ));
-            rows.push(row(
-                d.crypto_det_license,
-                match &p.license {
-                    cryptopro::LicenseKey::Installed { masked } => {
-                        d.crypto_det_license_key_fmt.replace("{key}", masked)
-                    }
-                    cryptopro::LicenseKey::NotFound => d.crypto_det_license_none.to_string(),
+            // v1.1 UI contract: the full number as read from the registry
+            // (never guessed) with its own exact Copy; the masked form is
+            // what the window-wide Copy text and any journal carry.
+            rows.push(match &p.license {
+                cryptopro::LicenseKey::Installed { masked, full } => CryptoDetailRow {
+                    copy: Some(full.reveal().to_string()),
+                    export_value: Some(masked.clone()),
+                    ..row(
+                        d.crypto_det_license,
+                        d.crypto_det_license_key_fmt.replace("{key}", full.reveal()),
+                        Tone::Idle,
+                    )
                 },
-                match p.license {
-                    cryptopro::LicenseKey::Installed { .. } => Tone::Idle,
-                    cryptopro::LicenseKey::NotFound => Tone::Warning,
-                },
-            ));
+                cryptopro::LicenseKey::NotFound => row(
+                    d.crypto_det_license,
+                    d.crypto_det_license_none.to_string(),
+                    Tone::Warning,
+                ),
+                cryptopro::LicenseKey::Unreadable(e) => row(
+                    d.crypto_det_license,
+                    d.crypto_det_license_unreadable_fmt.replace("{error}", e),
+                    Tone::Warning,
+                ),
+            });
             rows.push(row(
                 d.crypto_det_term,
                 match p.term {
@@ -145,11 +164,13 @@ impl WinStateDiagApp {
     }
 
     /// Copy text of the CryptoPro Details window.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn crypto_details_text(&self) -> String {
         let d = i18n::t(self.language);
         let mut out = format!("{}\r\n", d.crypto_details_title);
         for r in self.crypto_detail_rows() {
-            out.push_str(&format!("{}: {}\r\n", r.label, r.value));
+            let value = r.export_value.as_ref().unwrap_or(&r.value);
+            out.push_str(&format!("{}: {}\r\n", r.label, value));
         }
         out
     }
@@ -163,120 +184,150 @@ impl WinStateDiagApp {
         }
         let d = i18n::t(self.language);
         let rows = self.crypto_detail_rows();
-        let rehash_allowed = self.crypto_rehash_allowed();
-        let confirm = self.crypto_rehash_confirm;
         let status = self.crypto_export_status.as_ref().map(|s| s.text(d));
         let mut open = true;
-        let mut act: Option<DetailsAct> = None;
-        let mut rehash: Option<Action> = None;
+        let mut copy_licence: Option<String> = None;
+        let mut escape = false;
         detail_window(
             ctx,
             "wsd_crypto_details",
             d.crypto_details_title,
-            [640.0, 520.0],
+            [580.0, 390.0],
             &mut open,
             |ui| {
-                details::section_title(ui, d.crypto_details_title);
-                egui::Grid::new("wsd_crypto_rows")
-                    .num_columns(2)
-                    .striped(true)
-                    .spacing(vec2(16.0, 7.0))
+                escape |= ui.input(|i| i.key_pressed(egui::Key::Escape));
+                ui.spacing_mut().item_spacing.y = 2.0;
+                egui::ScrollArea::vertical()
+                    .id_salt("wsd_crypto_rows")
+                    .auto_shrink([false, true])
+                    .max_height(ui.available_height().max(1.0))
                     .show(ui, |ui| {
-                        for r in &rows {
-                            ui.label(RichText::new(&r.label).color(c::TEXT_SECONDARY));
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&r.value)
-                                        .color(crate::ui::pages::tone_color(r.tone)),
-                                )
-                                .wrap(),
-                            );
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(10.0);
-                ui.separator();
-                // ReHash: separate from Copy / Close, behind a warning.
-                if confirm {
-                    egui::Frame::new()
-                        .fill(c::BG_CARD_INNER)
-                        .stroke(egui::Stroke::new(1.0, c::YELLOW_WARNING))
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .inner_margin(egui::Margin::symmetric(12, 10))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(d.crypto_rehash_confirm_title)
-                                    .strong()
-                                    .color(c::YELLOW_WARNING),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(d.crypto_rehash_warning).color(c::TEXT_BODY),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                if details::primary_button(
-                                    ui,
-                                    d.crypto_rehash_confirm_yes,
-                                    rehash_allowed,
-                                )
-                                .clicked()
-                                {
-                                    rehash = Some(Action::CryptoRehashConfirmed);
-                                }
-                                if details::secondary_button(ui, d.confirm_cancel, true).clicked() {
-                                    rehash = Some(Action::CryptoRehashCancelled);
+                        let label_width = (ui.available_width() * 0.34).clamp(90.0, 180.0);
+                        let value_width = (ui.available_width() - label_width - 40.0).max(1.0);
+                        for r in rows.iter().filter(|r| {
+                            r.label != d.crypto_det_term
+                                && r.label != d.crypto_det_last_rehash
+                                && !(r.label == d.crypto_det_errors
+                                    && r.value == d.crypto_det_no_errors)
+                        }) {
+                            ui.horizontal_top(|ui| {
+                                ui.set_min_height(24.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(label_width, 24.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_min_width(label_width);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&r.label).color(c::TEXT_SECONDARY),
+                                            )
+                                            .wrap(),
+                                        );
+                                    },
+                                );
+                                // Fixed label/value/icon columns, including rows without Copy.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(value_width, 24.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_min_width(value_width);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&r.value)
+                                                    .color(crate::ui::pages::tone_color(r.tone)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    },
+                                );
+                                if let Some(exact) = &r.copy {
+                                    let response = ui
+                                        .add(
+                                            egui::Button::new("")
+                                                .frame(false)
+                                                .min_size(egui::vec2(24.0, 24.0)),
+                                        )
+                                        .on_hover_text(d.crypto_license_copy);
+                                    crate::ui::paint::icon_copy(
+                                        ui.painter(),
+                                        response.rect.shrink(3.0),
+                                        c::TEXT_PRIMARY,
+                                    );
+                                    if response.clicked() {
+                                        copy_licence = Some(exact.clone());
+                                    }
                                 }
                             });
-                        });
-                } else {
-                    ui.horizontal(|ui| {
-                        if details::secondary_button(ui, d.crypto_rehash_action, rehash_allowed)
-                            .clicked()
-                        {
-                            rehash = Some(Action::CryptoRehashRequest);
+                            ui.separator();
                         }
-                        if !rehash_allowed {
-                            ui.label(
-                                RichText::new(d.crypto_rehash_only_no_hash).color(c::TEXT_MUTED),
-                            );
+                        if let Some((text, color)) = &status {
+                            ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
                         }
                     });
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if details::secondary_button(ui, d.journal_viewer_copy, true).clicked() {
-                        act = Some(DetailsAct::Copy);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if details::secondary_button(ui, d.journal_viewer_close, true).clicked() {
-                            act = Some(DetailsAct::Close);
-                        }
-                    });
-                });
-                if let Some((text, color)) = &status {
-                    ui.add(egui::Label::new(RichText::new(text).color(*color)).wrap());
-                }
             },
         );
-        match act {
-            Some(DetailsAct::Copy) => {
-                let text = self.crypto_details_text();
-                self.crypto_export_status =
-                    Some(self.export_text(ctx, ExportAction::Copy, "CryptoPro", &text));
-            }
-            Some(DetailsAct::Close) => open = false,
-            _ => {}
+        if let Some(exact) = copy_licence {
+            self.copy_licence_number(ctx, &exact);
         }
-        if let Some(a) = rehash {
-            self.apply(a);
-        }
-        if !open {
+        if !open || escape {
             self.crypto_details_open = false;
-            self.crypto_rehash_confirm = false;
+        }
+    }
+
+    /// v1.1: copies exactly the licence number (no label, no spaces) to
+    /// the clipboard. Nothing is journalled or written to disk.
+    pub(crate) fn copy_licence_number(&mut self, ctx: &egui::Context, exact: &str) {
+        ctx.copy_text(exact.to_string());
+        self.clipboard_out = Some(exact.to_string());
+        self.crypto_export_status = Some(ExportStatus::Copied);
+    }
+
+    /// v1.1 UI contract: the ReHash confirmation opened by the card's round
+    /// button — its own small window with the warning and an explicit
+    /// [Да, выполнить ReHash] / [Отмена]. Nothing runs before the click.
+    pub(crate) fn crypto_rehash_confirm_window(&mut self, ctx: &egui::Context) {
+        if !self.crypto_rehash_confirm {
+            return;
+        }
+        let d = i18n::t(self.language);
+        let allowed = self.crypto_rehash_allowed();
+        let mut open = true;
+        let mut choice: Option<Action> = None;
+        detail_window(
+            ctx,
+            "wsd_crypto_rehash_confirm",
+            d.crypto_rehash_confirm_title,
+            [520.0, 230.0],
+            &mut open,
+            |ui| {
+                ui.label(
+                    RichText::new(d.crypto_rehash_confirm_title)
+                        .strong()
+                        .color(c::YELLOW_WARNING),
+                );
+                ui.add(
+                    egui::Label::new(RichText::new(d.crypto_rehash_warning).color(c::TEXT_BODY))
+                        .wrap(),
+                );
+                if !allowed {
+                    ui.label(RichText::new(d.crypto_rehash_only_no_hash).color(c::TEXT_MUTED));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if details::primary_button(ui, d.crypto_rehash_confirm_yes, allowed).clicked() {
+                        choice = Some(Action::CryptoRehashConfirmed);
+                    }
+                    if details::secondary_button(ui, d.confirm_cancel, true).clicked() {
+                        choice = Some(Action::CryptoRehashCancelled);
+                    }
+                });
+            },
+        );
+        if !open && choice.is_none() {
+            choice = Some(Action::CryptoRehashCancelled);
+        }
+        if let Some(a) = choice {
+            self.apply(a);
         }
     }
 
@@ -409,8 +460,61 @@ pub(crate) enum PassportAct {
 pub(crate) fn passport_value_color(kind: crate::passport2::Kind) -> egui::Color32 {
     match kind {
         crate::passport2::Kind::Config => c::TEXT_PRIMARY,
-        crate::passport2::Kind::Measured => c::GREEN_SUCCESS,
+        crate::passport2::Kind::Attention => c::YELLOW_WARNING,
+        // v1.1 UI contract: a measurement is not a health verdict.
+        crate::passport2::Kind::Measured => c::PASSPORT_MEASURED,
         crate::passport2::Kind::Unconfirmed => c::TEXT_MUTED,
+    }
+}
+
+/// v1.1 UI contract — hardware IDENTITY colour of a passport value: CPU by
+/// vendor (Intel blue / AMD red), RAM violet, board orange, BIOS teal,
+/// Windows green. Identity, never health. `None` = no identity colour.
+pub(crate) fn identity_color(
+    part: crate::passport2::CardKind,
+    value: &str,
+) -> Option<egui::Color32> {
+    use crate::passport2::CardKind;
+    match part {
+        CardKind::Cpu => cpu_vendor_color(value),
+        CardKind::Ram => Some(c::IDENT_RAM),
+        CardKind::Board => Some(c::IDENT_BOARD),
+        CardKind::Bios => Some(c::IDENT_BIOS),
+        _ => None,
+    }
+}
+
+/// Intel blue / AMD red from the CPU name (anything else: no accent).
+pub(crate) fn cpu_vendor_color(value: &str) -> Option<egui::Color32> {
+    let v = value.to_ascii_lowercase();
+    if v.contains("intel") || v.contains("xeon") || v.contains("core(tm)") {
+        Some(c::IDENT_INTEL)
+    } else if v.contains("amd")
+        || v.contains("ryzen")
+        || v.contains("epyc")
+        || v.contains("threadripper")
+    {
+        Some(c::IDENT_AMD)
+    } else {
+        None
+    }
+}
+
+/// Colour of one passport value: unconfirmed stays muted, a measurement
+/// stays neutral, configuration takes its identity colour; an incomplete
+/// inventory is amber (a warning is never shown in an identity colour).
+pub(crate) fn passport_row_color(
+    kind: crate::passport2::Kind,
+    part: crate::passport2::CardKind,
+    value: &str,
+) -> egui::Color32 {
+    use crate::passport2::Kind;
+    if value.contains("incomplete") || value.contains("неполн") {
+        return c::YELLOW_WARNING;
+    }
+    match kind {
+        Kind::Config => identity_color(part, value).unwrap_or(c::TEXT_PRIMARY),
+        _ => passport_value_color(kind),
     }
 }
 
@@ -434,12 +538,13 @@ fn passport_card(ui: &mut egui::Ui, card: &crate::passport2::Card) {
             egui::Grid::new(("wsd_pp_card", card.title.as_str()))
                 .num_columns(2)
                 .min_col_width(width * 0.30)
-                .max_col_width(width * 0.66)
+                .max_col_width(width * 0.46)
                 .spacing(vec2(12.0, 4.0))
                 .show(ui, |ui| {
                     for r in &card.rows {
                         let value = |text: &str| {
-                            let t = RichText::new(text).color(passport_value_color(r.kind));
+                            let t = RichText::new(text)
+                                .color(passport_row_color(r.kind, card.kind, text));
                             if r.kind == Kind::Unconfirmed {
                                 t.italics()
                             } else {
@@ -449,12 +554,23 @@ fn passport_card(ui: &mut egui::Ui, card: &crate::passport2::Card) {
                         match (r.label.is_empty(), r.value.is_empty()) {
                             // A sub-heading (disk / GPU / battery name).
                             (false, true) => {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&r.label).strong().color(c::TEXT_PRIMARY),
-                                    )
-                                    .wrap(),
-                                );
+                                if r.kind == Kind::Config
+                                    && !crate::passport2::is_unconfirmed(&r.label)
+                                {
+                                    crate::ui::paint::copy_value(
+                                        ui,
+                                        &r.label,
+                                        c::TEXT_PRIMARY,
+                                        width * 0.46,
+                                    );
+                                } else {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&r.label).strong().color(c::TEXT_PRIMARY),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
                                 ui.label("");
                             }
                             // A note line under the previous row.
@@ -463,13 +579,36 @@ fn passport_card(ui: &mut egui::Ui, card: &crate::passport2::Card) {
                                 ui.add(egui::Label::new(value(&r.value)).wrap());
                             }
                             (false, false) => {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&r.label).color(c::TEXT_SECONDARY),
-                                    )
-                                    .wrap(),
-                                );
-                                ui.add(egui::Label::new(value(&r.value)).wrap());
+                                if matches!(
+                                    card.kind,
+                                    crate::passport2::CardKind::Storage
+                                        | crate::passport2::CardKind::Network
+                                ) && !crate::passport2::is_unconfirmed(&r.label)
+                                {
+                                    crate::ui::paint::copy_value(
+                                        ui,
+                                        &r.label,
+                                        c::PASSPORT_LABEL,
+                                        width * 0.46,
+                                    );
+                                } else {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&r.label).color(c::PASSPORT_LABEL),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                if r.kind == Kind::Config {
+                                    crate::ui::paint::copy_value(
+                                        ui,
+                                        &r.value,
+                                        passport_row_color(r.kind, card.kind, &r.value),
+                                        width * 0.46,
+                                    );
+                                } else {
+                                    ui.add(egui::Label::new(value(&r.value)).wrap());
+                                }
                             }
                         }
                         ui.end_row();
@@ -489,7 +628,8 @@ pub(crate) fn passport_body(ui: &mut egui::Ui, d: &i18n::Dict, p: &crate::passpo
     );
     ui.label(RichText::new(d.pp_subtitle).color(c::TEXT_SECONDARY));
     if !p.system.is_empty() {
-        ui.add(egui::Label::new(RichText::new(&p.system).color(c::TEXT_PRIMARY)).wrap());
+        // v1.1 UI contract: the Windows identity line in Windows green.
+        ui.add(egui::Label::new(RichText::new(&p.system).color(c::IDENT_WINDOWS)).wrap());
     }
     ui.horizontal_wrapped(|ui| {
         for (text, kind) in [
@@ -652,16 +792,22 @@ impl WinStateDiagApp {
                             );
                         }
                     });
-                let top = ui.cursor().top();
-                act = passport_footer(
-                    ui,
-                    d,
-                    view.as_ref().map(|p| p.collected_at.as_str()),
-                    busy,
-                    view.is_some(),
-                    status.as_ref(),
-                );
-                let used = ui.min_rect().bottom() - top + 8.0;
+                // A later layout pass must not erase a click from the
+                // first pass; apply the selected action once, below.
+                // Measure only the footer, never the enclosing panel's
+                // minimum rectangle (which includes the scroll body).
+                let footer = ui.scope(|ui| {
+                    passport_footer(
+                        ui,
+                        d,
+                        view.as_ref().map(|p| p.collected_at.as_str()),
+                        busy,
+                        view.is_some(),
+                        status.as_ref(),
+                    )
+                });
+                act = footer.inner.or(act);
+                let used = footer.response.rect.height() + 8.0;
                 ui.ctx().data_mut(|m| m.insert_temp(footer_id, used));
             },
         );

@@ -81,6 +81,7 @@ fn tab_events(page: Page, d: &i18n::Dict) -> Vec<Vec<egui::Event>> {
     click_at(match page {
         Page::Diagnostics => rects[0].center(),
         Page::Hardware => rects[1].center(),
+        Page::Repair => rects[2].center(),
     })
 }
 
@@ -130,7 +131,12 @@ fn page_tabs_switch_between_diagnostics_and_hardware() {
         assert!(texts.iter().any(|t| t == d.gpo_row_label));
         // v1.0: report actions live in the journal header; the idle
         // "Диагностика не выполнялась" block is gone.
-        assert!(texts.iter().any(|t| t == d.journal_report_button));
+        assert!(texts.iter().any(|t| t
+            == if lang == Language::Ru {
+                "Отчёт ИИ"
+            } else {
+                "AI report"
+            }));
         assert!(!texts.iter().any(|t| t == d.result_idle));
         // GPO / ADMX is a very small secondary card (title + one line).
         assert!(l::GPO_COMPACT_CARD[3] <= 60.0);
@@ -295,6 +301,7 @@ fn analyze_without_debugger_does_nothing_and_install_is_explicit() {
 
 fn msi_snapshot() -> sensors::Snapshot {
     sensors::Snapshot {
+        hardware_metadata: None,
         captured_at: "2026-10-05T11:00:00".into(),
         samples: 10,
         interval_ms: 1000,
@@ -392,7 +399,7 @@ fn sensor_card_is_compact_and_never_lists_cpu_cores() {
             .filter(|r| !r.label.starts_with('+'))
             .all(|r| r.reference == i18n::RU.sensors_ref_dynamic && r.tone == Tone::Idle)
     );
-    assert_eq!(vm.power_state, "Отлично");
+    assert_eq!(vm.power_state, "Последняя выборка");
     assert_eq!(vm.power.len(), 2, "CPU + GPU only on the dashboard");
     assert!(vm.fans.iter().any(|f| f.value == "1180 RPM"));
     assert!(vm.status_line.contains("LHM: PARTIAL"));
@@ -448,7 +455,12 @@ fn sensor_details_window_has_reference_providers_and_export() {
         "no provider strings on the dashboard"
     );
     assert!(texts.iter().any(|t| t == i18n::RU.sensors_header_units));
-    assert!(texts.iter().any(|t| t == "11.40–12.60 V"));
+    assert!(
+        app.sensors_vm()
+            .refs
+            .iter()
+            .any(|r| r.range == "11.40–12.60 V")
+    ); // Reference remains reachable inside the bounded B3 scroller.
     app.apply(Action::ShowSensorDetails);
     let mut all = Vec::new();
     for _ in 0..3 {

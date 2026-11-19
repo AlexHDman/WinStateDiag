@@ -1,0 +1,21 @@
+{
+  "name": "unicode-general-category",
+  "version": "1.1.0",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/yeslogic/unicode-general-category",
+  "authors": [
+    "YesLogic Pty. Ltd. <info@yeslogic.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\unicode-general-category-1.1.0\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "cb2d8a62f035c33d6971b99322aae65f3cea7c88"
+    },
+    "path_in_vcs": ""
+  }
+}

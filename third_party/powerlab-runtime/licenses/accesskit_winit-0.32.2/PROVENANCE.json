@@ -1,0 +1,21 @@
+{
+  "name": "accesskit_winit",
+  "version": "0.32.2",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/AccessKit/accesskit",
+  "authors": [
+    "The AccessKit contributors"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": "Apache-2.0",
+  "license_files": [
+    "licenses\\accesskit_winit-0.32.2\\LICENSE-APACHE"
+  ],
+  "provenance_note": "crate omits license text; standard Apache-2.0 text from resolved registry package; upstream identity/authors below",
+  "vcs": {
+    "git": {
+      "sha1": "1bbcf100942bac96c2c3a4a91cb67b0b20201a24"
+    },
+    "path_in_vcs": "platforms/winit"
+  }
+}

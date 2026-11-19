@@ -1,0 +1,23 @@
+{
+  "name": "crc32fast",
+  "version": "1.5.2",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/srijs/rust-crc32fast",
+  "authors": [
+    "Sam Rijs <srijs@airpost.net>",
+    "Alex Crichton <alex@alexcrichton.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\crc32fast-1.5.2\\LICENSE-APACHE",
+    "licenses\\crc32fast-1.5.2\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "7eb0b8a2c9b246d27dc4cb5a53d3fc3b43a4bb83"
+    },
+    "path_in_vcs": ""
+  }
+}

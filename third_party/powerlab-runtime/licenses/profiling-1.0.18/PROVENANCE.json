@@ -1,0 +1,21 @@
+{
+  "name": "profiling",
+  "version": "1.0.18",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/aclysma/profiling",
+  "authors": [
+    "Philip Degarmo <aclysma@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": "Apache-2.0",
+  "license_files": [
+    "licenses\\profiling-1.0.18\\LICENSE-APACHE"
+  ],
+  "provenance_note": "crate omits license text; standard Apache-2.0 text from resolved registry package; upstream identity/authors below",
+  "vcs": {
+    "git": {
+      "sha1": "8271551172eb6fa4cba47369aedd93790c623df9"
+    },
+    "path_in_vcs": "profiling"
+  }
+}

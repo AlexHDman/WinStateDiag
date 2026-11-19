@@ -1,0 +1,21 @@
+{
+  "name": "spirv",
+  "version": "0.4.0+sdk-1.4.341.0",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/gfx-rs/rspirv",
+  "authors": [
+    "Lei Zhang <antiagainst@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": "Apache-2.0",
+  "license_files": [
+    "licenses\\spirv-0.4.0+sdk-1.4.341.0\\LICENSE-APACHE"
+  ],
+  "provenance_note": "crate omits license text; standard Apache-2.0 text from resolved registry package; upstream identity/authors below",
+  "vcs": {
+    "git": {
+      "sha1": "8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4"
+    },
+    "path_in_vcs": "spirv"
+  }
+}

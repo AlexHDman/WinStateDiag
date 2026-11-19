@@ -1,0 +1,22 @@
+{
+  "name": "bit-set",
+  "version": "0.10.0",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/contain-rs/bit-set",
+  "authors": [
+    "Alexis Beingessner <a.beingessner@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\bit-set-0.10.0\\LICENSE-APACHE",
+    "licenses\\bit-set-0.10.0\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "2a569e1a5bffaee2c2974bcf070ef4e8ee85550b"
+    },
+    "path_in_vcs": ""
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "half",
+  "version": "2.7.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/VoidStarKat/half-rs",
+  "authors": [
+    "Kathryn Long <squeeself@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\half-2.7.1\\LICENSE-APACHE",
+    "licenses\\half-2.7.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "8cc891f3e4aad956eca7fa79b1f42f87ecd141ae"
+    },
+    "path_in_vcs": ""
+  }
+}

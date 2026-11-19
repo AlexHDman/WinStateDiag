@@ -1,0 +1,20 @@
+{
+  "name": "windows-result",
+  "version": "0.4.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/microsoft/windows-rs",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\windows-result-0.4.1\\license-apache-2.0",
+    "licenses\\windows-result-0.4.1\\license-mit"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "32c3144490c016fe496a0aed769bce60987a2e9d"
+    },
+    "path_in_vcs": "crates/libs/result"
+  }
+}

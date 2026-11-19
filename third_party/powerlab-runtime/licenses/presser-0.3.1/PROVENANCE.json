@@ -1,0 +1,23 @@
+{
+  "name": "presser",
+  "version": "0.3.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/EmbarkStudios/presser",
+  "authors": [
+    "Embark <opensource@embark-studios.com>",
+    "Gray Olson <gray@grayolson.com"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\presser-0.3.1\\LICENSE-APACHE",
+    "licenses\\presser-0.3.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "eea263995892b761aae6307b0c2952cc7170a6bb"
+    },
+    "path_in_vcs": ""
+  }
+}

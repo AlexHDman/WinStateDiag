@@ -1,0 +1,22 @@
+{
+  "name": "lock_api",
+  "version": "0.4.14",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/Amanieu/parking_lot",
+  "authors": [
+    "Amanieu d'Antras <amanieu@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\lock_api-0.4.14\\LICENSE-APACHE",
+    "licenses\\lock_api-0.4.14\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "d7828fff7b5d6327ae608e82db45f888b344449a"
+    },
+    "path_in_vcs": "lock_api"
+  }
+}

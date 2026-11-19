@@ -1,0 +1,21 @@
+{
+  "name": "glutin",
+  "version": "0.32.3",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/rust-windowing/glutin",
+  "authors": [
+    "Kirill Chibisov <contact@kchibisov.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\glutin-0.32.3\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "20d1c103172aa4025f02cc94ca16a3169bea789c"
+    },
+    "path_in_vcs": "glutin"
+  }
+}

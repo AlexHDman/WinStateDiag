@@ -1,0 +1,22 @@
+{
+  "name": "autocfg",
+  "version": "1.5.1",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/cuviper/autocfg",
+  "authors": [
+    "Josh Stone <cuviper@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\autocfg-1.5.1\\LICENSE-APACHE",
+    "licenses\\autocfg-1.5.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "2799b09c24e6632f8e653c5cd8fc303e85a906ba"
+    },
+    "path_in_vcs": ""
+  }
+}

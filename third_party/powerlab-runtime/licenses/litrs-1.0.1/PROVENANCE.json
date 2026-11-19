@@ -1,0 +1,22 @@
+{
+  "name": "litrs",
+  "version": "1.0.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/LukasKalbertodt/litrs",
+  "authors": [
+    "Lukas Kalbertodt <lukas.kalbertodt@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\litrs-1.0.1\\LICENSE-APACHE",
+    "licenses\\litrs-1.0.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "510d5d778413d51da7d11f8e498d27bba86739e1"
+    },
+    "path_in_vcs": ""
+  }
+}

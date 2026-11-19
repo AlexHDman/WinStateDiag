@@ -1,0 +1,22 @@
+{
+  "name": "type-map",
+  "version": "0.5.1",
+  "license": "MIT/Apache-2.0",
+  "repository": "https://github.com/kardeiz/type-map",
+  "authors": [
+    "Jacob Brown <kardeiz@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\type-map-0.5.1\\LICENSE-APACHE",
+    "licenses\\type-map-0.5.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "d3ab3e642736d87f3fa8b1e6c8f13a93fcfb72e1"
+    },
+    "path_in_vcs": ""
+  }
+}

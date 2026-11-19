@@ -1,0 +1,146 @@
+{
+  "result": {
+    "category": "mb",
+    "title": "PRO B760M-A DDR4",
+    "downloads": {
+      "AMI BIOS": [
+        {
+          "download_version": "7D99v1J",
+          "download_release": "2026-09-02",
+          "download_file": "mb/7D99v1J.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1J.zip"
+        },
+        {
+          "download_version": "7D99v1I",
+          "download_release": "2026-08-24",
+          "download_file": "mb/7D99v1I.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1I.zip"
+        },
+        {
+          "download_version": "7D99v1H",
+          "download_release": "2026-06-08",
+          "download_file": "mb/7D99v1H.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1H.zip"
+        },
+        {
+          "download_version": "7D99v1H1",
+          "download_release": "2026-05-06",
+          "download_file": "mb/7D99v1H1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1H1.zip"
+        },
+        {
+          "download_version": "7D99v1G",
+          "download_release": "2026-03-20",
+          "download_file": "mb/7D99v1G.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1G.zip"
+        },
+        {
+          "download_version": "7D99v1F",
+          "download_release": "2025-08-22",
+          "download_file": "mb/7D99v1F.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1F.zip"
+        },
+        {
+          "download_version": "7D99v1F1(Beta version)",
+          "download_release": "2025-05-19",
+          "download_file": "mb/7D99v1F1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1F1.zip"
+        },
+        {
+          "download_version": "7D99v1E",
+          "download_release": "2025-05-16",
+          "download_file": "mb/7D99v1E.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1E.zip"
+        },
+        {
+          "download_version": "7D99v1D",
+          "download_release": "2025-04-17",
+          "download_file": "mb/7D99v1D.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1D.zip"
+        },
+        {
+          "download_version": "7D99v1C",
+          "download_release": "2024-09-06",
+          "download_file": "mb/7D99v1C.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1C.zip"
+        },
+        {
+          "download_version": "7D99v1C1(Beta version)",
+          "download_release": "2024-08-13",
+          "download_file": "mb/7D99v1C1.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1C1.zip"
+        },
+        {
+          "download_version": "7D99v1B",
+          "download_release": "2024-08-01",
+          "download_file": "mb/7D99v1B.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1B.zip"
+        },
+        {
+          "download_version": "7D99v1A",
+          "download_release": "2024-04-23",
+          "download_file": "mb/7D99v1A.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v1A.zip"
+        },
+        {
+          "download_version": "7D99v19",
+          "download_release": "2024-01-24",
+          "download_file": "mb/7D99v19.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v19.zip"
+        },
+        {
+          "download_version": "7D99v18",
+          "download_release": "2023-11-01",
+          "download_file": "mb/7D99v18.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v18.zip"
+        },
+        {
+          "download_version": "7D99v17",
+          "download_release": "2023-09-12",
+          "download_file": "mb/7D99v17.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v17.zip"
+        },
+        {
+          "download_version": "7D99v15",
+          "download_release": "2023-06-23",
+          "download_file": "mb/7D99v15.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v15.zip"
+        },
+        {
+          "download_version": "7D99v14",
+          "download_release": "2023-03-24",
+          "download_file": "mb/7D99v14.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v14.zip"
+        },
+        {
+          "download_version": "7D99v13",
+          "download_release": "2023-02-06",
+          "download_file": "mb/7D99v13.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v13.zip"
+        },
+        {
+          "download_version": "7D99v12",
+          "download_release": "2023-01-09",
+          "download_file": "mb/7D99v12.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v12.zip"
+        },
+        {
+          "download_version": "7D99v11",
+          "download_release": "2022-11-24",
+          "download_file": "mb/7D99v11.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v11.zip"
+        },
+        {
+          "download_version": "7D99v10",
+          "download_release": "2022-10-11",
+          "download_file": "mb/7D99v10.zip",
+          "download_url": "https://download.msi.com/bos_exe/mb/7D99v10.zip"
+        }
+      ]
+    }
+  },
+  "status": {
+    "code": 200,
+    "response": "ok"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "libloading",
+  "version": "0.8.9",
+  "license": "ISC",
+  "repository": "https://github.com/nagisa/rust_libloading/",
+  "authors": [
+    "Simonas Kazlauskas <libloading@kazlauskas.me>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\libloading-0.8.9\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "f4ec9e702de2d0778bccff8525dc44e4cacac2d1"
+    },
+    "path_in_vcs": ""
+  }
+}

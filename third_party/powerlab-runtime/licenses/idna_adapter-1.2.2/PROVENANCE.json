@@ -1,0 +1,22 @@
+{
+  "name": "idna_adapter",
+  "version": "1.2.2",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/hsivonen/idna_adapter",
+  "authors": [
+    "The rust-url developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\idna_adapter-1.2.2\\LICENSE-APACHE",
+    "licenses\\idna_adapter-1.2.2\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "1d9782f32c9e29218542b4a9411a82b35ec5c8cb"
+    },
+    "path_in_vcs": ""
+  }
+}

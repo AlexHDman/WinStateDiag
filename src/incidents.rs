@@ -310,7 +310,10 @@ impl Verdict {
             ),
             (None, None) => format!(
                 "{} (CAUSE NOT DETERMINED)",
-                pick("причина не определена", "cause not determined")
+                pick(
+                    "Неожиданное завершение работы. Причина не установлена",
+                    "Unexpected shutdown. Cause not determined"
+                )
             ),
         };
         format!("{hang} / {bsod} / {cause}")
@@ -370,7 +373,9 @@ fn signal_of(e: &CorrelatedEvent) -> Option<Signal> {
         return Some(Signal {
             subsystem: Subsystem::Gpu,
             kernel: true,
-            hang: p == "display" || m.contains("stopped responding"),
+            hang: (m.contains("stopped responding") || m.contains("watchdog"))
+                && !m.contains("recovered")
+                && !m.contains("восстановлен"),
         });
     }
     if m.contains("livekernelevent") {
@@ -382,10 +387,10 @@ fn signal_of(e: &CorrelatedEvent) -> Option<Signal> {
             subsystem: if gpu {
                 Subsystem::Gpu
             } else {
-                Subsystem::Driver
+                Subsystem::Unknown
             },
-            kernel: true,
-            hang: true,
+            kernel: gpu,
+            hang: gpu && (m.contains("1a8") || m.contains("watchdog")) && !m.contains("recovered"),
         });
     }
     if [
@@ -405,31 +410,20 @@ fn signal_of(e: &CorrelatedEvent) -> Option<Signal> {
         return Some(Signal {
             subsystem: Subsystem::Unknown,
             kernel: false,
-            hang: true,
-        });
-    }
-    if p == "service control manager"
-        && matches!(e.id, 7000 | 7009 | 7011 | 7023 | 7024 | 7031 | 7034)
-    {
-        return Some(Signal {
-            subsystem: Subsystem::Driver,
-            kernel: false,
             hang: false,
         });
     }
+    // SCM user-service failures are context, not evidence of a shutdown cause.
     None
 }
 
-fn lkr_signal(r: &LiveKernelReport) -> Signal {
-    let f = r.kind().to_ascii_uppercase();
+fn lkr_signal(_r: &LiveKernelReport) -> Signal {
+    // File presence/folder is evidence of a captured subsystem report only.
+    // A USB/NDIS/watchdog filename does not prove an OS-wide hang or its cause.
     Signal {
-        subsystem: if f.contains("WATCHDOG") && !f.contains("PDC") {
-            Subsystem::Gpu
-        } else {
-            Subsystem::Driver
-        },
-        kernel: true,
-        hang: true,
+        subsystem: Subsystem::Unknown,
+        kernel: false,
+        hang: false,
     }
 }
 
@@ -631,6 +625,42 @@ pub fn to_json(
 /// [`to_json`] with the SessionId that observed the listing: the same
 /// report object seen by two sessions is two observations of one object
 /// (same `report_id`), never two reports inside one session.
+/// Strict collector-local timestamp; timezone-bearing/invalid dates are not
+/// silently compared as local time. Raw records remain exported either way.
+fn timeline_time(raw: &str) -> Option<String> {
+    let b = raw.as_bytes();
+    if b.len() != 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    if !b
+        .iter()
+        .enumerate()
+        .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16) || c.is_ascii_digit())
+    {
+        return None;
+    }
+    let n = |a, z| raw.get(a..z)?.parse::<u32>().ok();
+    let (y, m, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if y == 0 || d == 0 || d > days || n(11, 13)? > 23 || n(14, 16)? > 59 || n(17, 19)? > 59 {
+        return None;
+    }
+    Some(raw.replace(' ', "T"))
+}
+
 pub fn to_json_in_session(
     incidents: &[(Incident, Verdict)],
     unexpected_shutdowns: usize,
@@ -658,6 +688,77 @@ pub fn to_json_in_session(
         "  \"unexpected_shutdowns\": {unexpected_shutdowns},\n"
     ));
     o.push_str(&format!("  \"window_days\": {WINDOW_DAYS},\n"));
+    // This is observed event history, never a verdict of a current fault.
+    // Indices refer to the complete incident records below (raw evidence retained).
+    let mut confirmed: Vec<usize> = incidents
+        .iter()
+        .enumerate()
+        .filter(|(_, (incident, verdict))| {
+            (verdict.bsod_registered || verdict.hang_confirmed)
+                && timeline_time(&incident.logged).is_some()
+        })
+        .map(|(index, _)| index)
+        .collect();
+    confirmed.sort_by_key(|i| std::cmp::Reverse(timeline_time(&incidents[*i].0.logged)));
+    let mut seen = std::collections::BTreeSet::new();
+    confirmed.retain(|i| {
+        let (incident, verdict) = &incidents[*i];
+        seen.insert((
+            timeline_time(&incident.logged),
+            incident.boot.clone(),
+            incident.bugcheck_code,
+            verdict.bsod_registered,
+            verdict.hang_confirmed,
+        ))
+    });
+    let reference = |index: usize| {
+        format!(
+            "{{\"incident_index\": {index}, \"timestamp\": {}, \"kind\": {}, \"reason\": {}, \"sources\": [{}], \"signals\": [{}]}}",
+            q(&incidents[index].0.logged),
+            q(if incidents[index].1.bsod_registered {
+                "BSOD"
+            } else {
+                "HANG"
+            }),
+            q(if incidents[index].1.bsod_registered {
+                "nonzero BugcheckCode or correlated same-boot BugCheck; not a current-fault verdict"
+            } else {
+                "confirmed hang from correlated event signals; not a BSOD or current-fault verdict"
+            }),
+            incidents[index]
+                .0
+                .sources
+                .iter()
+                .map(|s| q(s))
+                .collect::<Vec<_>>()
+                .join(", "),
+            incidents[index]
+                .1
+                .signals
+                .iter()
+                .map(|s| q(s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    o.push_str(&format!(
+        "  \"last_confirmed_incident\": {},\n",
+        confirmed
+            .first()
+            .map(|index| reference(*index))
+            .unwrap_or_else(|| "null".into())
+    ));
+    o.push_str(&format!(
+        "  \"historical_bluescreen\": [{}],\n",
+        confirmed
+            .iter()
+            .skip(1)
+            .filter(|index| incidents[**index].1.bsod_registered)
+            .map(|index| reference(*index))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    o.push_str("  \"bsod_history_scope\": \"collected 30-day event window; older incidents and uncorrelated dumps not evaluated by this timeline\",\n");
     o.push_str(&format!("  \"counting_rule\": {},\n", q(COUNTING_RULE)));
     o.push_str(&format!("  \"incident_count\": {},\n", incidents.len()));
     o.push_str("  \"incidents\": [");
@@ -784,6 +885,185 @@ pub fn to_json_in_session(
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn rc7_field_incidents_replay_preserves_counts_and_removes_service_only_causes() {
+        let Ok(root) = std::env::var("WSD_RC7_FIELD_ROOT") else {
+            return;
+        };
+        for (machine, count) in [
+            ("LAB-A-SERVER", 2),
+            ("LAB-B-SERVER", 2),
+            ("LAB-C-SERVER", 1),
+            ("LAB-D-SERVER", 2),
+            ("LAB-E-SERVER", 0),
+        ] {
+            let dir = std::path::Path::new(&root).join(machine);
+            let text = std::fs::read_to_string(dir.join("incident-input.json")).unwrap();
+            let json = json::parse(&text).unwrap();
+            let incidents = parse_incidents(json.get("incidents"));
+            let reports = parse_live_kernel_reports(json.get("lkr"));
+            assert_eq!(incidents.len(), count);
+            let results: Vec<_> = incidents
+                .into_iter()
+                .map(|i| {
+                    let v = classify(&i, &reports, false);
+                    (i, v)
+                })
+                .collect();
+            for (_, v) in &results {
+                assert_eq!(v.subsystem, None, "{machine}");
+                assert!(!v.bsod_registered);
+            }
+            std::fs::write(
+                dir.join("rc7-replay-incidents.json"),
+                to_json(&results, count, &reports),
+            )
+            .unwrap();
+            println!("{machine}: {count} incidents; cause not determined; no invented BSOD");
+        }
+    }
+
+    #[test]
+    fn rc7_scm_timeouts_are_context_not_shutdown_cause() {
+        let events = [7000, 7009, 7011, 7023, 7024, 7031, 7034]
+            .into_iter()
+            .map(|id| {
+                ev(
+                    "2026-10-04T20:57:44",
+                    "Service Control Manager",
+                    id,
+                    2,
+                    "ScDeviceEnum / TermService timeout",
+                )
+            })
+            .collect();
+        let v = classify(&incident(events, 0), &[], false);
+        assert_eq!(v.subsystem, None);
+        assert!(!v.hang_confirmed && !v.bsod_registered);
+        assert!(
+            v.headline_localized(true)
+                .contains("Неожиданное завершение работы. Причина не установлена")
+        );
+    }
+
+    #[test]
+    fn rc6_shutdown_context_does_not_invent_causes() {
+        for sources in [
+            vec!["KP41".into()],
+            vec!["EL6008".into()],
+            vec!["KP41".into(), "EL6008".into()],
+        ] {
+            let mut inc = incident(vec![], 0);
+            inc.sources = sources;
+            let verdict = classify(&inc, &[], false);
+            assert!(!verdict.bsod_registered && !verdict.hang_confirmed);
+            assert!(verdict.subsystem.is_none());
+            assert!(verdict.headline().contains("CAUSE NOT DETERMINED"));
+            inc.events.push(CorrelatedEvent {
+                time: inc.logged.clone(),
+                log: "System".into(),
+                provider: "Microsoft-Windows-WHEA-Logger".into(),
+                id: 17,
+                level: 3,
+                message: "A corrected hardware error has occurred".into(),
+            });
+            let verdict = classify(&inc, &[], false);
+            assert!(!verdict.bsod_registered && verdict.subsystem.is_none());
+            inc.bugcheck_code = 0x124;
+            assert!(classify(&inc, &[], false).bsod_registered);
+        }
+    }
+
+    #[test]
+    fn phase03_b4_latest_confirmed_hang_and_invalid_duplicate_history() {
+        let mut old = incident(vec![], 0x139);
+        old.logged = "2026-09-15T12:00:00".into();
+        let mut hang = incident(
+            vec![ev(
+                "2026-10-05T10:00:00",
+                "Application Hang",
+                1002,
+                2,
+                "application hung",
+            )],
+            0,
+        );
+        hang.logged = "2026-10-05 12:00:00".into();
+        let hv = classify(&hang, &[], false);
+        assert!(!hv.hang_confirmed);
+        let mut invalid = old.clone();
+        invalid.logged.clear();
+        let rows = vec![
+            (old.clone(), classify(&old, &[], false)),
+            (old.clone(), classify(&old, &[], false)),
+            (hang.clone(), hv),
+            (invalid.clone(), classify(&invalid, &[], false)),
+        ];
+        let encoded = to_json(&rows, 4, &[]);
+        let doc = json::parse(&encoded).unwrap();
+        let last = doc.get("last_confirmed_incident").unwrap();
+        assert_eq!(last.get("kind").and_then(|x| x.as_str()), Some("BSOD"));
+        assert_eq!(
+            last.get("timestamp").and_then(|x| x.as_str()),
+            Some(old.logged.as_str())
+        );
+        assert_eq!(
+            doc.get("historical_bluescreen")
+                .unwrap()
+                .as_arr()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            doc.get("incidents").unwrap().as_arr().unwrap().len(),
+            4,
+            "raw evidence retained"
+        );
+        assert!(timeline_time("2026-02-30T12:00:00").is_none());
+        assert!(timeline_time("2026-10-05T25:00:00").is_none());
+        assert!(timeline_time("2026-10-05T12:00:00Z").is_none());
+        assert!(timeline_time("2026-10-05 23:00:00") > timeline_time("2026-10-05T01:00:00"));
+    }
+
+    #[test]
+    fn diag_102_kernel_power_alone_is_not_confirmed_bsod() {
+        let power_loss = incident(vec![], 0);
+        let verdict = classify(&power_loss, &[], false);
+        assert!(!verdict.bsod_registered);
+        assert!(!verdict.hang_confirmed);
+        assert!(classify(&power_loss, &[], true).bsod_registered);
+        let empty = to_json(&[(power_loss.clone(), verdict)], 1, &[]);
+        assert!(empty.contains("\"last_confirmed_incident\": null"));
+        assert!(empty.contains("\"historical_bluescreen\": []"));
+        let mut old = incident(vec![], 0x139);
+        old.logged = "2026-10-01T12:00:00".into();
+        let recent = incident(vec![], 0x9f);
+        let rows = vec![
+            (old.clone(), classify(&old, &[], false)),
+            (recent.clone(), classify(&recent, &[], false)),
+        ];
+        let encoded = to_json(&rows, 2, &[]);
+        let parsed = json::parse(&encoded).unwrap();
+        assert_eq!(
+            parsed
+                .get("last_confirmed_incident")
+                .unwrap()
+                .get("incident_index"),
+            Some(&json::Value::Num(1.0))
+        );
+        assert_eq!(
+            parsed
+                .get("historical_bluescreen")
+                .unwrap()
+                .as_arr()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(encoded.contains("window_days") && encoded.contains("KP41"));
+    }
+
     pub fn ev(time: &str, provider: &str, id: u32, level: u32, msg: &str) -> CorrelatedEvent {
         CorrelatedEvent {
             time: time.into(),
@@ -847,14 +1127,11 @@ pub(crate) mod tests {
             0,
         );
         let v = classify(&inc, &[], false);
-        assert!(v.hang_confirmed);
+        assert!(!v.hang_confirmed);
         assert!(!v.bsod_registered);
         assert_eq!(v.subsystem, Some(Subsystem::Gpu));
         assert_eq!(v.confidence, Confidence::High);
-        assert!(
-            v.headline()
-                .starts_with("HANG CONFIRMED / BSOD NOT REGISTERED / PROBABLE SUBSYSTEM GPU")
-        );
+        assert!(!v.headline().starts_with("HANG CONFIRMED"));
         assert_eq!(v.signals.len(), 3);
     }
 
@@ -891,7 +1168,7 @@ pub(crate) mod tests {
             &[],
             false,
         );
-        assert!(app.hang_confirmed);
+        assert!(!app.hang_confirmed);
         assert_eq!(app.subsystem, None, "an app hang names no culprit");
     }
 
@@ -935,9 +1212,9 @@ pub(crate) mod tests {
         let inc = incident(vec![], 0);
         assert_eq!(reports_in_window(&inc, &reports).len(), 1);
         let v = classify(&inc, &reports, false);
-        assert!(v.hang_confirmed);
-        assert_eq!(v.subsystem, Some(Subsystem::Gpu));
-        assert_eq!(v.confidence, Confidence::Medium);
+        assert!(!v.hang_confirmed);
+        assert_eq!(v.subsystem, None);
+        assert_eq!(v.confidence, Confidence::Low);
     }
 
     #[test]
@@ -1073,5 +1350,32 @@ pub(crate) mod tests {
         // Without a session the field is explicit null, never invented.
         let pv = json::parse(&to_json(&[], 0, &r)).unwrap();
         assert_eq!(pv.get("observed_in_session"), Some(&json::Value::Null));
+    }
+    #[test]
+    fn rc9_usb_wer_is_context_and_explicit_watchdog_still_detected() {
+        let usb = incident(
+            vec![ev(
+                "2026-10-04T20:57:44",
+                "Windows Error Reporting",
+                1001,
+                2,
+                "LiveKernelEvent USBHUB3",
+            )],
+            0,
+        );
+        let v = classify(&usb, &[], false);
+        assert!(!v.hang_confirmed);
+        assert_eq!(v.subsystem, None);
+        let watchdog = incident(
+            vec![ev(
+                "2026-10-04T20:57:44",
+                "Windows Error Reporting",
+                1001,
+                2,
+                "LiveKernelEvent watchdog 1a8",
+            )],
+            0,
+        );
+        assert!(classify(&watchdog, &[], false).hang_confirmed);
     }
 }

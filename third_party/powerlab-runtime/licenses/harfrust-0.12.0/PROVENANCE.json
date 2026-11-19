@@ -1,0 +1,19 @@
+{
+  "name": "harfrust",
+  "version": "0.12.0",
+  "license": "MIT",
+  "repository": "https://github.com/harfbuzz/harfrust",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\harfrust-0.12.0\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "60b28ea22b5261710018d69c168a762bcb28794c"
+    },
+    "path_in_vcs": "harfrust"
+  }
+}

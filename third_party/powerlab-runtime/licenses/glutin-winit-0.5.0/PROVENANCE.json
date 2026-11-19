@@ -1,0 +1,21 @@
+{
+  "name": "glutin-winit",
+  "version": "0.5.0",
+  "license": "MIT",
+  "repository": "https://github.com/rust-windowing/glutin",
+  "authors": [
+    "Kirill Chibisov <contact@kchibisov.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\glutin-winit-0.5.0\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "0811b6c753334f1681c7db8a48e407596cfa9366"
+    },
+    "path_in_vcs": "glutin-winit"
+  }
+}

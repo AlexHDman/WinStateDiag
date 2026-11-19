@@ -6,6 +6,510 @@
 use super::*;
 use crate::deep_checks::json;
 
+/// Exercises the native immediate-viewport callback with egui's real
+/// multi-pass runner, without creating an OS window or using a GPU.
+struct NativeDetailsHarness {
+    ctx: egui::Context,
+    state: std::rc::Rc<std::cell::RefCell<NativeDetailsState>>,
+}
+
+#[derive(Default)]
+struct NativeDetailsState {
+    input: egui::RawInput,
+    output: Option<egui::FullOutput>,
+    callbacks: usize,
+    force_discard: bool,
+}
+
+impl NativeDetailsHarness {
+    fn new() -> Self {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::install(&ctx);
+        ctx.set_embed_viewports(false);
+        let state = std::rc::Rc::new(std::cell::RefCell::new(NativeDetailsState::default()));
+        let shared = state.clone();
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let (mut input, force_discard) = {
+                let mut state = shared.borrow_mut();
+                (std::mem::take(&mut state.input), state.force_discard)
+            };
+            input.viewport_id = viewport.ids.this;
+            input.viewports.insert(
+                viewport.ids.this,
+                egui::ViewportInfo {
+                    parent: Some(viewport.ids.parent),
+                    inner_rect: input.screen_rect,
+                    ..Default::default()
+                },
+            );
+            let mut callbacks = 0;
+            let mut output = ctx.run_ui(input, |ui| {
+                callbacks += 1;
+                (viewport.viewport_ui_cb)(ui);
+                if force_discard && ui.ctx().current_pass_index() == 0 {
+                    ui.ctx().request_discard("Details regression: second pass");
+                }
+            });
+            output.textures_delta.clear();
+            let mut state = shared.borrow_mut();
+            state.callbacks = callbacks;
+            state.output = Some(output);
+        });
+        Self { ctx, state }
+    }
+
+    fn render(
+        &self,
+        size: egui::Vec2,
+        force_discard: bool,
+        events: Vec<egui::Event>,
+        mut draw: impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        {
+            let mut state = self.state.borrow_mut();
+            state.input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            };
+            state.force_discard = force_discard;
+            state.output = None;
+        }
+        let mut parent = self
+            .ctx
+            .run_ui(egui::RawInput::default(), |ui| draw(ui.ctx()));
+        parent.textures_delta.clear();
+        let mut output = self.state.borrow_mut().output.take().unwrap();
+        // Actions such as Copy are applied by the parent after the child
+        // callback returns. Inspect both outputs; no OS clipboard is used.
+        output
+            .platform_output
+            .commands
+            .extend(parent.platform_output.commands);
+        output
+    }
+}
+
+impl Drop for NativeDetailsHarness {
+    fn drop(&mut self) {
+        // The renderer is thread-local. Release the captured test state;
+        // later tests on this worker use embedded viewports by default.
+        egui::Context::set_immediate_viewport_renderer(|_, _| {
+            panic!("native Details test renderer is not installed")
+        });
+    }
+}
+
+fn native_texts(output: &egui::FullOutput) -> Vec<(String, Rect)> {
+    output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(t) => Some((
+                t.galley.text().to_string(),
+                clipped.shape.visual_bounding_rect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn detail_window_native_callback_renders_every_pass() {
+    let harness = NativeDetailsHarness::new();
+    let mut open = true;
+    for frame in 0..12 {
+        let mut result = None;
+        let output = harness.render(vec2(640.0, 520.0), true, vec![], |ctx| {
+            result = detail_window(
+                ctx,
+                "multipass",
+                "Details",
+                [640.0, 520.0],
+                &mut open,
+                |ui| {
+                    egui::Grid::new("multipass_grid").show(ui, |ui| {
+                        ui.label("persistent detail value");
+                        ui.end_row();
+                    });
+                    42
+                },
+            );
+        });
+        assert_eq!(harness.state.borrow().callbacks, 2, "frame {frame}");
+        assert_eq!(result, Some(42), "final callback result, frame {frame}");
+        assert!(
+            native_texts(&output)
+                .iter()
+                .any(|(t, _)| t == "persistent detail value"),
+            "final pass lost the content, frame {frame}"
+        );
+        assert!(open);
+    }
+}
+
+#[test]
+fn phase03_b1_disk_ok_without_sensors_is_partial_not_fault() {
+    let mut app = WinStateDiagApp::default();
+    assert_eq!(app.state_codes().1, "NO_DATA");
+    app.sensors = Some(sensors::Snapshot::default());
+    assert_eq!(app.state_codes().1, "NO_DATA");
+    app.ata_scan = Some(vec![AtaDisk {
+        index: 0,
+        model: "Fixture SATA".into(),
+        bus: "SATA".into(),
+        smart: crate::ata_smart::AtaSmart {
+            state: crate::ata_smart::AtaState::Ok,
+            detail: String::new(),
+            attributes: vec![crate::ata_smart::Attribute {
+                id: 194,
+                current: 100,
+                worst: 100,
+                threshold: Some(0),
+                raw: 30,
+            }],
+        },
+    }]);
+    assert_eq!(app.state_codes().1, "PARTIAL");
+    assert_ne!(app.system_state_vm().hardware.tone, Tone::Success);
+    app.sensors = Some(sensors::Snapshot {
+        sensors: sensors::tests::sample(&sensors::tests::msi_reference()),
+        ..Default::default()
+    });
+    assert_eq!(
+        app.state_codes().1,
+        "OK",
+        "complete trusted fixture still permits OK"
+    );
+    app.sensors_error = Some("fixture access denied".into());
+    assert_eq!(app.state_codes().1, "PARTIAL");
+    app.ata_scan.as_mut().unwrap()[0]
+        .smart
+        .attributes
+        .push(crate::ata_smart::Attribute {
+            id: 197,
+            current: 100,
+            worst: 100,
+            threshold: Some(0),
+            raw: 1,
+        });
+    assert_eq!(
+        app.state_codes().1,
+        "ATTENTION",
+        "missing sensors must not hide real disk evidence"
+    );
+    app.ata_scan = None;
+    assert_eq!(app.state_codes().1, "NO_DATA");
+}
+
+/// UI-PASSPORT-001: model-level guard only; OS minimization still needs LIVE QA.
+#[test]
+fn passport_idle_frames_never_request_minimize_or_close_and_can_reopen() {
+    let mut app = WinStateDiagApp::default();
+    app.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.into());
+    let harness = NativeDetailsHarness::new();
+    for _opening in 0..3 {
+        app.passport2_open = true;
+        for frame in 0..20 {
+            let size = if frame % 2 == 0 {
+                vec2(1060.0, 860.0)
+            } else {
+                vec2(700.0, 520.0)
+            };
+            let output = harness.render(size, true, vec![], |ctx| app.passport2_window(ctx));
+            assert!(app.passport2_open);
+            for viewport in output.viewport_output.values() {
+                assert!(!viewport.commands.iter().any(|command| matches!(
+                    command,
+                    egui::ViewportCommand::Minimized(true) | egui::ViewportCommand::Close
+                )));
+            }
+            assert!(!native_texts(&output).is_empty());
+        }
+        app.passport2_open = false;
+    }
+}
+
+#[test]
+fn passport_native_repeated_render_preserves_every_card_and_copy() {
+    for lang in [Language::Ru, Language::En] {
+        let mut app = WinStateDiagApp::default();
+        app.language = lang;
+        app.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.into());
+        app.passport2_open = true;
+        let view = app.passport2_view().unwrap();
+        let d = i18n::t(lang);
+        let summary = crate::passport2::summary_text(&view, d);
+        assert_eq!(view.cards.len(), 8);
+        let harness = NativeDetailsHarness::new();
+        let size = vec2(1060.0, 2400.0);
+        let mut copy_pos = egui::Pos2::ZERO;
+        for frame in 0..16 {
+            // Natural Grid sizing passes first, then deliberately repeat
+            // every frame to ensure contents survive the final pass.
+            let output = harness.render(size, frame >= 4, vec![], |ctx| app.passport2_window(ctx));
+            let texts = native_texts(&output);
+            if frame >= 2 {
+                for card in &view.cards {
+                    for expected in std::iter::once(&card.title)
+                        .chain(card.rows.iter().map(|r| &r.value).filter(|v| !v.is_empty()))
+                    {
+                        assert!(
+                            texts.iter().any(|(t, _)| t == expected),
+                            "{lang:?}, frame {frame}, missing {expected}"
+                        );
+                        assert!(summary.contains(expected), "copy lacks {expected}");
+                    }
+                }
+                for button in [d.pp_refresh, d.pp_copy, d.pp_save, d.pp_close] {
+                    assert!(texts.iter().any(|(t, _)| t == button), "missing {button}");
+                }
+                copy_pos = texts
+                    .iter()
+                    .find(|(t, _)| t == d.pp_copy)
+                    .unwrap()
+                    .1
+                    .center();
+            }
+            assert_eq!(app.passport2_view().unwrap(), view);
+        }
+        harness.render(size, true, pointer_button(copy_pos, true), |ctx| {
+            app.passport2_window(ctx)
+        });
+        let copied = harness.render(size, true, pointer_button(copy_pos, false), |ctx| {
+            app.passport2_window(ctx)
+        });
+        let copies: Vec<_> = copied
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                egui::OutputCommand::CopyText(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies, vec![&summary], "one exact summary per click");
+        assert!(matches!(app.passport2_status, Some(ExportStatus::Copied)));
+        assert_eq!(app.passport2_view().unwrap(), view);
+        let close_pos = native_texts(&copied)
+            .iter()
+            .find(|(t, _)| t == d.pp_close)
+            .unwrap()
+            .1
+            .center();
+        harness.render(size, true, pointer_button(close_pos, true), |ctx| {
+            app.passport2_window(ctx)
+        });
+        harness.render(size, true, pointer_button(close_pos, false), |ctx| {
+            app.passport2_window(ctx)
+        });
+        assert!(!app.passport2_open, "Close survives a discarded pass");
+    }
+}
+
+fn pointer_button(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn passport_native_scroll_and_resize_keep_content_and_footer() {
+    let mut app = WinStateDiagApp::default();
+    app.language = Language::Ru;
+    app.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.into());
+    app.passport2_open = true;
+    let original = app.passport2_view().unwrap();
+    let summary = crate::passport2::summary_text(&original, &i18n::RU);
+    let harness = NativeDetailsHarness::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cpu_y = Vec::new();
+    for size in [vec2(640.0, 520.0), vec2(1060.0, 860.0), vec2(420.0, 300.0)] {
+        for frame in 0..24 {
+            let events = if frame >= 4 {
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(100.0, 55.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, if frame < 14 { -180.0 } else { 180.0 }),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                vec![]
+            };
+            let output = harness.render(size, true, events, |ctx| app.passport2_window(ctx));
+            let texts = native_texts(&output);
+            if frame >= 2 {
+                for button in [
+                    i18n::RU.pp_refresh,
+                    i18n::RU.pp_copy,
+                    i18n::RU.pp_save,
+                    i18n::RU.pp_close,
+                ] {
+                    let bounds = texts
+                        .iter()
+                        .find(|(t, _)| t == button)
+                        .unwrap_or_else(|| panic!("{size:?} frame {frame}: missing {button}"))
+                        .1;
+                    assert!(
+                        bounds.min.x >= 0.0
+                            && bounds.max.x <= size.x + 0.5
+                            && bounds.min.y >= 0.0
+                            && bounds.max.y <= size.y + 0.5,
+                        "{button}: {bounds:?} outside {size:?}"
+                    );
+                }
+            }
+            for clipped in &output.shapes {
+                if let egui::Shape::Text(t) = &clipped.shape {
+                    let bounds = clipped.shape.visual_bounding_rect();
+                    if clipped.clip_rect.intersects(bounds) {
+                        seen.insert(t.galley.text().to_string());
+                        if size.x == 640.0 && t.galley.text() == i18n::RU.pp_cpu {
+                            cpu_y.push(bounds.min.y);
+                        }
+                    }
+                }
+            }
+            assert_eq!(app.passport2_view().unwrap(), original);
+            assert_eq!(
+                crate::passport2::summary_text(&app.passport2_view().unwrap(), &i18n::RU),
+                summary
+            );
+        }
+    }
+    assert!(
+        cpu_y.windows(2).any(|ys| (ys[0] - ys[1]).abs() > 5.0),
+        "wheel input must actually scroll the body: {cpu_y:?}"
+    );
+    for card in &original.cards {
+        assert!(
+            seen.contains(&card.title),
+            "never visible while scrolling: {}",
+            card.title
+        );
+    }
+    // Return to a tall viewport after scrolling/resizing: every card's
+    // actual values must still render, not merely remain in the model.
+    let mut last = Vec::new();
+    for _ in 0..12 {
+        last = native_texts(&harness.render(vec2(1060.0, 2400.0), true, vec![], |ctx| {
+            app.passport2_window(ctx)
+        }));
+    }
+    for card in &original.cards {
+        for expected in std::iter::once(&card.title)
+            .chain(card.rows.iter().map(|r| &r.value).filter(|v| !v.is_empty()))
+        {
+            assert!(
+                last.iter().any(|(t, _)| t == expected),
+                "lost after resize: {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn other_details_native_windows_survive_repeated_layout_passes() {
+    let windows: [(&str, fn(&mut WinStateDiagApp, &egui::Context)); 8] = [
+        ("crypto-details", WinStateDiagApp::crypto_details_window),
+        ("driver-details", WinStateDiagApp::drivers_window),
+        ("disk-details", WinStateDiagApp::raw_passes_window),
+        ("crash-analyzer", WinStateDiagApp::crash_details_window),
+        ("sensor-details", WinStateDiagApp::sensors_details_window),
+        ("stage-details", WinStateDiagApp::stage_details_window),
+        ("expc", WinStateDiagApp::expc_details_window),
+        ("gpo", WinStateDiagApp::gpo_details_window),
+    ];
+    for (scene, draw) in windows {
+        let mut app = WinStateDiagApp::default();
+        app.language = Language::Ru;
+        app.seed_qa_scene(if scene == "expc" {
+            "stage-details"
+        } else {
+            scene
+        });
+        app.expc_details_open = true;
+        app.gpo_details_open = true;
+        let harness = NativeDetailsHarness::new();
+        let size = vec2(1400.0, 2400.0);
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            expected =
+                native_texts(&harness.render(size, false, vec![], |ctx| draw(&mut app, ctx)));
+        }
+        assert_eq!(
+            expected
+                .iter()
+                .any(|(t, _)| t == i18n::RU.journal_viewer_close),
+            scene != "crypto-details",
+            "{scene}: Close footer policy"
+        );
+        assert!(expected.len() > 1, "{scene}: no baseline contents");
+        for frame in 0..12 {
+            let output = harness.render(size, true, vec![], |ctx| draw(&mut app, ctx));
+            assert_eq!(harness.state.borrow().callbacks, 2);
+            let actual = native_texts(&output);
+            for (text, _) in &expected {
+                assert!(
+                    actual.iter().any(|(t, _)| t == text),
+                    "{scene}, frame {frame}, lost {text}"
+                );
+            }
+        }
+        if scene == "crypto-details" {
+            harness.render(
+                size,
+                true,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                |ctx| draw(&mut app, ctx),
+            );
+        } else {
+            let close_pos = expected
+                .iter()
+                .find(|(t, _)| t == i18n::RU.journal_viewer_close)
+                .unwrap()
+                .1
+                .center();
+            harness.render(size, true, pointer_button(close_pos, true), |ctx| {
+                draw(&mut app, ctx)
+            });
+            harness.render(size, true, pointer_button(close_pos, false), |ctx| {
+                draw(&mut app, ctx)
+            });
+        }
+        let still_open = match scene {
+            "crypto-details" => app.crypto_details_open,
+            "driver-details" => app.drivers_open,
+            "disk-details" => app.raw_passes_open,
+            "crash-analyzer" => app.crash_details_open,
+            "sensor-details" => app.sensors_details_open,
+            "stage-details" => app.stage_details.is_some(),
+            "expc" => app.expc_details_open,
+            "gpo" => app.gpo_details_open,
+            _ => unreachable!(),
+        };
+        assert!(
+            !still_open,
+            "{scene}: Close was lost during a repeated layout pass"
+        );
+    }
+}
+
 fn app_in(tag: &str) -> (WinStateDiagApp, PathBuf) {
     let exe = std::env::temp_dir()
         .join(format!("wsd-v11-{tag}-{}", std::process::id()))
@@ -68,7 +572,7 @@ fn deliver_scan(app: &mut WinStateDiagApp, inv: crash_dump::Inventory) {
 // ---------------- 1. asynchronous startup ----------------
 
 #[test]
-fn startup_preflight_starts_the_three_read_only_checks_without_blocking() {
+fn startup_preflight_includes_passport_without_blocking_or_full_diagnostics() {
     let (mut app, exe) = app_in("async");
     let t0 = Instant::now();
     app.start_preflight();
@@ -78,9 +582,9 @@ fn startup_preflight_starts_the_three_read_only_checks_without_blocking() {
     );
     assert_eq!(
         app.collector_requests,
-        ["driver_audit", "cryptopro", "crash_scan"]
+        ["passport", "cryptopro", "crash_scan"]
     );
-    assert_eq!(app.driver_origin, CheckOrigin::Preflight);
+    assert!(matches!(app.driver_audit, DriverAuditState::Idle));
     assert_eq!(app.crypto_origin, CheckOrigin::Preflight);
     assert_eq!(app.crash.scan_origin, Some(CheckOrigin::Preflight));
     assert!(
@@ -101,9 +605,234 @@ fn startup_preflight_starts_the_three_read_only_checks_without_blocking() {
 // ---------------- 2. startup without session / report ----------------
 
 #[test]
+fn phase05_passport_refresh_failure_never_reuses_stale_inventory() {
+    let (mut app, exe) = app_in("phase05_inventory");
+    app.passport = Some(Ok(passport::Passport {
+        cpu: "OLD CPU".into(),
+        ..Default::default()
+    }));
+    app.start_passport();
+    assert!(app.passport.is_none());
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.passport_rx = Some(rx);
+    let before = app.collector_requests.len();
+    app.start_passport();
+    assert_eq!(
+        app.collector_requests.len(),
+        before,
+        "no overlapping collector"
+    );
+    assert!(
+        app.passport_rows().is_empty(),
+        "collecting, not old inventory"
+    );
+    drop(tx);
+    app.poll_passport();
+    assert!(matches!(&app.passport, Some(Err(e)) if e.contains("without a result")));
+    assert_eq!(app.passport_rows().len(), 5);
+    assert!(
+        !app.passport_rows()
+            .iter()
+            .any(|r| r.value.contains("OLD CPU"))
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.passport_rx = Some(rx);
+    tx.send(Err("timed out".into())).unwrap();
+    app.poll_passport();
+    assert!(matches!(&app.passport, Some(Err(e)) if e == "timed out"));
+    assert!(matches!(app.state, RunState::Idle));
+    assert!(report_package::lock(&app.package).is_fresh());
+    cleanup(&exe);
+}
+
+#[test]
+fn phase05_a1_remains_expanded_across_repaints_data_and_page_changes() {
+    let (mut app, exe) = app_in("phase05_a1");
+    let ctx = egui::Context::default();
+    crate::ui::fonts::install(&ctx);
+    for frame in 0..24 {
+        app.apply(Action::SetPage(Page::Hardware));
+        app.apply(Action::SetPage(Page::Diagnostics));
+        app.passport = match frame % 3 {
+            0 => None,
+            1 => Some(Ok(passport::Passport {
+                cpu: format!("Intel CPU {frame}"),
+                ..Default::default()
+            })),
+            _ => Some(Err("source unavailable".into())),
+        };
+        let vm = app.build_vm(0.016, f64::from(frame));
+        let labels = [
+            &i18n::RU.passport_windows,
+            &i18n::RU.passport_cpu,
+            &i18n::RU.passport_ram,
+            &i18n::RU.passport_board,
+            &i18n::RU.passport_bios,
+        ];
+        let text = shown_texts(&ctx, |ui| {
+            crate::ui::pages::draw_passport(ui, egui::Pos2::ZERO, &vm)
+        });
+        for label in labels {
+            assert!(
+                text.iter().any(|s| s == label),
+                "missing {label} at frame {frame}"
+            );
+        }
+    }
+    // A1 is always expanded: no collapsible widget or data-dependent ID exists.
+    let source = include_str!("ui/pages.rs");
+    let body = source
+        .split("pub fn draw_passport(")
+        .nth(1)
+        .unwrap()
+        .split("pub fn passport_card_value_color")
+        .next()
+        .unwrap();
+    assert!(!body.contains("Collapsing") && !body.contains("auto_id"));
+    cleanup(&exe);
+}
+
+#[test]
+fn rc4_a1_async_delivery_disconnect_and_repaint_keep_all_rows() {
+    let (mut app, exe) = app_in("rc4-a1-async");
+    let ctx = egui::Context::default();
+    crate::ui::fonts::install(&ctx);
+    for success in [true, false] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.passport_rx = Some(rx);
+        app.passport = None;
+        app.poll_passport();
+        assert!(app.passport_rx.is_some());
+        if success {
+            tx.send(Ok(passport::Passport {
+                cpu: "RC4 fixture CPU".into(),
+                ..Default::default()
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        app.poll_passport();
+        assert!(app.passport_rx.is_none());
+        assert_eq!(app.passport.as_ref().unwrap().is_ok(), success);
+        for frame in 0..8 {
+            app.apply(Action::SetPage(Page::Hardware));
+            app.apply(Action::SetPage(Page::Diagnostics));
+            let vm = app.build_vm(0.016, f64::from(frame));
+            let text = shown_texts(&ctx, |ui| {
+                crate::ui::pages::draw_passport(ui, egui::Pos2::ZERO, &vm)
+            });
+            for label in [
+                i18n::RU.passport_cpu,
+                i18n::RU.passport_ram,
+                i18n::RU.passport_board,
+                i18n::RU.passport_bios,
+                i18n::RU.passport_windows,
+            ] {
+                assert!(text.iter().any(|s| s == label));
+            }
+        }
+    }
+    cleanup(&exe);
+}
+
+#[test]
+fn rc4_crypto_compact_native_layout_has_no_text_overlap() {
+    let mut app = WinStateDiagApp::default();
+    app.language = Language::Ru;
+    app.seed_qa_scene("crypto-details");
+    app.crypto_detection = cryptopro::Detection::Installed(std::path::PathBuf::from(format!(
+        "C:\\{}\\cpverify.exe",
+        "long-provider-directory\\".repeat(12)
+    )));
+    let harness = NativeDetailsHarness::new();
+    for size in [vec2(580.0, 390.0), vec2(420.0, 300.0), vec2(760.0, 460.0)] {
+        let output = harness.render(size, true, vec![], |ctx| app.crypto_details_window(ctx));
+        let texts = native_texts(&output);
+        assert!(!texts.iter().any(|(t, _)| t == "Копировать"));
+        let values: Vec<_> = app
+            .crypto_detail_rows()
+            .iter()
+            .filter(|r| r.value != "—")
+            .filter_map(|r| {
+                texts
+                    .iter()
+                    .find(|(t, _)| t == &r.value)
+                    .map(|(_, rect)| rect.min.x)
+            })
+            .collect();
+        assert!(values.len() >= 3);
+        assert!(
+            values.iter().all(|x| (*x - values[0]).abs() <= 1.1),
+            "value column must align: {values:?}"
+        );
+        for (index, (a, ar)) in texts.iter().enumerate() {
+            for (b, br) in &texts[index + 1..] {
+                assert!(
+                    !ar.shrink(0.5).intersects(br.shrink(0.5)),
+                    "overlap: {a:?} / {b:?} at {size:?}"
+                );
+            }
+        }
+        assert!(app.crypto_details_open);
+    }
+}
+
+#[test]
+fn rc4_b1_async_refresh_status_page_changes_keep_native_window_open() {
+    let mut app = WinStateDiagApp::default();
+    app.passport2_open = true;
+    let harness = NativeDetailsHarness::new();
+    for event in [
+        HardwareEvent::Passport(crate::passport2::QA_PASSPORT_JSON.into()),
+        HardwareEvent::Saving,
+        HardwareEvent::Refreshed(Err("fixture export denied".into())),
+        HardwareEvent::Closed,
+        HardwareEvent::Failed("fixture collector timeout".into()),
+    ] {
+        app.apply_hardware_event(event);
+        app.apply(Action::SetPage(Page::Diagnostics));
+        app.apply(Action::SetPage(Page::Hardware));
+        for _ in 0..3 {
+            let output = harness.render(vec2(700.0, 520.0), true, vec![], |ctx| {
+                app.passport2_window(ctx)
+            });
+            assert!(app.passport2_open);
+            assert!(!native_texts(&output).is_empty());
+            for viewport in output.viewport_output.values() {
+                assert!(!viewport.commands.iter().any(|c| matches!(
+                    c,
+                    egui::ViewportCommand::Close | egui::ViewportCommand::Minimized(true)
+                )));
+            }
+        }
+    }
+}
+
+#[test]
+fn rc4_b1_footer_does_not_consume_the_scroll_body_on_repaint() {
+    let mut app = WinStateDiagApp::default();
+    app.passport2_open = true;
+    app.passport2_json = Some(crate::passport2::QA_PASSPORT_JSON.into());
+    let harness = NativeDetailsHarness::new();
+    for _ in 0..30 {
+        let output = harness.render(vec2(1060.0, 860.0), true, vec![], |ctx| {
+            app.passport2_window(ctx)
+        });
+        let texts = native_texts(&output);
+        let footer = texts
+            .iter()
+            .find(|(text, _)| text == i18n::RU.pp_refresh)
+            .unwrap();
+        assert!(footer.1.top() > 600.0, "body collapsed: {:?}", footer.1);
+    }
+}
+
+#[test]
 fn preflight_results_create_no_session_report_or_held_evidence() {
     let (mut app, exe) = app_in("noreport");
     app.start_preflight();
+    // Explicit legacy-result fixture; startup itself must never launch A5.
+    app.driver_origin = CheckOrigin::Preflight;
     deliver_audit(&mut app, Ok(audit()));
     deliver_scan(
         &mut app,
@@ -134,9 +863,11 @@ fn preflight_results_create_no_session_report_or_held_evidence() {
 // ---------------- 3. auto Driver Audit ----------------
 
 #[test]
-fn auto_driver_audit_shows_result_with_origin_and_time() {
+fn legacy_preflight_driver_result_keeps_origin_and_time() {
     let (mut app, exe) = app_in("autodrv");
     app.start_preflight();
+    // Explicit legacy-result fixture; startup itself must never launch A5.
+    app.driver_origin = CheckOrigin::Preflight;
     deliver_audit(&mut app, Ok(audit()));
     assert!(matches!(app.driver_audit, DriverAuditState::Done(_)));
     let stamp = app.driver_checked.clone().expect("checked");
@@ -376,7 +1107,7 @@ fn crypto_recheck_is_fresh_read_only_and_never_parallel() {
 // ---------------- 9. ReHash explicit confirmation ----------------
 
 #[test]
-fn rehash_needs_warning_and_confirmation_and_never_runs_during_a_check() {
+fn rehash_explicit_click_starts_once_and_never_runs_during_a_check() {
     let (mut app, exe) = app_in("rehash");
     app.crypto = Some(cryptopro::HashState::NoHash);
     // A check is running: no ReHash, not even the confirmation.
@@ -385,18 +1116,20 @@ fn rehash_needs_warning_and_confirmation_and_never_runs_during_a_check() {
     app.apply(Action::CryptoRehashRequest);
     assert!(!app.crypto_rehash_confirm);
     app.crypto_rx = None;
-    // Request → warning only.
-    app.apply(Action::CryptoRehashRequest);
-    assert!(app.crypto_rehash_confirm);
+    // Explicit click is the authorization; no modal or automatic execution.
     assert!(!app.collector_requests.contains(&"cryptopro_rehash"));
-    // Cancel → nothing ran.
-    app.apply(Action::CryptoRehashCancelled);
-    assert!(!app.crypto_rehash_confirm);
-    assert!(app.crypto_rx.is_none());
-    // Confirm → ReHash starts (and its result is re-verified by rehash()).
     app.apply(Action::CryptoRehashRequest);
-    app.apply(Action::CryptoRehashConfirmed);
-    assert!(app.collector_requests.contains(&"cryptopro_rehash"));
+    assert!(!app.crypto_rehash_confirm);
+    assert!(app.crypto_rx.is_some());
+    // Repeated clicks while running cannot start another operation.
+    app.apply(Action::CryptoRehashRequest);
+    assert_eq!(
+        app.collector_requests
+            .iter()
+            .filter(|r| **r == "cryptopro_rehash")
+            .count(),
+        1
+    );
     assert!(app.crypto_rx.is_some());
     let src = include_str!("cryptopro.rs").replace("\r\n", "\n");
     let rehash = &src[src.find("pub fn rehash(").unwrap()..];
@@ -405,16 +1138,28 @@ fn rehash_needs_warning_and_confirmation_and_never_runs_during_a_check() {
         rehash.find("\"-rm\"").unwrap() < rehash.rfind("check(det, runner)").unwrap(),
         "verified again (cpverify -rv) after ReHash"
     );
-    // The Details window shows the warning text.
+    // v1.1 UI contract: the confirmation is its own window (opened by
+    // the card's round button) with the warning; Details only points to
+    // the card and has no ReHash action of its own.
     let ctx = egui::Context::default();
     crate::ui::fonts::install(&ctx);
     app.crypto_rx = None;
     app.crypto = Some(cryptopro::HashState::NoHash);
-    app.crypto_rehash_confirm = true;
     app.crypto_details_open = true;
+    let mut details = Vec::new();
+    for _ in 0..3 {
+        details = shown_texts(&ctx, |ui| app.crypto_details_window(ui.ctx()));
+    }
+    assert!(
+        !details
+            .iter()
+            .any(|t| t == i18n::RU.crypto_rehash_from_card_note)
+    );
+    assert!(!details.iter().any(|t| t == i18n::RU.crypto_rehash_action));
+    app.crypto_rehash_confirm = true;
     let mut texts = Vec::new();
     for _ in 0..3 {
-        texts = shown_texts(&ctx, |ui| app.crypto_details_window(ui.ctx()));
+        texts = shown_texts(&ctx, |ui| app.crypto_rehash_confirm_window(ui.ctx()));
     }
     assert!(
         texts.iter().any(|t| t.contains("ИЗМЕНЯЕТ СИСТЕМУ")),
@@ -491,7 +1236,14 @@ fn driver_history_clear_needs_confirmation_and_touches_nothing_else() {
     match &app.driver_export_status {
         Some(ExportStatus::Saved(p)) => {
             let text = std::fs::read_to_string(p).unwrap();
-            assert!(text.contains(&driver_audit::to_text(&audit())[..40]));
+            assert!(
+                text.contains(
+                    &driver_audit::to_text(&audit())
+                        .chars()
+                        .take(40)
+                        .collect::<String>()
+                )
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -532,9 +1284,10 @@ fn closing_the_app_cancels_background_processes() {
     }
     // The real app close calls it with the global flag.
     let src = include_str!("app.rs").replace("\r\n", "\n");
-    assert!(src.contains("    fn on_exit(&mut self) {\n        self.shutdown(&engine::SHUTDOWN);"));
+    assert!(src.contains("    fn on_exit(&mut self) {\n        self.powerlab.stop();\n        self.shutdown(&engine::SHUTDOWN);"));
     let lib = include_str!("lib.rs").replace("\r\n", "\n");
-    assert!(lib.contains("    fn on_exit(&mut self) {\n        self.inner.on_exit();"));
+    let on_exit = &lib[lib.find("    fn on_exit(&mut self) {").unwrap()..];
+    assert!(on_exit[..200].contains("self.inner.on_exit();"));
     cleanup(&exe);
 }
 
@@ -880,12 +1633,14 @@ fn dashboard_crypto_and_driver_headers_fit_at_100_125_150() {
 fn preflight_results_never_feed_report_states_or_correlation() {
     let (mut app, exe) = app_in("derived");
     app.start_preflight();
+    // Explicit legacy-result fixture; startup itself must never launch A5.
+    app.driver_origin = CheckOrigin::Preflight;
     let mut bad = audit();
     bad.overall = Severity::Problem;
     deliver_audit(&mut app, Ok(bad));
     let mut inv = inventory(crash_dump::DebuggerStatus::NotInstalled);
     inv.bugchecks = vec![crash_dump::BugcheckEvent {
-        time: "2026-10-03T00:35:00".into(),
+        time: local_iso(sysinfo::local_time()),
         code: 0x139,
         params: Vec::new(),
         dump_path: None,
@@ -979,6 +1734,8 @@ fn session_gets_its_own_crypto_check_after_a_manual_check_or_rehash() {
 fn failed_audit_keeps_the_time_and_origin_of_the_shown_result() {
     let (mut app, exe) = app_in("drvstamp");
     app.start_preflight();
+    // Explicit legacy-result fixture; startup itself must never launch A5.
+    app.driver_origin = CheckOrigin::Preflight;
     deliver_audit(&mut app, Ok(audit()));
     let shown = app.driver_checked.clone().unwrap();
     assert_eq!(shown.origin, CheckOrigin::Preflight);
@@ -1000,6 +1757,12 @@ fn failed_audit_keeps_the_time_and_origin_of_the_shown_result() {
     assert!(app.driver_history.last().is_some_and(
         |e| e.outcome.contains("collector failed") && e.stamp.origin == CheckOrigin::Session
     ));
+    assert!(!app.system_basis_complete());
+    assert!(
+        app.state_reasons()
+            .iter()
+            .any(|r| r.contains("A5 collector [COVERAGE/ERROR]"))
+    );
     cleanup(&exe);
 }
 
@@ -1262,4 +2025,441 @@ fn passport_window_at_minimum_size_keeps_the_footer_visible() {
     let src = include_str!("app_v11.rs").replace("\r\n", "\n");
     assert!(src.contains("let body_h = (ui.available_height() - footer_h).max(24.0);"));
     cleanup(&exe);
+}
+
+#[test]
+fn v1210_gui_execution_and_raw_journal_contract() {
+    let (mut app, exe) = app_in("v1210_status");
+    app.package = Arc::new(Mutex::new(SessionPackage::for_exe_dir(&exe)));
+    report_package::lock(&app.package).bind_session(SessionIdentity::new(
+        "v1210-test-session",
+        "",
+        "MSI",
+    ));
+    app.journal.push("Начало v1210-test-session".into());
+    app.state = RunState::Done {
+        zip_path: "report.zip".into(),
+    };
+    app.expc_checks = vec![deep_checks::ExpcCheck {
+        key: "SFC".into(),
+        status: "UNKNOWN".into(),
+        detail: "unrecognized".into(),
+    }];
+    let vm = app.build_vm(0.0, 0.0);
+    assert!(vm.operation.subtitle.contains("Диагностика завершена"));
+    assert!(
+        vm.operation.subtitle.contains("частично") || vm.operation.subtitle.contains("Нет данных")
+    );
+    app.driver_audit = DriverAuditState::Done(Box::new(AuditReport {
+        complete: true,
+        devices_scanned: 297,
+        errors: vec!["Get-WindowsDriver: 0xC0040009; scope=DRIVER_PACKAGE_COLLECTION".into()],
+        ..Default::default()
+    }));
+    let vm = app.build_vm(0.0, 0.0);
+    assert!(vm.operation.subtitle.contains("Ошибка диагностики"));
+    assert_eq!(app.audit_report().unwrap().overall, Severity::Ok);
+    assert!(
+        app.state_reasons()
+            .iter()
+            .any(|r| r.contains("[COVERAGE/ERROR]") && r.contains("0xC0040009"))
+    );
+    app.driver_audit = DriverAuditState::Idle;
+    app.expc_checks.push(deep_checks::ExpcCheck {
+        key: "Step 07".into(),
+        status: "ERROR".into(),
+        detail: "exception".into(),
+    });
+    let vm = app.build_vm(0.0, 0.0);
+    assert!(vm.operation.subtitle.contains("Ошибка диагностики"));
+    assert_eq!(vm.operation.tone, Tone::Error);
+    let original = "A5_PROGRESS|Native date fallback: 48/53; 31.0 s";
+    let mut journal = SessionJournal::default();
+    journal.push(original.into());
+    assert!(
+        journal
+            .full_text(i18n::t(Language::Ru))
+            .contains("Проверка дат драйверов: 48 из 53 · 31 с")
+    );
+    assert!(journal.technical_text().contains(original));
+    app.journal.push(original.into());
+    assert!(
+        app.build_vm(0.0, 0.0)
+            .journal
+            .last()
+            .unwrap()
+            .message
+            .contains("Проверка дат драйверов: 48 из 53 · 31 с")
+    );
+    // The production synchronization path feeds the same summary to all report formats.
+    app.manifest_states_checked = None;
+    app.sync_manifest_states();
+    let zip = {
+        let mut package = report_package::lock(&app.package);
+        let zip = package
+            .contribute(
+                "",
+                "MSI",
+                "30-10-26",
+                vec![report_package::EvidenceFile::new(
+                    "EXPC_test.txt",
+                    b"test".to_vec(),
+                )],
+            )
+            .unwrap();
+        package
+            .snapshot_session_journal(
+                &app.journal
+                    .entries
+                    .iter()
+                    .map(SessionJournal::technical_line)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        package.finalize().unwrap();
+        zip
+    };
+    let files = report_package::parse_zip(&std::fs::read(zip).unwrap()).unwrap();
+    for name in ["State_Summary.json", "manifest.json"] {
+        let bytes = &files.iter().find(|f| f.name == name).unwrap().bytes;
+        let value = json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
+        assert_eq!(
+            value.get("execution_status").unwrap().as_str(),
+            Some("COMPLETED_WITH_ERRORS")
+        );
+        assert_eq!(
+            value.get("coverage_status").unwrap().as_str(),
+            Some("LIMITED")
+        );
+        assert_eq!(
+            value.get("producer_version").unwrap().as_str(),
+            Some(crate::APP_VERSION)
+        );
+    }
+    assert!(files.iter().any(|f| f.name == "State_Summary.txt"
+        && String::from_utf8_lossy(&f.bytes).contains("Execution: COMPLETED_WITH_ERRORS")));
+    assert!(
+        files
+            .iter()
+            .any(|f| String::from_utf8_lossy(&f.bytes).contains(original))
+    );
+}
+
+#[test]
+fn v1211_repair_request_gate_and_immutable_zip_evidence() {
+    use crate::repair;
+    let (mut app, exe) = app_in("v1211_repair");
+    assert!(!app.repair_busy());
+    assert!(app.repair_ui.pending.is_none());
+    app.package = Arc::new(Mutex::new(SessionPackage::for_exe_dir(&exe)));
+    report_package::lock(&app.package).bind_session(SessionIdentity::new(
+        "v1211-repair",
+        "Клиент",
+        "MSI",
+    ));
+    app.client_name = "Клиент".into();
+    app.journal.push("Начало v1211-repair".into());
+    app.state = RunState::Done {
+        zip_path: "report.zip".into(),
+    };
+    for status in &mut app.expc_tracker.status {
+        *status = SubStageStatus::Done;
+    }
+    let original = DeepCheckOutcome {
+        check: DeepCheck::Sfc,
+        result: CheckResult::Attention,
+        detail: "SFC /verifyonly обнаружил признаки нарушения целостности.".into(),
+        source: deep_checks::ResultSource::ExpcJson,
+    };
+    app.deep_check_results = vec![original.clone()];
+    app.expc_checks = vec![deep_checks::ExpcCheck {
+        key: "SFC".into(),
+        status: "ATTENTION".into(),
+        detail: original.detail.clone(),
+    }];
+    assert!(app.build_vm(0.0, 0.0).stages[10].repair_available);
+    assert!(!app.build_vm(0.0, 0.0).stages[11].repair_available);
+    app.apply(Action::RequestRepair(10));
+    assert!(app.repair_ui.pending.is_none());
+    assert!(
+        app.repair_ui
+            .message
+            .contains("Native Repair отключён в тестах")
+    );
+    assert!(!app.repair_busy());
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.repair_ui.rx = Some(rx);
+    app.apply(Action::Start);
+    assert!(matches!(app.state, RunState::Done { .. }));
+    app.apply(Action::Reset);
+    assert_eq!(app.deep_check_results[0], original);
+    assert!(!app.build_vm(0.0, 0.0).stages[10].repair_available);
+    app.repair_ui.rx = None;
+    drop(tx);
+    let original_bytes = b"Original EXPC: SFC INTEGRITY_VIOLATIONS";
+    app.contribute_evidence(
+        "repair",
+        "Initial",
+        vec![EvidenceFile::new(
+            "EXPC_original.txt",
+            original_bytes.to_vec(),
+        )],
+    );
+    let report = repair::Report {
+        id: "fake-success".into(),
+        plan: repair::plan(&original, "C:").unwrap(),
+        status: "SUCCESS_VERIFIED".into(),
+        message: "Повторная проверка чистая".into(),
+        repair: Some(repair::Output {
+            code: Some(0),
+            text: "completed".into(),
+            scheduled: false,
+        }),
+        verification: Some(repair::Output {
+            code: Some(0),
+            text: "Windows Resource Protection did not find any integrity violations.".into(),
+            scheduled: false,
+        }),
+        verified: Some(CheckResult::Ok),
+        reboot: false,
+        completed_at: "2026-11-05T00:00:00".into(),
+    };
+    app.accept_repair_report(report);
+    assert_eq!(
+        app.deep_check_results[0], original,
+        "original never overwritten"
+    );
+    assert_eq!(app.deep_check_at(10).unwrap().result, CheckResult::Ok);
+    assert!(!app.build_vm(0.0, 0.0).stages[10].repair_available);
+    assert!(
+        app.diag_checks()
+            .iter()
+            .any(|c| c.key == "SFC" && c.status == "OK")
+    );
+    assert!(
+        !app.diag_checks()
+            .iter()
+            .any(|c| c.key == "SFC" && c.status == "ATTENTION")
+    );
+    app.manifest_states_checked = None;
+    app.sync_manifest_states();
+    let mut pkg = report_package::lock(&app.package);
+    pkg.finalize().unwrap();
+    let zip = pkg.final_zip().unwrap().to_path_buf();
+    drop(pkg);
+    let files = report_package::parse_zip(&std::fs::read(zip).unwrap()).unwrap();
+    assert_eq!(
+        files
+            .iter()
+            .find(|f| f.name == "EXPC_original.txt")
+            .unwrap()
+            .bytes,
+        original_bytes
+    );
+    for name in ["Repair_fake-success.json", "Repair_fake-success.txt"] {
+        assert!(files.iter().any(|f| f.name == name));
+    }
+    let manifest = String::from_utf8(
+        files
+            .iter()
+            .find(|f| f.name == "manifest.json")
+            .unwrap()
+            .bytes
+            .clone(),
+    )
+    .unwrap();
+    assert!(manifest.contains("\"repairs\""));
+    assert!(manifest.contains("SUCCESS_VERIFIED"));
+    assert!(manifest.contains("Repair_fake-success.json"));
+}
+#[test]
+fn v1211_firmware_actual_font_width_at_windows_scales() {
+    let ctx = egui::Context::default();
+    crate::ui::fonts::install(&ctx);
+    for ppp in [1.0, 1.25, 1.5, 1.75, 2.0] {
+        ctx.set_pixels_per_point(ppp);
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let cols = crate::ui::pages::stage_table_columns(0.0);
+                let width = cols[2] - cols[1] - 10.0;
+                let label = i18n::RU.stage_short[13];
+                assert_eq!(label, "BIOS / Драйверы / Firmware");
+                let style = crate::ui::pages::firmware_label_style(ui.painter(), label, width);
+                let galley = ui.painter().layout_no_wrap(
+                    label.into(),
+                    crate::ui::fonts::font(style),
+                    egui::Color32::WHITE,
+                );
+                assert!(
+                    galley.size().x <= width,
+                    "{ppp}: {} > {width}",
+                    galley.size().x
+                );
+                println!(
+                    "A9 Firmware ppp={ppp} font={} width={:.2}/{width}",
+                    style.size,
+                    galley.size().x
+                );
+            });
+            output.textures_delta.clear();
+        }
+    }
+}
+
+#[test]
+fn v13_a9_repair_button_hit_test_dispatches_once_without_second_confirmation() {
+    let (mut app, _exe) = app_in("v1211_hit");
+    app.state = RunState::Done {
+        zip_path: "test.zip".into(),
+    };
+    for state in &mut app.expc_tracker.status {
+        *state = SubStageStatus::Done;
+    }
+    app.deep_check_results = vec![DeepCheckOutcome {
+        check: DeepCheck::Sfc,
+        result: CheckResult::Attention,
+        detail: "SFC /verifyonly обнаружил признаки нарушения целостности.".into(),
+        source: deep_checks::ResultSource::ExpcJson,
+    }];
+    let vm = app.build_vm(0.0, 0.0);
+    let ctx = egui::Context::default();
+    crate::ui::fonts::install(&ctx);
+    let mut actions = Vec::new();
+    let mut point = None;
+    for _ in 0..2 {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1400.0, 1150.0))),
+                ..Default::default()
+            },
+            |ui| crate::ui::pages::draw_stages_table(ui, egui::Pos2::ZERO, &vm, &mut actions),
+        );
+        point = native_texts(&output)
+            .into_iter()
+            .find(|(text, _)| text == "Исправить")
+            .map(|(_, rect)| rect.center());
+        output.textures_delta.clear();
+    }
+    assert!(actions.is_empty());
+    assert!(app.repair_ui.pending.is_none());
+    let point = point.expect("Repair must render in the finding cell");
+    let cols = crate::ui::pages::stage_table_columns(
+        crate::ui::tokens::layout::STAGE_TABLE_CARD[0] - 1.0 + 16.0,
+    );
+    assert!(point.x >= cols[4] && point.x < cols[5]);
+    for pressed in [true, false] {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1400.0, 1150.0))),
+                events: pointer_button(point, pressed),
+                ..Default::default()
+            },
+            |ui| crate::ui::pages::draw_stages_table(ui, egui::Pos2::ZERO, &vm, &mut actions),
+        );
+        output.textures_delta.clear();
+    }
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| matches!(a, Action::RequestRepair(10)))
+            .count(),
+        1
+    );
+    for action in actions {
+        app.apply(action);
+    }
+    assert!(app.repair_ui.pending.is_none());
+    assert!(
+        app.repair_ui
+            .message
+            .contains("Native Repair отключён в тестах")
+    );
+    assert!(!app.repair_busy());
+}
+
+#[test]
+fn v1212_repair_window_scroll_confirmation_and_progress_are_headless() {
+    // Exercise the actual rendering callback without creating an OS window or a repair worker.
+    for size in [vec2(780.0, 850.0), vec2(420.0, 300.0)] {
+        let mut app = WinStateDiagApp::default();
+        app.repair_ui.open = true;
+        let finding = DeepCheckOutcome {
+            check: DeepCheck::Chkdsk,
+            result: CheckResult::Attention,
+            detail: "Windows found problems".into(),
+            source: deep_checks::ResultSource::ExpcJson,
+        };
+        app.repair_ui.pending = crate::repair::plan(&finding, "C:");
+        let ctx = egui::Context::default();
+        crate::ui::fonts::install(&ctx);
+        let mut seen = std::collections::BTreeSet::new();
+        for frame in 0..18 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(frame as f64 / 10.0),
+                    events: if frame > 2 {
+                        vec![
+                            egui::Event::PointerMoved(egui::pos2(140.0, 130.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: vec2(0.0, -160.0),
+                                phase: egui::TouchPhase::Move,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                },
+                |_| app.repair_window(&ctx),
+            );
+            for (text, _) in native_texts(&output) {
+                seen.insert(text);
+            }
+            output.textures_delta.clear();
+            assert!(!app.repair_busy());
+        }
+        assert!(
+            seen.iter()
+                .any(|s| s.contains("Подтверждаю исправление и возможное планирование")),
+            "{size:?}: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|s| s.contains("Продолжить к подтверждению"))
+        );
+        assert!(app.repair_ui.pending.is_some());
+        app.repair_ui.pending = None;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.repair_ui.rx = Some(rx);
+        *app.repair_ui.progress.lock().unwrap() = crate::repair::Progress {
+            check: Some(DeepCheck::Chkdsk),
+            phase: "Повторная проверка (только чтение)".into(),
+            percent: Some(25.5),
+            latest: "Проверка выполняется".into(),
+        };
+        let mut progress_texts = Vec::new();
+        for frame in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(2.0 + frame as f64 / 10.0),
+                    ..Default::default()
+                },
+                |_| app.repair_window(&ctx),
+            );
+            progress_texts.extend(native_texts(&output));
+            output.textures_delta.clear();
+        }
+        assert!(
+            progress_texts
+                .iter()
+                .any(|(s, _)| s.contains("Исправление выполняется")),
+            "{size:?}: {progress_texts:?}"
+        );
+        assert!(!app.repair_ui.cancel.load(Ordering::SeqCst));
+    }
 }

@@ -47,6 +47,7 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
             .to_string(),
             short_finding: String::new(),
             duration: format!("00:{:02}", 1 + i % 5),
+            repair_available: false,
         })
         .collect();
 
@@ -85,17 +86,26 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
     };
 
     DashboardVm {
+        bios: BiosVm::default(),
+        ai_export_enabled: true,
+        ai_export_busy: false,
+        drivers_progress: String::new(),
         lang,
         controls_enabled: true,
         stop_enabled: false,
         crypto: CryptoVm::HashOk,
         crypto_caption: Some(format!("{} · 16:05", d.origin_preflight_short)),
         crypto_recheck_enabled: true,
+        crypto_csp: "CSP 5.0.13800".into(),
+        crypto_csp_tone: Tone::Success,
+        crypto_rehash_enabled: false,
         drivers_caption: Some(format!("{} · 16:05", d.origin_preflight_short)),
         drivers_check_enabled: true,
         computer_name: COMPUTER_NAME.into(),
         stages,
         overall: OverallVm {
+            detail: "Режим: Основная · глубокие проверки не выбирались".into(),
+            retry_export: false,
             fraction: 1.0,
             percent_text: "100%".into(),
             status_text: d.overall_status_done.into(),
@@ -237,6 +247,7 @@ pub fn master_vm_in(lang: Language) -> DashboardVm {
             install: None,
         },
         sensors: SensorsVm {
+            hardware: Default::default(),
             matrix: Vec::new(),
             refs: Vec::new(),
             temps: Vec::new(),

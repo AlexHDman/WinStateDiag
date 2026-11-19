@@ -1,0 +1,24 @@
+{
+  "name": "unicode-segmentation",
+  "version": "1.13.3",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/unicode-rs/unicode-segmentation",
+  "authors": [
+    "kwantam <kwantam@gmail.com>",
+    "Manish Goregaokar <manishsmail@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\unicode-segmentation-1.13.3\\COPYRIGHT",
+    "licenses\\unicode-segmentation-1.13.3\\LICENSE-APACHE",
+    "licenses\\unicode-segmentation-1.13.3\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "66a032fd8d667bc47ac5b640b151dff3f5356d07"
+    },
+    "path_in_vcs": ""
+  }
+}

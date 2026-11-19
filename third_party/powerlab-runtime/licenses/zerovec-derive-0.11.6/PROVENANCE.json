@@ -1,0 +1,21 @@
+{
+  "name": "zerovec-derive",
+  "version": "0.11.6",
+  "license": "Unicode-3.0",
+  "repository": "https://github.com/unicode-org/icu4x",
+  "authors": [
+    "Manish Goregaokar <manishsmail@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\zerovec-derive-0.11.6\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "898d79c69f37da7b45a15a5714663c9b59b3d928"
+    },
+    "path_in_vcs": "utils/zerovec/derive"
+  }
+}

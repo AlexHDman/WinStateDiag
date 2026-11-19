@@ -1,0 +1,22 @@
+{
+  "name": "webbrowser",
+  "version": "1.2.4",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/amodm/webbrowser-rs",
+  "authors": [
+    "Amod Malviya @amodm"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\webbrowser-1.2.4\\LICENSE-APACHE",
+    "licenses\\webbrowser-1.2.4\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "13fdff33e967dd160581ce8ac45a8c3588e8eb59"
+    },
+    "path_in_vcs": ""
+  }
+}

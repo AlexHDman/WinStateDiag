@@ -1,0 +1,22 @@
+{
+  "name": "allocator-api2",
+  "version": "0.2.21",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/zakarumych/allocator-api2",
+  "authors": [
+    "Zakarum <zaq.dev@icloud.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\allocator-api2-0.2.21\\LICENSE-APACHE",
+    "licenses\\allocator-api2-0.2.21\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "63cd7fcc2f8854b5821c7054d026e8a4647acde1"
+    },
+    "path_in_vcs": ""
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "cursor-icon",
+  "version": "1.2.0",
+  "license": "MIT OR Apache-2.0 OR Zlib",
+  "repository": "https://github.com/rust-windowing/cursor-icon",
+  "authors": [
+    "Kirill Chibisov <contact@kchibisov.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\cursor-icon-1.2.0\\LICENSE-APACHE",
+    "licenses\\cursor-icon-1.2.0\\LICENSE-MIT",
+    "licenses\\cursor-icon-1.2.0\\LICENSE-ZLIB"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "766287581de8b4895d018c2d15ada77627a954f0"
+    },
+    "path_in_vcs": ""
+  }
+}

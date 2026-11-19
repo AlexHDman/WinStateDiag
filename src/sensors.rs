@@ -124,6 +124,7 @@ impl HwCategory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Provider {
+    CollectorRuntime,
     NvmeHealth,
     /// v1.0 read-only ATA / SATA SMART (attribute 194 / 190) — disk
     /// temperatures only.
@@ -139,7 +140,8 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 10] = [
+    pub const ALL: [Provider; 11] = [
+        Provider::CollectorRuntime,
         Provider::NvmeHealth,
         Provider::AtaSmart,
         Provider::LhmInternal,
@@ -153,6 +155,7 @@ impl Provider {
     ];
     pub fn code(self) -> &'static str {
         match self {
+            Provider::CollectorRuntime => "Sensor collector runtime",
             Provider::NvmeHealth => "NVMe Health",
             Provider::AtaSmart => "ATA SMART",
             Provider::LhmInternal => "LibreHardwareMonitorLib (internal)",
@@ -167,6 +170,7 @@ impl Provider {
     }
     pub fn short(self) -> &'static str {
         match self {
+            Provider::CollectorRuntime => "Collector",
             Provider::NvmeHealth => "NVMe",
             Provider::AtaSmart => "SMART",
             Provider::LhmInternal => "LHM",
@@ -188,6 +192,7 @@ impl Provider {
     /// for disk temperatures; it never offers anything else.
     pub fn priority(self) -> u8 {
         match self {
+            Provider::CollectorRuntime => 255,
             Provider::NvmeHealth => 0,
             Provider::AtaSmart => 0,
             Provider::LhmInternal => 1,
@@ -259,6 +264,7 @@ pub struct Sensor {
     pub min: f64,
     pub max: f64,
     pub samples: u32,
+    pub critical_consecutive: u32,
     pub confidence: Confidence,
     pub timestamp: String,
 }
@@ -294,6 +300,7 @@ fn norm(s: &str) -> String {
 /// Confidence of one sensor from its provider and kind.
 pub fn confidence_of(r: &RawReading) -> Confidence {
     match (r.provider, r.kind) {
+        (Provider::CollectorRuntime, _) => Confidence::Low,
         (Provider::Win32VoltageProbe, _) | (Provider::ThermalZone, _) => Confidence::Low,
         (Provider::LhmWmi | Provider::OhmWmi, SensorKind::Voltage) => {
             if r.category == HwCategory::Motherboard && r.board_mapped {
@@ -330,6 +337,8 @@ pub fn confidence_of(r: &RawReading) -> Confidence {
 #[derive(Debug, Default, Clone)]
 pub struct Sampler {
     sensors: Vec<Sensor>,
+    // Retain session extrema across a failed sample, without exposing stale current values.
+    stale: Vec<Sensor>,
     pub samples_taken: u32,
 }
 
@@ -337,7 +346,29 @@ impl Sampler {
     pub fn add_sample(&mut self, readings: &[RawReading], timestamp: &str) {
         self.samples_taken += 1;
         for r in readings {
-            let Some(v) = r.value.filter(|v| plausible(r.kind, *v)) else {
+            let value = r.value.filter(|v| plausible(r.kind, *v)).filter(|v| {
+                // LHM supplies a numeric zero for unsupported GPU power. Without
+                // a validity bit it is unconfirmed, not a high-confidence reading.
+                !(r.kind == SensorKind::Power
+                    && *v == 0.0
+                    && (r.category == HwCategory::Cpu
+                        || (r.category == HwCategory::Gpu
+                            && matches!(
+                                r.provider,
+                                Provider::LhmInternal | Provider::LhmWmi | Provider::OhmWmi
+                            ))))
+            });
+            let Some(v) = value else {
+                // A failed subsequent sample invalidates the old current value.
+                if let Some(i) = self
+                    .sensors
+                    .iter()
+                    .position(|s| s.provider == r.provider && s.sensor_id == r.sensor_id)
+                {
+                    let mut stale = self.sensors.remove(i);
+                    stale.critical_consecutive = 0;
+                    self.stale.push(stale);
+                }
                 continue;
             };
             // A running CPU never draws 0 W: LibreHardwareMonitorLib reports
@@ -346,12 +377,28 @@ impl Sampler {
             if r.kind == SensorKind::Power && r.category == HwCategory::Cpu && v <= 0.0 {
                 continue;
             }
+            if let Some(i) = self
+                .stale
+                .iter()
+                .position(|s| s.provider == r.provider && s.sensor_id == r.sensor_id)
+            {
+                self.sensors.push(self.stale.remove(i));
+            }
             match self
                 .sensors
                 .iter_mut()
                 .find(|s| s.provider == r.provider && s.sensor_id == r.sensor_id)
             {
                 Some(s) => {
+                    s.critical_consecutive =
+                        if Rail::from_sensor_name(&r.name).is_some_and(|rail| {
+                            classify((v - rail.nominal()) / rail.nominal() * 100.0)
+                                == RailStatus::Critical
+                        }) {
+                            s.critical_consecutive + 1
+                        } else {
+                            0
+                        };
                     s.value = v;
                     s.min = s.min.min(v);
                     s.max = s.max.max(v);
@@ -370,6 +417,12 @@ impl Sampler {
                     min: v,
                     max: v,
                     samples: 1,
+                    critical_consecutive: u32::from(Rail::from_sensor_name(&r.name).is_some_and(
+                        |rail| {
+                            classify((v - rail.nominal()) / rail.nominal() * 100.0)
+                                == RailStatus::Critical
+                        },
+                    )),
                     confidence: confidence_of(r),
                     timestamp: timestamp.to_string(),
                 }),
@@ -409,6 +462,8 @@ pub enum Role {
     // Voltages
     AtxRail(Rail),
     DynamicVoltage(String),
+    /// Provider-labelled voltage with no confirmed ATX nominal (e.g. standby).
+    InformationalVoltage(String),
     // Power
     CpuPackagePower,
     CpuCorePower,
@@ -631,7 +686,9 @@ pub fn role_of(s: &Sensor) -> Option<Role> {
                     }
                 }
             }
-            None
+            (cat == HwCategory::Motherboard
+                && (n.contains("standby") || n.contains("vsb") || n.contains("stby")))
+            .then(|| Role::InformationalVoltage(s.name.clone()))
         }
         SensorKind::Power => match cat {
             HwCategory::Cpu => {
@@ -685,7 +742,17 @@ pub fn role_of(s: &Sensor) -> Option<Role> {
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ReadingOrigin {
+    pub hardware_id: String,
+    pub hardware_name: String,
+    pub sensor_id: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Canonical {
+    /// IDs are scoped to the provider; equal adapter indices from different providers are not a join.
+    pub origin: Option<ReadingOrigin>,
     pub role: Role,
     /// Label from the sensor/hardware (disk model, fan name); UI labels for
     /// fixed roles come from i18n.
@@ -698,6 +765,7 @@ pub struct Canonical {
     pub confidence: Confidence,
     /// Computed from several sensors (e.g. CPU core average).
     pub derived: bool,
+    pub critical_confirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -777,6 +845,12 @@ pub fn rail_status(rail: Rail, c: &Canonical) -> PowerStatus {
         RailStatus::Excellent => PowerStatus::Excellent,
         _ if !c.confidence.trusted() => PowerStatus::CheckSensor,
         RailStatus::Attention => PowerStatus::Attention,
+        RailStatus::Critical
+            if !c.critical_confirmed
+                || classify((c.value - n) / n * 100.0) != RailStatus::Critical =>
+        {
+            PowerStatus::CheckSensor
+        }
         RailStatus::Critical => PowerStatus::Critical,
     }
 }
@@ -830,6 +904,12 @@ fn canonical_from(role: Role, s: &Sensor) -> Canonical {
         _ => s.name.clone(),
     };
     Canonical {
+        origin: Some(ReadingOrigin {
+            hardware_id: s.hw_id.clone(),
+            hardware_name: s.hw_name.clone(),
+            sensor_id: s.sensor_id.clone(),
+            timestamp: s.timestamp.clone(),
+        }),
         role,
         label,
         value: s.value,
@@ -839,6 +919,7 @@ fn canonical_from(role: Role, s: &Sensor) -> Canonical {
         provider: s.provider,
         confidence: s.confidence,
         derived: false,
+        critical_confirmed: s.critical_consecutive >= 2,
     }
 }
 
@@ -865,9 +946,19 @@ pub fn summarize(sensors: &[Sensor]) -> Summary {
     for ids in disk_ids.values_mut() {
         ids.sort();
     }
+    let mut gpu_roles: BTreeMap<(Provider, String, Role), Vec<&Sensor>> = BTreeMap::new();
     let mut by_role: BTreeMap<Role, Vec<&Sensor>> = BTreeMap::new();
     for s in sensors {
         if let Some(mut r) = role_of(s) {
+            if s.category == HwCategory::Gpu {
+                let id = if s.hw_id.is_empty() {
+                    s.sensor_id.clone()
+                } else {
+                    s.hw_id.clone()
+                };
+                gpu_roles.entry((s.provider, id, r)).or_default().push(s);
+                continue;
+            }
             if let Role::DiskTemp(k) = &r
                 && let Some(ids) = disk_ids.get(&(s.provider, k.clone()))
                 && ids.len() > 1
@@ -933,7 +1024,9 @@ pub fn summarize(sensors: &[Sensor]) -> Summary {
                 let st = rail_status(*rail, &c);
                 rails.push((*rail, c, st));
             }
-            Role::DynamicVoltage(_) => dynamic.push(pick(role.clone(), list)),
+            Role::DynamicVoltage(_) | Role::InformationalVoltage(_) => {
+                dynamic.push(pick(role.clone(), list))
+            }
             Role::CpuPackagePower
             | Role::CpuCorePower
             | Role::CpuUncorePower
@@ -943,6 +1036,18 @@ pub fn summarize(sensors: &[Sensor]) -> Summary {
             Role::CpuFan | Role::Pump | Role::SystemFan(_) | Role::GpuFan(_) => {
                 fans.push(pick(role.clone(), list))
             }
+        }
+    }
+    // Preserve each provider-local physical adapter. Never compare an Intel reading
+    // with NVIDIA or merge two identical models by name/index across providers.
+    for ((_, _, role), readings) in &gpu_roles {
+        let c = pick(role.clone(), readings);
+        match c.kind {
+            SensorKind::Temperature => temps.push(c),
+            SensorKind::Voltage => dynamic.push(c),
+            SensorKind::Power => power.push(c),
+            SensorKind::Fan | SensorKind::Control => fans.push(c),
+            _ => {}
         }
     }
     // CPU temperature: average of all cores.
@@ -984,6 +1089,7 @@ fn cpu_temperature(by_role: &std::collections::BTreeMap<Role, Vec<&Sensor>>) -> 
         let mean = |f: fn(&Sensor) -> f64| set.iter().map(|s| f(s)).sum::<f64>() / n;
         let first = set[0];
         return Some(Canonical {
+            origin: None,
             role: Role::CpuCoreAverage,
             label: "CPU".into(),
             value: mean(|s| s.value),
@@ -993,6 +1099,7 @@ fn cpu_temperature(by_role: &std::collections::BTreeMap<Role, Vec<&Sensor>>) -> 
             provider: first.provider,
             confidence: first.confidence,
             derived: true,
+            critical_confirmed: false,
         });
     }
     None
@@ -1179,6 +1286,7 @@ pub struct Snapshot {
     /// v1.0 lightweight process context taken while the sensors were
     /// sampled (explains a high CPU load; never a fault by itself).
     pub process_context: Option<ProcessContext>,
+    pub hardware_metadata: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -1292,6 +1400,16 @@ pub fn process_context_json(p: Option<&ProcessContext>) -> String {
 }
 
 impl Snapshot {
+    pub fn failure_reason(&self) -> Option<String> {
+        let reasons: Vec<_> = self
+            .providers
+            .iter()
+            .filter(|p| p.state == ProviderState::ProviderError)
+            .map(|p| format!("{}: {}", p.provider.code(), p.detail))
+            .collect();
+        (!reasons.is_empty()).then(|| reasons.join("; "))
+    }
+
     /// Overall state of the sensor layer.
     pub fn state(&self) -> ProviderState {
         let s = summarize(&self.sensors);
@@ -1366,7 +1484,13 @@ pub fn parse_sampler_line(line: &str) -> Option<Vec<RawReading>> {
                 let kind = SensorKind::from_lhm(&s(r, "type"))?;
                 let hwtype = s(r, "hwtype");
                 let value = match r.get("value") {
-                    Some(json::Value::Num(n)) => Some(*n),
+                    Some(json::Value::Num(n))
+                        if r.get("state")
+                            .and_then(|x| x.as_str())
+                            .is_none_or(|v| v == "AVAILABLE") =>
+                    {
+                        Some(*n)
+                    }
                     _ => None,
                 };
                 Some(RawReading {
@@ -1406,6 +1530,26 @@ pub fn parse_sampler_output(stdout: &str) -> (Vec<(String, Vec<RawReading>)>, Ve
             samples.push((t.trim().to_string(), Vec::new()));
         } else if line.starts_with("WSD_SENS_STATUS ") {
             if let Some(r) = parse_status_line(line) {
+                if matches!(
+                    r.state,
+                    ProviderState::ProviderError
+                        | ProviderState::Unavailable
+                        | ProviderState::BlockedByWindowsSecurity
+                ) {
+                    let stale: Vec<_> = samples
+                        .iter()
+                        .flat_map(|(_, rows)| rows)
+                        .filter(|row| row.provider == r.provider)
+                        .map(|row| {
+                            let mut invalid = row.clone();
+                            invalid.value = None;
+                            invalid
+                        })
+                        .collect();
+                    if let Some((_, rows)) = samples.last_mut() {
+                        rows.extend(stale);
+                    }
+                }
                 reports.push(r);
             }
         } else if line.starts_with("WSD_SENS ")
@@ -1571,30 +1715,47 @@ pub fn parse_hwinfo_shm(b: &[u8]) -> Result<Vec<RawReading>, String> {
 /// `WSD_SENS_STATUS` lines. Never installs or writes anything.
 pub const SAMPLER_PS1: &str = r#"param([string]$LhmDir = '', [int]$Samples = 10, [int]$IntervalMs = 1000)
 $ErrorActionPreference = 'Continue'
+# This sampler never installs drivers; installation is a separate explicit action.
 function J($o) { ConvertTo-Json -InputObject $o -Compress -Depth 4 }
 function Status($p, $state, $detail) { Write-Output ('WSD_SENS_STATUS ' + (J ([ordered]@{ p = $p; state = $state; detail = [string]$detail }))) }
-$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-# ---- LibreHardwareMonitorLib (internal, bundled) ----
-$lhm = $null; $pawn = $false
-try { $pawn = [bool](Get-CimInstance Win32_SystemDriver -Filter "Name='PawnIO'" -ErrorAction Stop | Where-Object { $_.State -eq 'Running' }) } catch { }
-if ($LhmDir -and (Test-Path -LiteralPath (Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'))) {
-  try {
-    $script:asm = @{}; Get-ChildItem -LiteralPath $LhmDir -Filter *.dll | ForEach-Object { $script:asm[[IO.Path]::GetFileNameWithoutExtension($_.Name)] = $_.FullName }
-    [AppDomain]::CurrentDomain.add_AssemblyResolve({ param($s, $e) $n = (New-Object Reflection.AssemblyName($e.Name)).Name; if ($script:asm.ContainsKey($n)) { return [Reflection.Assembly]::LoadFrom($script:asm[$n]) }; return $null })
-    [void][Reflection.Assembly]::LoadFrom((Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'))
-    $lhm = New-Object LibreHardwareMonitor.Hardware.Computer
-    foreach ($f in 'IsCpuEnabled','IsGpuEnabled','IsMotherboardEnabled','IsMemoryEnabled','IsStorageEnabled','IsControllerEnabled','IsPsuEnabled') { try { $lhm.$f = $true } catch { } }
-    foreach ($f in 'IsNetworkEnabled','IsBatteryEnabled') { try { $lhm.$f = $false } catch { } }
-    $lhm.Open()
-    $detail = if ($pawn) { 'PawnIO driver present (installed by the user)' } else { 'PawnIO low-level driver not installed: CPU/motherboard/RAM sensors unavailable (WinStateDiag never installs drivers)' }
-    if (-not $admin) { $detail += '; not elevated' }
-    Status 'LHM' $(if ($pawn -and $admin) { 'AVAILABLE' } else { 'PARTIAL' }) $detail
-  } catch {
-    $m = $_.Exception.Message
-    if ($m -match 'blocked|Application Control|policy|0x800711C7|Device Guard') { Status 'LHM' 'BLOCKED_BY_WINDOWS_SECURITY' $m } else { Status 'LHM' 'PROVIDER_ERROR' $m }
-    $lhm = $null
-  }
-} else { Status 'LHM' 'UNAVAILABLE' 'LibreHardwareMonitorLib not bundled in this build' }
+$admin = Get-WsdIsAdmin
+Initialize-WsdPawnNative
+if([Console]::ReadLine() -ne 'start'){return}
+[WsdPawnNative]::WatchParent()
+$lhm=$null;$readerMutex=$null;$readerOwned=$false;$lease=$null;$cleanupOk=$true
+$meta=[ordered]@{restricted_container=($env:WSD_HARDWARE_RESTRICTED -eq '1');pawnio=(Get-WsdPawnIo);identity=(Get-WsdHardwareIdentity);lhm_version=$WsdManifest.lhm_version;lhm_sha256=$WsdManifest.lhm_sha256;modules=@();mode='read-only; no fan/OC/settings changes';board_profile='UNKNOWN';errors=@()}
+try {
+  $readerMutex=[Threading.Mutex]::new($false,'Global\EXPC.HardwareMonitor.Reader')
+  try{$readerOwned=$readerMutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$readerOwned=$true;Save-WsdHardwareAbort $meta.pawnio 'Abandoned reader mutex';throw 'Previous hardware reader was abandoned; protected read refused'}
+  if(-not $readerOwned){throw 'Another hardware reader or installation owns polling'}
+  if ($LhmDir -and (Test-Path -LiteralPath (Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'))) {
+    try {
+      $dll=Join-Path $LhmDir 'LibreHardwareMonitorLib.dll'
+      if((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash -ne $WsdManifest.lhm_sha256){throw 'LHM library hash mismatch'}
+      [WsdPawnNative]::RegisterLhm($LhmDir)
+      $assembly=[Reflection.Assembly]::LoadFrom($dll)
+      $meta.modules=Test-WsdLhmModules $assembly $WsdManifest
+      [LibreHardwareMonitor.PawnIo.PawnIo]::AccessAllowed=($env:WSD_HARDWARE_RESTRICTED -ne '1' -and $admin -and $meta.pawnio.state -eq 'ACCESSIBLE' -and $meta.pawnio.reader_gate -eq 'READY')
+      [LibreHardwareMonitor.PawnIo.PawnIo]::AccessDenialReason=$meta.pawnio.state+': '+$meta.pawnio.open_message+'; '+$meta.pawnio.reader_gate_reason+'; restricted_container='+$meta.restricted_container
+      if([WsdPawnNative]::Stop){throw 'Parent closed before hardware startup'}
+      if([LibreHardwareMonitor.PawnIo.PawnIo]::AccessAllowed){$lease=Open-WsdHardwareLease $meta.pawnio}
+      $lhm = New-Object LibreHardwareMonitor.Hardware.Computer
+      # Native Windows Storage supplies temperature separately; no SMART enable.
+      $lhm.Open()
+      foreach ($f in 'IsCpuEnabled','IsGpuEnabled','IsMemoryEnabled','IsMotherboardEnabled') {
+        if([WsdPawnNative]::Stop){break}
+        if($f -eq 'IsMotherboardEnabled' -and -not [LibreHardwareMonitor.PawnIo.PawnIo]::AccessAllowed){continue}
+        try{$lhm.$f=$true}catch{$meta.errors+=($f+': '+$_.Exception.Message);Status 'LHM' 'PARTIAL' ($f+': '+$_.Exception.Message)}
+      }
+      $board=@($lhm.Hardware|Where-Object { [string]$_.HardwareType -eq 'Motherboard' })|Select-Object -First 1
+      if($board){$meta.board_profile=[string]$board.Model;$meta['board_discovery']=[string]$board.DiscoveryReport;$meta['super_io']=@($board.SubHardware|ForEach-Object { [ordered]@{id=[string]$_.Identifier;name=$_.Name;type=[string]$_.HardwareType} })}
+      Status 'LHM' 'PARTIAL' ('PawnIO='+$meta.pawnio.state+'; reader_admin='+$admin+'; individual sensor values determine coverage')
+    } catch {
+      $meta.errors+=('LHM: '+$_.Exception.Message)
+      Status 'LHM' 'PROVIDER_ERROR' $_.Exception.Message
+      if($lhm){try{$lhm.Close()}catch{$cleanupOk=$false;$meta.errors+=('initialization cleanup: '+$_.Exception.Message)}};$lhm=$null
+    }
+  } else { Status 'LHM' 'UNAVAILABLE' 'LibreHardwareMonitorLib not bundled' }
 # ---- WMI monitors already running ----
 $wmi = @()
 foreach ($ns in 'root\LibreHardwareMonitor','root\OpenHardwareMonitor') {
@@ -1607,22 +1768,37 @@ $probe = @()
 try { $probe = @(Get-CimInstance Win32_VoltageProbe -ErrorAction Stop | Where-Object { $null -ne $_.CurrentReading }) } catch { }
 Status 'WMI probe' $(if ($probe.Count) { 'AVAILABLE' } else { 'UNAVAILABLE' }) "$($probe.Count) probes"
 $tzOk = $true
-function Row($p, $hwid, $hwtype, $hw, $sid, $type, $name, $value, $bm) { [ordered]@{ p = $p; hwid = [string]$hwid; hwtype = [string]$hwtype; hw = [string]$hw; sid = [string]$sid; type = [string]$type; name = [string]$name; value = $value; bm = [bool]$bm } }
+function Row($p, $hwid, $hwtype, $hw, $sid, $type, $name, $value, $bm, $state='') {
+  if (-not $state) { $state = if ($null -eq $value) { 'SENSOR_ABSENT_OR_UNSUPPORTED' } else { 'AVAILABLE' } }
+  $rawValue=$value
+  if ($type -eq 'Power' -and $hwtype -like 'Gpu*' -and $p -in @('LHM','LHM WMI','OHM WMI') -and $null -ne $value -and $value -eq 0) { $state='UNCONFIRMED_ZERO' }
+  if ($state -ne 'AVAILABLE') {
+    $value=$null
+    Status $p 'PARTIAL' ("sensor=$sid; state=$state; value=null; previous values are not current")
+  }
+  [ordered]@{ p=$p; hwid=[string]$hwid; hwtype=[string]$hwtype; hw=[string]$hw; sid=[string]$sid; type=[string]$type; name=[string]$name; value=$value; raw_value=$rawValue; state=$state; bm=[bool]$bm }
+}
 function WalkLhm($hw, $rows, $board) {
-  try { $hw.Update() } catch { }
+  if([WsdPawnNative]::Stop){return}
+  $readState=''
+  if($env:WSD_HW_TRACE -eq '1'){Write-Output ('WSD_HW_UPDATE '+$hw.Identifier)}
+  try { if($hw -is [LibreHardwareMonitor.Hardware.Hardware]){$hw.InvalidateDynamicReadings()};$hw.Update() } catch {
+    $readState=if ($_.Exception -is [UnauthorizedAccessException]) { 'ACCESS_DENIED' } else { 'READ_ERROR' }
+  }
   foreach ($sh in $hw.SubHardware) { WalkLhm $sh $rows $board }
   foreach ($s in $hw.Sensors) {
+    if([string]$hw.HardwareType -eq 'Memory' -and [string]$hw.Identifier -like '*dimm*' -and [string]$s.SensorType -eq 'Temperature' -and $s.Index -ne 0){continue}
     $v = $null; if ($s.Value -ne $null) { $v = [double]$s.Value }
     $bm = ([string]$hw.HardwareType -eq 'SuperIO') -and $board
-    $rows.Add((Row 'LHM' $hw.Identifier $hw.HardwareType $hw.Name $s.Identifier $s.SensorType $s.Name $v $bm))
+    $rows.Add((Row 'LHM' $hw.Identifier $hw.HardwareType $hw.Name $s.Identifier $s.SensorType $s.Name $v $bm $readState))
   }
 }
-for ($i = 0; $i -lt $Samples; $i++) {
+for ($i = 0; $i -lt $Samples -and -not [WsdPawnNative]::Stop; $i++) {
   Write-Output ('WSD_SENS_T ' + (Get-Date).ToString('o'))
   $rows = New-Object System.Collections.Generic.List[object]
   if ($lhm) {
     foreach ($hw in $lhm.Hardware) {
-      $board = ([string]$hw.HardwareType -eq 'Motherboard') -and ($hw.Name -notmatch 'Unknown')
+      $board = ([string]$hw.HardwareType -eq 'Motherboard') -and ([string]$hw.Model -ne 'Unknown')
       WalkLhm $hw $rows $board
     }
   }
@@ -1632,13 +1808,14 @@ for ($i = 0; $i -lt $Samples; $i++) {
       $hws = @{}; foreach ($h in @(Get-CimInstance -Namespace $ns -ClassName Hardware -ErrorAction Stop)) { $hws[[string]$h.Identifier] = $h }
       foreach ($s in @(Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop)) {
         $h = $hws[[string]$s.Parent]
-        $rows.Add((Row $p $s.Parent $h.HardwareType $h.Name $s.Identifier $s.SensorType $s.Name ([double]$s.Value) $false))
+        $rows.Add((Row $p $s.Parent $h.HardwareType $h.Name $s.Identifier $s.SensorType $s.Name $(if ($null -ne $s.Value) { [double]$s.Value } else { $null }) $false))
       }
-    } catch { }
+    } catch { Status $p 'PROVIDER_ERROR' ('READ_ERROR: ' + $_.Exception.Message) }
   }
   if ($smi) {
     try {
       $q = & $smi --query-gpu=index,name,temperature.gpu,power.draw,fan.speed --format=csv,noheader,nounits 2>$null
+      if ($LASTEXITCODE -ne 0) { throw "nvidia-smi exit $LASTEXITCODE" }
       foreach ($l in @($q)) {
         $f = $l -split ',\s*'
         if ($f.Count -ge 5) {
@@ -1649,7 +1826,7 @@ for ($i = 0; $i -lt $Samples; $i++) {
           $rows.Add((Row 'nvidia-smi' $id 'GpuNvidia' $f[1] "$id/f" 'Control' 'GPU Fan' (& $num $f[4]) $false))
         }
       }
-    } catch { }
+    } catch { Status 'nvidia-smi' 'PROVIDER_ERROR' ('READ_ERROR: ' + $_.Exception.Message) }
   }
   if ($i -eq 0) {
     foreach ($pr in $probe) { $rows.Add((Row 'WMI probe' 'Win32_VoltageProbe' 'Motherboard' '' "probe/$($pr.DeviceID)" 'Voltage' (([string]$pr.Description + ' ' + [string]$pr.Name).Trim()) ([double]$pr.CurrentReading / 1000.0) $false)) }
@@ -1671,7 +1848,23 @@ for ($i = 0; $i -lt $Samples; $i++) {
   Write-Output ('WSD_SENS ' + (J ($rows.ToArray())))
   if ($i -lt $Samples - 1) { Start-Sleep -Milliseconds $IntervalMs }
 }
-if ($lhm) { try { $lhm.Close() } catch { } }
+  $meta['module_diagnostics']=@([LibreHardwareMonitor.PawnIo.PawnIo]::AccessDiagnostics)
+} catch { $meta.errors+=($_.Exception.Message);Status 'LHM' 'PROVIDER_ERROR' $_.Exception.Message }
+finally {
+  try {
+    if ($lhm) { try { $lhm.Close() } catch { $cleanupOk=$false;$meta.errors+=('cleanup: '+$_.Exception.Message) } }
+    if($lease){
+      if([LibreHardwareMonitor.PawnIo.PawnIo]::CleanupUncertain){$cleanupOk=$false;$meta.errors+='Protected transaction cleanup was not confirmed'}
+      Close-WsdHardwareLease $lease $cleanupOk
+    }
+  } catch {$cleanupOk=$false;$meta.errors+=('lease cleanup: '+$_.Exception.Message)}
+  finally {
+    $meta['cleanup_confirmed']=$cleanupOk
+    if($readerOwned){try{$readerMutex.ReleaseMutex()}catch{$meta.errors+=('mutex cleanup: '+$_.Exception.Message)}}
+    if($readerMutex){$readerMutex.Dispose()}
+    Write-Output ('WSD_HW_META '+($meta|ConvertTo-Json -Depth 14 -Compress))
+  }
+}
 "#;
 
 // ---------------------------------------------------------------------
@@ -1693,6 +1886,7 @@ fn role_code(r: &Role) -> String {
         Role::DiskTemp(k) => format!("DiskTemp:{k}"),
         Role::AtxRail(rail) => format!("AtxRail:{}", rail.label()),
         Role::DynamicVoltage(n) => format!("DynamicVoltage:{n}"),
+        Role::InformationalVoltage(n) => format!("InformationalVoltage:{n}"),
         Role::SystemFan(n) => format!("SystemFan:{n}"),
         Role::GpuFan(n) => format!("GpuFan:{n}"),
         other => format!("{other:?}"),
@@ -1713,7 +1907,9 @@ pub fn threshold_source_of_role(r: &Role) -> &'static str {
 
 pub fn threshold_source_of_sensor(x: &Sensor) -> &'static str {
     match (x.kind, x.category) {
-        (SensorKind::Voltage, HwCategory::Motherboard | HwCategory::Psu) => {
+        (SensorKind::Voltage, HwCategory::Motherboard)
+            if Rail::from_sensor_name(&x.name).is_some() =>
+        {
             "atx_spec_nominal_only_for_fixed_rails"
         }
         (SensorKind::Temperature, HwCategory::Storage) => "drive_reported_limits_or_none",
@@ -1722,8 +1918,9 @@ pub fn threshold_source_of_sensor(x: &Sensor) -> &'static str {
 }
 
 fn canonical_json(c: &Canonical) -> String {
+    let origin = c.origin.as_ref().map(|o| format!("{{\"hardware_id\": {}, \"hardware\": {}, \"sensor_id\": {}, \"timestamp\": {}, \"identity_scope\": \"provider_local\"}}",json::string(&o.hardware_id),json::string(&o.hardware_name),json::string(&o.sensor_id),json::string(&o.timestamp))).unwrap_or("null".into());
     format!(
-        "{{\"role\": {}, \"label\": {}, \"value\": {}, \"min\": {}, \"max\": {}, \"unit\": {}, \"provider\": {}, \"confidence\": {}, \"derived\": {}, \"threshold_source\": {}}}",
+        "{{\"role\": {}, \"label\": {}, \"value\": {}, \"min\": {}, \"max\": {}, \"unit\": {}, \"provider\": {}, \"confidence\": {}, \"derived\": {}, \"threshold_source\": {}, \"provenance\": {}}}",
         json::string(&role_code(&c.role)),
         json::string(&c.label),
         f(c.value),
@@ -1733,8 +1930,25 @@ fn canonical_json(c: &Canonical) -> String {
         json::string(c.provider.code()),
         json::string(c.confidence.code()),
         c.derived,
-        json::string(threshold_source_of_role(&c.role))
+        json::string(threshold_source_of_role(&c.role)),
+        origin
     )
+}
+
+/// Display precision must never turn a valid nonzero power reading into zero.
+pub fn power_text(value: f64) -> String {
+    if !value.is_finite() || value < 0.0 {
+        return "Нет данных".into();
+    }
+    if value == 0.0 {
+        "0 W".into()
+    } else if value < 0.001 {
+        format!("{value:.3e} W")
+    } else if value < 1.0 {
+        format!("{value:.3} W")
+    } else {
+        format!("{value:.1} W")
+    }
 }
 
 /// `Hardware_Sensors_<ts>.json`.
@@ -1792,7 +2006,7 @@ pub fn to_json(snap: &Snapshot) -> String {
         .iter()
         .map(|x| {
             format!(
-                "    {{\"provider\": {}, \"hardware\": {}, \"hardware_id\": {}, \"category\": {}, \"sensor_type\": {}, \"sensor_name\": {}, \"sensor_id\": {}, \"value\": {}, \"min\": {}, \"max\": {}, \"unit\": {}, \"samples\": {}, \"confidence\": {}, \"timestamp\": {}, \"threshold_source\": {}}}",
+                "    {{\"provider\": {}, \"hardware\": {}, \"hardware_id\": {}, \"category\": {}, \"sensor_type\": {}, \"sensor_name\": {}, \"sensor_id\": {}, \"value\": {}, \"min\": {}, \"max\": {}, \"unit\": {}, \"samples\": {}, \"critical_consecutive\": {}, \"confidence\": {}, \"timestamp\": {}, \"threshold_source\": {}}}",
                 json::string(x.provider.code()),
                 json::string(&x.hw_name),
                 json::string(&x.hw_id),
@@ -1805,6 +2019,7 @@ pub fn to_json(snap: &Snapshot) -> String {
                 f(x.max),
                 json::string(x.unit()),
                 x.samples,
+                x.critical_consecutive,
                 json::string(x.confidence.code()),
                 json::string(&x.timestamp),
                 json::string(threshold_source_of_sensor(x))
@@ -1812,7 +2027,7 @@ pub fn to_json(snap: &Snapshot) -> String {
         })
         .collect();
     let ps = s.power_status();
-    format!(
+    let mut output = format!(
         "{{\n  \"format\": \"winstatediag.hardware_sensors/1\",\n  \"captured_at\": {},\n  \"status\": {},\n  \"provider\": {},\n  \"lhm_bundle_version\": {},\n  \"sampling\": {{\"samples\": {}, \"interval_ms\": {}, \"min_max\": \"WinStateDiag session sample values, not lifetime hardware values\", \"load\": \"no stress applied\"}},\n  \"providers\": [\n{}\n  ],\n  \"summary\": {{\n    \"temperatures\": [\n{}\n    ],\n    \"atx_rails\": [\n{}\n    ],\n    \"dynamic_voltages\": [\n{}\n    ],\n    \"power\": [\n{}\n    ],\n    \"fans\": [\n{}\n    ]\n  }},\n  \"power_state\": {{\"status\": {}, \"note\": {}}},\n  \"mismatches\": [\n{}\n  ],\n  \"process_context\": {},\n  \"sensor_count\": {},\n  \"sensors\": [\n{}\n  ]\n}}\n",
         json::string(&snap.captured_at),
         json::string(snap.state().code()),
@@ -1836,7 +2051,39 @@ pub fn to_json(snap: &Snapshot) -> String {
         process_context_json(snap.process_context.as_ref()),
         snap.sensors.len(),
         sensors.join(",\n")
-    )
+    );
+    // Coverage is not a hardware-health verdict. Individual readings and
+    // thresholds remain in summary; no whole-machine health is inferred.
+    let provider_availability = if snap
+        .providers
+        .iter()
+        .any(|p| matches!(p.state, ProviderState::Available | ProviderState::Partial))
+    {
+        "AVAILABLE"
+    } else {
+        "UNAVAILABLE"
+    };
+    output.insert_str(2, &format!(
+        "  \"health\": \"NOT TESTED\",\n  \"coverage\": {},\n  \"provider_availability\": {},\n",
+        json::string(if snap.sensors.is_empty() { "NO DATA" } else { snap.state().code() }),
+        json::string(provider_availability)
+    ));
+    output.insert_str(
+        2,
+        &format!(
+            "  \"failure_reason\": {},\n",
+            snap.failure_reason()
+                .as_deref()
+                .map(json::string)
+                .unwrap_or_else(|| "null".into())
+        ),
+    );
+    if let Some(meta) = &snap.hardware_metadata
+        && json::parse(meta).is_some()
+    {
+        output.insert_str(2, &format!("  \"hardware_support\": {meta},\n"));
+    }
+    output
 }
 
 // ---------------------------------------------------------------------
@@ -1912,7 +2159,8 @@ pub fn collect_raw(
         }
     };
     let script = format!(
-        "& {{ {} }} -LhmDir '{}' -Samples {} -IntervalMs {}",
+        "{}\n& {{ {} }} -LhmDir '{}' -Samples {} -IntervalMs {}",
+        crate::hardware_support::base_script(),
         SAMPLER_PS1,
         lhm_dir
             .as_ref()
@@ -1925,8 +2173,9 @@ pub fn collect_raw(
     let timeout =
         std::time::Duration::from_millis(u64::from(samples) * u64::from(interval_ms) + 45_000);
     let proc_host = host.to_string();
-    let ps =
-        std::thread::spawn(move || crate::ps_exec::run_powershell(&host_owned, &script, timeout));
+    let ps = std::thread::spawn(move || {
+        crate::ps_exec::run_powershell_hardware(&host_owned, &script, timeout)
+    });
     // v1.0 process context, taken inside the sampling window.
     let procs = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(2500));
@@ -1948,6 +2197,7 @@ pub fn collect_raw(
                 });
             }
             Err(e) => {
+                hw_sampler = Sampler::default(); // previous values are stale after a read failure
                 hw_report = Some(ProviderReport {
                     provider: Provider::HwInfo,
                     state: ProviderState::Unavailable,
@@ -1984,8 +2234,10 @@ pub fn collect_raw(
             detail: "sensor sampler thread panicked".into(),
         }),
     }
-    if let Some(dir) = lhm_dir {
-        // The helper process has exited; the DLLs are no longer locked.
+    if raw.lines().any(|l| l.starts_with("WSD_HW_META "))
+        && let Some(dir) = lhm_dir
+    {
+        // Cooperative reader completed its cleanup before emitting final metadata.
         let _ = std::fs::remove_dir_all(dir);
     }
     providers.extend(hw_report);
@@ -2000,6 +2252,11 @@ pub fn collect_raw(
             sensors,
             providers,
             process_context,
+            hardware_metadata: raw
+                .lines()
+                .find_map(|l| l.strip_prefix("WSD_HW_META "))
+                .filter(|s| json::parse(s).is_some())
+                .map(str::to_owned),
         },
         raw,
     )
@@ -2270,6 +2527,295 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn rc8_archived_msi_sensor_replay() {
+        let Ok(root) = std::env::var("WSD_RC8_FIELD_ROOT") else {
+            return;
+        };
+        let text =
+            std::fs::read_to_string(std::path::Path::new(&root).join("sensor-replay.txt")).unwrap();
+        let (sets, _) = parse_sampler_output(&text);
+        let mut sampler = Sampler::default();
+        for (t, rows) in sets {
+            sampler.add_sample(&rows, &t);
+        }
+        let snap = Snapshot {
+            hardware_metadata: None,
+            sensors: sampler.into_sensors(),
+            ..Default::default()
+        };
+        let s = summarize(&snap.sensors);
+        assert_eq!(s.rails.len(), 3);
+        assert_eq!(s.power_status(), PowerStatus::Excellent);
+        let standby = snap
+            .sensors
+            .iter()
+            .find(|r| r.sensor_id == "/lpc/nct6687dr/0/voltage/11")
+            .unwrap();
+        assert_eq!(standby.value, 3.328);
+        assert_eq!(threshold_source_of_sensor(standby), "none_informational");
+        std::fs::write(
+            std::path::Path::new(&root).join("rc8-sensors-replayed.json"),
+            to_json(&snap),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rc8_msi_standby_is_informational_and_real_5vsb_fault_survives() {
+        for hw in [
+            "Nuvoton NCT6687D-R",
+            "Nuvoton NCT6776F",
+            "ITE IT8728F",
+            "Unknown board",
+        ] {
+            let mut rows = Vec::new();
+            for (name, value, index) in [
+                ("+12V", 12.0, 0),
+                ("+5V", 5.02, 1),
+                ("+3.3V", 3.316, 8),
+                ("+3V Standby", 3.328, 11),
+                ("AVSB", 3.324, 12),
+            ] {
+                let mut r = rr(
+                    Provider::LhmInternal,
+                    HwCategory::Motherboard,
+                    hw,
+                    name,
+                    SensorKind::Voltage,
+                    Some(value),
+                );
+                r.sensor_id = format!("/lpc/nct6687dr/0/voltage/{index}");
+                r.board_mapped = true;
+                rows.push(r);
+            }
+            let snap = Snapshot {
+                hardware_metadata: None,
+                sensors: sample(&rows),
+                ..Default::default()
+            };
+            let summary = summarize(&snap.sensors);
+            assert_eq!(summary.rails.len(), 3);
+            assert_eq!(summary.power_status(), PowerStatus::Excellent);
+            assert_eq!(summary.dynamic_voltages.len(), 2);
+            for c in &summary.dynamic_voltages {
+                assert!(matches!(c.role, Role::InformationalVoltage(_)));
+                assert_eq!(threshold_source_of_role(&c.role), "none_informational");
+            }
+            let j = to_json(&snap);
+            assert!(!j.contains("CRITICAL"));
+            assert!(j.contains("InformationalVoltage:+3V Standby"));
+            assert!(j.contains("InformationalVoltage:AVSB"));
+            // An explicit, trusted 5V standby reading must still detect a real deviation.
+            rows[3].name = "+5V Standby".into();
+            assert_eq!(
+                {
+                    let mut sampler = Sampler::default();
+                    sampler.add_sample(&rows, "t1");
+                    sampler.add_sample(&rows, "t2");
+                    summarize(sampler.sensors()).power_status()
+                },
+                PowerStatus::Critical
+            );
+            rows[3].provider = Provider::LhmWmi;
+            rows[3].board_mapped = false;
+            assert_eq!(
+                summarize(&sample(&rows)).power_status(),
+                PowerStatus::CheckSensor
+            );
+        }
+    }
+
+    #[test]
+    fn rc7_field_gpu_zero_replay_and_provider_failure_invalidate_current_reading() {
+        if let Ok(root) = std::env::var("WSD_RC7_FIELD_ROOT") {
+            for machine in ["LAB-D-SERVER", "LAB-B-SERVER", "LAB-C-SERVER", "LAB-E-SERVER"] {
+                let dir = std::path::Path::new(&root).join(machine);
+                let path = std::fs::read_dir(dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .find(|p| {
+                        p.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("Hardware_Sensors_")
+                            && p.extension().is_some_and(|e| e == "json")
+                    })
+                    .unwrap();
+                let text = std::fs::read_to_string(path).unwrap();
+                let json = json::parse(text.trim_start_matches('\u{feff}')).unwrap();
+                let json::Value::Arr(power) = json.get("summary").unwrap().get("power").unwrap()
+                else {
+                    panic!("power array")
+                };
+                assert_eq!(power.len(), 1, "{machine}");
+                let p = &power[0];
+                assert_eq!(
+                    p.get("provider").and_then(|v| v.as_str()),
+                    Some(Provider::LhmInternal.code())
+                );
+                let Some(json::Value::Num(value)) = p.get("value") else {
+                    panic!("value")
+                };
+                assert_eq!(*value, 0.0);
+                let mut sm = Sampler::default();
+                sm.add_sample(
+                    &[rr(
+                        Provider::LhmInternal,
+                        HwCategory::Gpu,
+                        "field GPU",
+                        "GPU Power",
+                        SensorKind::Power,
+                        Some(*value),
+                    )],
+                    "field",
+                );
+                assert!(
+                    summarize(sm.sensors()).power.is_empty(),
+                    "{machine}: no HIGH 0 W from unconfirmed LHM"
+                );
+            }
+        }
+        let text = r#"WSD_SENS_T t1
+WSD_SENS {"p":"nvidia-smi","hwtype":"GpuNvidia","type":"Power","sid":"gpu/p","value":20}
+WSD_SENS_T t2
+WSD_SENS_STATUS {"p":"nvidia-smi","state":"PROVIDER_ERROR","detail":"READ_ERROR; old value STALE"}
+"#;
+        let (sets, reports) = parse_sampler_output(text);
+        let mut sm = Sampler::default();
+        for (t, rows) in sets {
+            sm.add_sample(&rows, &t);
+        }
+        assert!(sm.sensors().is_empty());
+        assert!(reports[0].detail.contains("STALE"));
+    }
+
+    #[test]
+    fn rc7_gpu_unconfirmed_zero_null_and_stale_are_not_high_confidence() {
+        let mut row = rr(
+            Provider::LhmInternal,
+            HwCategory::Gpu,
+            "Intel GPU",
+            "GPU Power",
+            SensorKind::Power,
+            Some(0.0),
+        );
+        let mut sampler = Sampler::default();
+        sampler.add_sample(&[row.clone()], "t0");
+        assert!(sampler.sensors().is_empty());
+        row.value = Some(12.0);
+        sampler.add_sample(&[row.clone()], "t1");
+        assert_eq!(sampler.sensors().len(), 1);
+        row.value = None;
+        sampler.add_sample(&[row.clone()], "t2");
+        assert!(sampler.sensors().is_empty(), "old value is stale");
+        row.value = Some(20.0);
+        sampler.add_sample(&[row.clone()], "t-recovered");
+        assert_eq!(
+            (
+                sampler.sensors()[0].min,
+                sampler.sensors()[0].max,
+                sampler.sensors()[0].samples
+            ),
+            (12.0, 20.0, 2)
+        );
+        row.value = None;
+        sampler.add_sample(&[row.clone()], "t-failed");
+        row.provider = Provider::NvidiaSmi;
+        row.value = Some(0.0);
+        sampler.add_sample(&[row], "t3");
+        assert_eq!(
+            sampler.sensors()[0].value,
+            0.0,
+            "valid reported zero remains"
+        );
+        for state in [
+            "ACCESS_DENIED",
+            "READ_ERROR",
+            "STALE",
+            "UNSUPPORTED",
+            "SENSOR_ABSENT_OR_UNSUPPORTED",
+        ] {
+            let line = format!(
+                r#"WSD_SENS {{"p":"LHM","hwtype":"GpuIntel","type":"Power","value":5,"state":"{state}"}}"#
+            );
+            assert_eq!(parse_sampler_line(&line).unwrap()[0].value, None);
+        }
+    }
+
+    #[test]
+    fn diag_105_missing_measurements_are_not_hardware_problem() {
+        let snap = Snapshot {
+            hardware_metadata: None,
+            captured_at: "2026-10-19T12:00:00".into(),
+            providers: vec![ProviderReport {
+                provider: Provider::NvmeHealth,
+                state: ProviderState::Unavailable,
+                detail: "NO DATA: source unavailable".into(),
+            }],
+            ..Default::default()
+        };
+        let summary = summarize(&snap.sensors);
+        assert!(summary.temps.is_empty() && summary.fans.is_empty() && summary.rails.is_empty());
+        assert_eq!(summary.power_status(), PowerStatus::NoData);
+        assert_eq!(snap.state(), ProviderState::Unavailable);
+        let json = to_json(&snap);
+        assert!(
+            json.contains("UNAVAILABLE")
+                && json.contains("NO DATA")
+                && json.contains("2026-10-19T12:00:00")
+        );
+        assert!(!json.contains("PROBLEM") && !json.contains("normal temperature"));
+        let value = crate::deep_checks::json::parse(&json).unwrap();
+        assert_eq!(
+            value.get("health").and_then(|x| x.as_str()),
+            Some("NOT TESTED")
+        );
+        assert_eq!(
+            value.get("coverage").and_then(|x| x.as_str()),
+            Some("NO DATA")
+        );
+        assert_eq!(
+            value.get("provider_availability").and_then(|x| x.as_str()),
+            Some("UNAVAILABLE")
+        );
+    }
+
+    #[test]
+    fn phase04_provider_failure_reason_is_not_unsupported_or_no_data() {
+        let mut snap = Snapshot {
+            captured_at: "2026-10-19T12:00:00".into(),
+            providers: vec![ProviderReport {
+                provider: Provider::LhmWmi,
+                state: ProviderState::ProviderError,
+                detail: "HRESULT 0x80041003 access denied".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(snap.state(), ProviderState::ProviderError);
+        let text = to_json(&snap);
+        let value = json::parse(&text).unwrap();
+        assert!(
+            value
+                .get("failure_reason")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .contains("0x80041003")
+        );
+        assert_eq!(
+            value.get("health").and_then(|v| v.as_str()),
+            Some("NOT TESTED")
+        );
+        snap.providers[0].state = ProviderState::Unavailable;
+        snap.providers[0].detail = "UNSUPPORTED on this platform".into();
+        assert!(snap.failure_reason().is_none());
+        assert_eq!(snap.state(), ProviderState::Unavailable);
+        let text = to_json(&snap);
+        assert!(text.contains("UNSUPPORTED on this platform"));
+        assert!(text.contains("\"failure_reason\": null"));
+    }
+
+    #[test]
     fn normalization_and_summary_match_the_msi_reference() {
         let s = summarize(&sample(&msi_reference()));
         let t = |r: Role| s.temps.iter().find(|c| c.role == r).map(|c| c.value);
@@ -2512,7 +3058,12 @@ pub(crate) mod tests {
         );
         m.board_mapped = true;
         assert_eq!(
-            summarize(&sample(&[m])).power_status(),
+            {
+                let mut sampler = Sampler::default();
+                sampler.add_sample(&[m.clone()], "t1");
+                sampler.add_sample(&[m], "t2");
+                summarize(sampler.sensors()).power_status()
+            },
             PowerStatus::Critical
         );
     }
@@ -2608,12 +3159,20 @@ pub(crate) mod tests {
         let s = summarize(&sample(&rows));
         let gpu = s.temps.iter().find(|c| c.role == Role::GpuTemp).unwrap();
         assert_eq!(gpu.provider, Provider::HwInfo, "HWiNFO outranks nvidia-smi");
-        assert_eq!(
-            s.mismatches.len(),
-            1,
-            "12 °C apart → SENSOR SOURCE MISMATCH"
+        assert!(
+            s.mismatches.is_empty(),
+            "provider-local GPU IDs have no proven cross-provider join"
         );
-        assert_eq!(s.mismatches[0].other, (Provider::NvidiaSmi, 48.0));
+        assert_eq!(
+            s.temps.iter().filter(|c| c.role == Role::GpuTemp).count(),
+            2
+        );
+        assert!(
+            s.temps
+                .iter()
+                .filter(|c| c.role == Role::GpuTemp)
+                .all(|c| c.origin.is_some())
+        );
         // NVMe Health is the canonical disk temperature; 1 °C is no mismatch.
         let disk = s
             .temps
@@ -2729,7 +3288,7 @@ pub(crate) mod tests {
     fn min_max_are_session_sample_values() {
         use HwCategory::*;
         let mut sm = Sampler::default();
-        for v in [12.02, 11.95, 12.10, f64::NAN] {
+        for v in [12.02, 11.95, 12.10] {
             let mut r = rr(
                 Provider::HwInfo,
                 Motherboard,
@@ -2741,7 +3300,7 @@ pub(crate) mod tests {
             r.board_mapped = true;
             sm.add_sample(&[r], "t");
         }
-        assert_eq!(sm.samples_taken, 4);
+        assert_eq!(sm.samples_taken, 3);
         let s = &sm.sensors()[0];
         assert_eq!((s.min, s.max, s.value, s.samples), (11.95, 12.10, 12.10, 3));
     }
@@ -2829,6 +3388,7 @@ pub(crate) mod tests {
     #[test]
     fn missing_data_and_provider_failure_are_honest() {
         let snap = Snapshot {
+            hardware_metadata: None,
             captured_at: "t".into(),
             samples: 10,
             interval_ms: 1000,
@@ -2990,6 +3550,7 @@ WSD_SENS {\"p\":\"LHM\",\"hwid\":\"/gpu-nvidia/0\",\"hwtype\":\"GpuNvidia\",\"hw
     #[test]
     fn json_evidence_is_valid_and_labels_session_min_max() {
         let snap = Snapshot {
+            hardware_metadata: None,
             captured_at: "2026-10-05T11:00:00".into(),
             samples: 10,
             interval_ms: 1000,
@@ -3172,11 +3733,69 @@ WSD_SENS {\"p\":\"LHM\",\"hwid\":\"/gpu-nvidia/0\",\"hwtype\":\"GpuNvidia\",\"hw
         assert_eq!(low.system_cpu_percent, 12.0);
         // The snapshot lands in the sensor evidence JSON.
         let snap = Snapshot {
+            hardware_metadata: None,
             process_context: Some(p),
             ..Default::default()
         };
         assert!(to_json(&snap).contains("\"process_context\": {\"timestamp\""));
         assert!(PROCESS_PS1.contains("Win32_PerfFormattedData_PerfProc_Process"));
         assert!(!PROCESS_PS1.contains("Stop-Process"));
+    }
+}
+#[cfg(test)]
+mod v111_gpu_tests {
+    use super::*;
+    #[test]
+    fn integrated_and_discrete_power_never_collapse_or_compare_as_mismatch() {
+        use fixture::{rr, sample};
+        let mut intel = rr(
+            Provider::LhmInternal,
+            HwCategory::Gpu,
+            "Intel Graphics",
+            "GPU Power",
+            SensorKind::Power,
+            Some(0.025),
+        );
+        intel.hw_id = "/gpu-intel/fixture".into();
+        let mut nv = rr(
+            Provider::NvidiaSmi,
+            HwCategory::Gpu,
+            "NVIDIA GeForce RTX 5060",
+            "GPU Power",
+            SensorKind::Power,
+            Some(30.4),
+        );
+        nv.hw_id = "/nvidia-smi/fixture".into();
+        let readings = sample(&[intel, nv]);
+        let sum = summarize(&readings);
+        let p: Vec<_> = sum
+            .power
+            .iter()
+            .filter(|c| c.role == Role::GpuPower)
+            .collect();
+        assert_eq!(p.len(), 2);
+        assert!(sum.mismatches.is_empty());
+        assert!(
+            p.iter().any(|c| c.value == 0.025
+                && c.origin.as_ref().unwrap().hardware_name == "Intel Graphics")
+        );
+        assert!(p.iter().any(|c| {
+            c.value == 30.4
+                && c.origin
+                    .as_ref()
+                    .unwrap()
+                    .hardware_name
+                    .contains("RTX 5060")
+        }));
+        assert_eq!(power_text(0.025), "0.025 W");
+        assert_eq!(power_text(0.), "0 W");
+        assert_ne!(power_text(0.00001), "0 W");
+        let json = to_json(&Snapshot {
+            sensors: readings,
+            ..Default::default()
+        });
+        assert!(json.contains("provider_local"));
+        assert!(json.contains("Intel Graphics"));
+        assert!(json.contains("30.4"));
     }
 }

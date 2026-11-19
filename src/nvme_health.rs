@@ -690,6 +690,8 @@ pub fn health_source_status(h: &NvmeHealth) -> (&'static str, &'static str) {
         let status = match a.health() {
             "SMART: THRESHOLD EXCEEDED" => "PROBLEM",
             "SMART: OK" => "OK",
+            // v1.1 RC: thresholds not readable = no verdict, not a finding.
+            h if h.starts_with("SMART: PARTIAL") => "PARTIAL",
             _ => "ATTENTION",
         };
         return ("ata_smart", status);

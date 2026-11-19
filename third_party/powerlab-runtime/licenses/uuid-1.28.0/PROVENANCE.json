@@ -1,0 +1,24 @@
+{
+  "name": "uuid",
+  "version": "1.28.0",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/uuid-rs/uuid",
+  "authors": [
+    "Ashley Mannix<ashleymannix@live.com.au>",
+    "Dylan DPC<dylan.dpc@gmail.com>",
+    "Hunar Roop Kahlon<hunar.roop@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\uuid-1.28.0\\LICENSE-APACHE",
+    "licenses\\uuid-1.28.0\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "276c23628a669ca9fca637f3326c21b114e88049"
+    },
+    "path_in_vcs": ""
+  }
+}

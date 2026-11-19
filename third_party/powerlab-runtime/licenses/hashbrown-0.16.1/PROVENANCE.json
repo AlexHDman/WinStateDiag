@@ -1,0 +1,22 @@
+{
+  "name": "hashbrown",
+  "version": "0.16.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/rust-lang/hashbrown",
+  "authors": [
+    "Amanieu d'Antras <amanieu@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\hashbrown-0.16.1\\LICENSE-APACHE",
+    "licenses\\hashbrown-0.16.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "1876e4f02708b93903d55ef598f68e82a826518f"
+    },
+    "path_in_vcs": ""
+  }
+}

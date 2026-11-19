@@ -1,0 +1,21 @@
+{
+  "name": "zerofrom-derive",
+  "version": "0.1.8",
+  "license": "Unicode-3.0",
+  "repository": "https://github.com/unicode-org/icu4x",
+  "authors": [
+    "Manish Goregaokar <manishsmail@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\zerofrom-derive-0.1.8\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "ce235d80cf7cbd028e8bd59920420e1203b205b3"
+    },
+    "path_in_vcs": "utils/zerofrom/derive"
+  }
+}

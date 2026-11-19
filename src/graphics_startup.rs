@@ -233,8 +233,8 @@ pub struct StartupLog {
 }
 
 impl StartupLog {
-    /// `<EXE>\Reports\Logs\startup_graphics.log` (v1.0 Startup Idle: a
-    /// launch never creates a report folder; a diagnostic session copies
+    /// Per-user `EXPC/WinStateDiag/Logs/startup_graphics.log` (startup
+    /// never creates a report folder; a diagnostic session copies
     /// this log into its own package); if that is not writable,
     /// `%TEMP%\WinStateDiag\startup_graphics.log`.
     pub fn open(tag: &str) -> Self {
@@ -941,10 +941,18 @@ mod tests {
     fn startup_log_goes_into_reports_logs_not_a_report_folder() {
         let root = std::env::temp_dir().join(format!("wsd-gs-root-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let log = StartupLog::at(&crate::report_package::logs_dir(&root), "test");
+        let log = StartupLog::at(
+            &crate::report_package::logs_dir(&root.join("Reports")),
+            "test",
+        );
         log.line("hello");
         let path = log.path();
-        assert_eq!(path, root.join("Logs").join(LOG_FILE_NAME));
+        assert_eq!(
+            path,
+            crate::app_paths::data_root(&root)
+                .join("Logs")
+                .join(LOG_FILE_NAME)
+        );
         assert!(fs::read_to_string(&path).unwrap().contains("hello"));
         assert!(!root.join(LOG_FILE_NAME).exists());
         let dirs: Vec<String> = fs::read_dir(&root)
@@ -952,7 +960,7 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(dirs, vec!["Logs".to_string()]);
+        assert_eq!(dirs, vec![".test-user-profile".to_string()]);
         let _ = fs::remove_dir_all(&root);
     }
 

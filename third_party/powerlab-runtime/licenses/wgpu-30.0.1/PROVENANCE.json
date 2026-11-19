@@ -1,0 +1,22 @@
+{
+  "name": "wgpu",
+  "version": "30.0.1",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/gfx-rs/wgpu",
+  "authors": [
+    "gfx-rs developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\wgpu-30.0.1\\LICENSE.APACHE",
+    "licenses\\wgpu-30.0.1\\LICENSE.MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "40f4a34ebaf56f9a046231f54125ad046239d3f3"
+    },
+    "path_in_vcs": "wgpu"
+  }
+}

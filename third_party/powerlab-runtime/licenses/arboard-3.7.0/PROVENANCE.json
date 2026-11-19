@@ -1,0 +1,20 @@
+{
+  "name": "arboard",
+  "version": "3.7.0",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/1Password/arboard",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\arboard-3.7.0\\LICENSE-APACHE.txt",
+    "licenses\\arboard-3.7.0\\LICENSE-MIT.txt"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "5f5c8637911ba219edee619105a19b4f74e66a9f"
+    },
+    "path_in_vcs": ""
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "gpu-allocator",
+  "version": "0.28.0",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/Traverse-Research/gpu-allocator",
+  "authors": [
+    "Traverse Research <opensource@traverseresearch.nl>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\gpu-allocator-0.28.0\\LICENSE-APACHE",
+    "licenses\\gpu-allocator-0.28.0\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "3d4466e3331c43d1f85b937b775427b07d7a32fe"
+    },
+    "path_in_vcs": ""
+  }
+}

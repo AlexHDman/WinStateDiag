@@ -85,19 +85,55 @@ pub fn text_clipped(
             .x
             <= max_w
     };
-    if fits(text_value) {
+    // P0 (v1.1 startup freeze / abort): the old elision removed ONE char per
+    // layout — O(n²) glyph work and up to n cached galleys per frame. A
+    // 6 000-char journal line cost ~4.3 s and ~2.9 GB per frame (measured);
+    // with `panic = "abort"` an allocation failure closes the app. Now: the
+    // input is first cut to what can possibly fit (no glyph is narrower
+    // than CLIP_MIN_GLYPH_PX), then a binary search needs ≤ ~12 layouts.
+    let max_chars = clip_char_budget(max_w);
+    let mut chars: Vec<char> = text_value.chars().take(max_chars + 1).collect();
+    let cut = chars.len() > max_chars;
+    if cut {
+        chars.truncate(max_chars);
+    }
+    if !cut && fits(text_value) {
         return text(painter, x, baseline, Align::Min, text_value, style, color);
     }
-    let chars: Vec<char> = text_value.chars().collect();
-    let mut n = chars.len();
-    while n > 0 {
-        let candidate: String = chars[..n].iter().collect::<String>() + "…";
-        if fits(&candidate) {
-            return text(painter, x, baseline, Align::Min, &candidate, style, color);
+    let candidate = |n: usize| chars[..n].iter().collect::<String>() + "…";
+    // Largest n in [0, len] whose prefix + "…" fits (monotone in n).
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&candidate(mid)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
         }
-        n -= 1;
     }
-    text(painter, x, baseline, Align::Min, "…", style, color)
+    text(
+        painter,
+        x,
+        baseline,
+        Align::Min,
+        &candidate(lo),
+        style,
+        color,
+    )
+}
+
+/// No real glyph of the UI fonts is narrower than this (px): the most
+/// characters a `max_w`-wide line can ever show.
+const CLIP_MIN_GLYPH_PX: f32 = 2.0;
+
+/// Upper bound of characters that can fit in `max_w` (never below 8).
+pub fn clip_char_budget(max_w: f32) -> usize {
+    let w = if max_w.is_finite() {
+        max_w.max(0.0)
+    } else {
+        0.0
+    };
+    ((w / CLIP_MIN_GLYPH_PX).ceil() as usize).clamp(8, 4096)
 }
 
 pub fn text_width(painter: &Painter, text_value: &str, style: TextStyle) -> f32 {
@@ -331,6 +367,16 @@ pub fn icon_copy(painter: &Painter, rect: Rect, col: Color32) {
         stroke,
         StrokeKind::Middle,
     );
+    for fraction in [0.35, 0.55, 0.75] {
+        let y = front.top() + front.height() * fraction;
+        painter.line_segment(
+            [
+                egui::pos2(front.left() + 2.0, y),
+                egui::pos2(front.right() - 2.0, y),
+            ],
+            Stroke::new(0.9, col),
+        );
+    }
 }
 
 pub fn icon_document(painter: &Painter, rect: Rect, col: Color32) {
@@ -503,9 +549,12 @@ pub fn icon_refresh(painter: &Painter, center: Pos2, diameter: f32, col: Color32
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonKind {
     Primary,
+    Repair,
     Secondary,
     /// Secondary look with the softer label colour (journal "Очистить").
     Subtle,
+    /// v1.1: header page-tab violet (journal «Папка»).
+    Nav,
 }
 
 #[derive(Clone, Copy)]
@@ -515,30 +564,43 @@ pub enum ButtonIcon {
     Trash,
 }
 
-pub fn button(
-    ui: &mut Ui,
-    rect: Rect,
-    id_salt: &str,
-    label: &str,
+/// v1.1: (fill, border, text) of a [`button`] in a given state — one
+/// source for drawing and for the state regression tests.
+pub fn button_colors(
     kind: ButtonKind,
     enabled: bool,
-    icon: ButtonIcon,
-    style: TextStyle,
-) -> Response {
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let response = ui.interact(rect, ui.id().with(id_salt), sense);
-    let hovered = enabled && response.hovered();
-    let pressed = enabled && response.is_pointer_button_down_on();
-    let (fill, border, text_col) = match (kind, enabled) {
+    hovered: bool,
+    pressed: bool,
+) -> (Color32, Color32, Color32) {
+    match (kind, enabled) {
+        (ButtonKind::Nav, _) => (
+            if pressed {
+                c::PAGE_TAB_ACTIVE_FILL
+            } else {
+                Color32::from_rgb(87, 48, 155)
+            },
+            c::PAGE_TAB_ACTIVE_GLOW,
+            if enabled {
+                c::PAGE_TAB_ACTIVE_TEXT
+            } else {
+                c::BUTTON_DISABLED_TEXT
+            },
+        ),
         (_, false) => (
             c::BUTTON_DISABLED_FILL,
             c::BORDER_INNER,
             c::BUTTON_DISABLED_TEXT,
         ),
+        (ButtonKind::Repair, true) => {
+            let fill = if pressed {
+                Color32::from_rgb(210, 155, 28)
+            } else if hovered {
+                Color32::from_rgb(255, 213, 92)
+            } else {
+                c::YELLOW_WARNING
+            };
+            (fill, fill, Color32::from_rgb(24, 24, 24))
+        }
         (ButtonKind::Primary, true) => {
             let f = if pressed {
                 c::BLUE_DARK
@@ -569,7 +631,28 @@ pub fn button(
             };
             (f, b, t)
         }
+    }
+}
+
+pub fn button(
+    ui: &mut Ui,
+    rect: Rect,
+    id_salt: &str,
+    label: &str,
+    kind: ButtonKind,
+    enabled: bool,
+    icon: ButtonIcon,
+    style: TextStyle,
+) -> Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
     };
+    let response = ui.interact(rect, ui.id().with(id_salt), sense);
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let (fill, border, text_col) = button_colors(kind, enabled, hovered, pressed);
     let painter = ui.painter();
     painter.rect(
         rect,
@@ -663,6 +746,61 @@ pub fn round_refresh_button(
     let painter = ui.painter();
     painter.circle(center, diameter / 2.0, fill, Stroke::new(1.0, border));
     icon_refresh(painter, center, diameter * 0.5, glyph);
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// v1.1 round action button with a text glyph (CryptoPro ReHash «#»),
+/// the same family / states as [`round_refresh_button`].
+pub fn round_glyph_button(
+    ui: &mut Ui,
+    center: Pos2,
+    diameter: f32,
+    id_salt: &str,
+    enabled: bool,
+    glyph: &str,
+    accent: Color32,
+) -> Response {
+    let rect = Rect::from_center_size(center, vec2(diameter, diameter));
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, ui.id().with(id_salt), sense);
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let (fill, border, text) = if !enabled {
+        (
+            c::BUTTON_DISABLED_FILL,
+            c::BORDER_INNER,
+            c::BUTTON_DISABLED_TEXT,
+        )
+    } else if pressed {
+        (c::BUTTON_SECONDARY_PRESSED, accent, accent)
+    } else if hovered {
+        (c::BUTTON_SECONDARY_HOVER, accent, accent)
+    } else {
+        (c::BUTTON_SECONDARY_FILL, c::BUTTON_SECONDARY_BORDER, accent)
+    };
+    let painter = ui.painter();
+    painter.circle(center, diameter / 2.0, fill, Stroke::new(1.0, border));
+    let style = TextStyle {
+        size: diameter * 0.5,
+        weight: super::tokens::typography::Weight::Bold,
+    };
+    self::text(
+        painter,
+        center.x,
+        center.y + style.size * 0.36,
+        egui::Align::Center,
+        glyph,
+        style,
+        text,
+    );
     if enabled {
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
@@ -970,4 +1108,180 @@ pub fn icon_windows_logo(painter: &Painter, center: Pos2, size: f32, col: Color3
 /// disk other than the Windows system disk.
 pub fn icon_disk_neutral(painter: &Painter, center: Pos2, size: f32, col: Color32) {
     icon_device(painter, center, size, super::vm::DeviceIcon::Storage, col);
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    fn clipped(ctx: &egui::Context, s: &str, max_w: f32) -> (String, std::time::Duration) {
+        let mut shown = String::new();
+        let t0 = std::time::Instant::now();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let p = ui.painter().clone();
+            text_clipped(
+                &p,
+                0.0,
+                20.0,
+                max_w,
+                s,
+                super::super::tokens::typography::CAPTION,
+                Color32::WHITE,
+            );
+        });
+        let took = t0.elapsed();
+        out.textures_delta.clear();
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                shown = t.galley.text().to_string();
+            }
+        }
+        (shown, took)
+    }
+
+    /// P0 regression: a very long line (journal / collector error) is
+    /// elided in bounded time, and the result is the longest prefix that
+    /// fits — the same text the old one-char-at-a-time loop produced.
+    #[test]
+    fn long_text_is_clipped_fast_and_correctly() {
+        let ctx = egui::Context::default();
+        super::super::fonts::install(&ctx);
+        let long: String = "Проверка драйверов: ошибка сбора; "
+            .chars()
+            .cycle()
+            .take(20_000)
+            .collect();
+        let (shown, took) = clipped(&ctx, &long, 450.0);
+        assert!(shown.ends_with('…'), "{shown}");
+        assert!(long.starts_with(shown.trim_end_matches('…')));
+        // Old algorithm: >4 s and ~3 GB for 6 000 chars. Generous bound
+        // for debug builds on slow CI.
+        assert!(took.as_millis() < 1500, "took {took:?}");
+        // Same answer as the exhaustive search on a moderate text.
+        let mid: String = long.chars().take(300).collect();
+        let (fast, _) = clipped(&ctx, &mid, 450.0);
+        let mut best = String::from("…");
+        let p = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter().clone();
+            let chars: Vec<char> = mid.chars().collect();
+            for n in (0..=chars.len()).rev() {
+                let cand = chars[..n].iter().collect::<String>() + "…";
+                if painter
+                    .layout_no_wrap(
+                        cand.clone(),
+                        font(super::super::tokens::typography::CAPTION),
+                        Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                    <= 450.0
+                {
+                    best = cand;
+                    break;
+                }
+            }
+        });
+        let mut p = p;
+        p.textures_delta.clear();
+        assert_eq!(fast, best);
+        // Short text is untouched.
+        let (short, _) = clipped(&ctx, "OK", 450.0);
+        assert_eq!(short, "OK");
+    }
+
+    #[test]
+    fn clip_budget_is_bounded() {
+        assert_eq!(clip_char_budget(0.0), 8);
+        assert_eq!(clip_char_budget(f32::NAN), 8);
+        assert_eq!(clip_char_budget(450.0), 225);
+        assert_eq!(clip_char_budget(1.0e9), 4096);
+    }
+}
+
+/// Bounded display, exact clipboard value; no dynamic measurements.
+pub(crate) fn copy_value(
+    ui: &mut egui::Ui,
+    value: &str,
+    color: egui::Color32,
+    max_width: f32,
+) -> egui::Response {
+    let width = max_width.clamp(32.0, 440.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(0.7, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::simple_singleline(value.to_string(), font, color);
+    job.wrap.max_width = (rect.width() - 32.0).max(1.0);
+    job.wrap.max_rows = 1;
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    ui.painter().galley(
+        egui::pos2(rect.left() + 5.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    icon_copy(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 13.0, rect.center().y),
+            egui::vec2(16.0, 16.0),
+        ),
+        color,
+    );
+    if response.clicked() {
+        ui.ctx().copy_text(value.to_string());
+    }
+    response.on_hover_text(value)
+}
+
+#[test]
+fn rc7_copy_value_copies_full_identifier_at_narrow_width() {
+    let ctx = egui::Context::default();
+    let exact = "MODEL-PART-NUMBER-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut rect = egui::Rect::NOTHING;
+    let input = |events| egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(180.0, 80.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    let mut first = ctx.run_ui(input(vec![]), |ui| {
+        rect = copy_value(ui, exact, egui::Color32::WHITE, 160.0).rect;
+    });
+    first.textures_delta.clear();
+    let pos = rect.center();
+    let mut output = ctx.run_ui(
+        input(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]),
+        |ui| {
+            copy_value(ui, exact, egui::Color32::WHITE, 160.0);
+        },
+    );
+    output.textures_delta.clear();
+    assert!(rect.width() <= 180.0 && rect.height() == 24.0);
+    assert!(
+        output
+            .platform_output
+            .commands
+            .iter()
+            .any(|c| matches!(c,egui::OutputCommand::CopyText(s) if s==exact))
+    );
 }

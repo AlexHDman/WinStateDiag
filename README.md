@@ -1,113 +1,24 @@
-![WinStateDiag](assets/github-header.png)
+# EXPC WinDiag 1.12
 
-# WinStateDiag
+WinDiag is a portable Windows diagnostic application. This branch contains the sources and build inputs for the 1.12 candidate.
 
-**Portable read-only diagnostic center for Windows**
-EN: *Windows System Diagnostics Center* · RU: *Диагностический центр состояния Windows*
+## Build
 
-Current version: **v1.1** · Windows 10 / 11 x64 · portable, no installer
-
-> WinStateDiag **diagnoses and reports**. It does **not** repair Windows and never runs repair commands automatically.
-
-[Русская версия ниже](#русский)
-
----
-
-## What it does
-
-WinStateDiag is a single portable `WinStateDiag.exe`. It examines the current state of a Windows PC and collects the results into one verified ZIP report per PC and date.
-
-**Diagnostics**
-- **EXPC PC Diagnostics** — 14 read-only steps (system, storage, devices, events, VSS, WHEA, shutdowns/BSOD, application errors, memory diagnostic, Defender, deep checks, BIOS/drivers/firmware).
-- **Modes:** Standard, Deep checks (choose SFC / DISM / CHKDSK), Full.
-- **SFC / DISM / CHKDSK result states** — the completion (100%) is shown separately from what the check found: OK, ATTENTION or ERROR. Example: `DISM ⚠ 100%` means the scan completed and reported a component store that is repairable. The matching repair command is only *shown as text*; WinStateDiag never runs it.
-- **Hardware Passport** — one scrollable page of compact cards (CPU, memory, motherboard, BIOS/UEFI, storage, graphics, network, power/battery). Configuration, current measurements and values Windows could not confirm are shown apart; there is no universal "OK".
-- **Driver Audit** — read-only check of installed drivers with per-device status and evidence; runs once automatically at launch (preflight), «Проверка» re-checks it any time, and Details keep a check history.
-- **SSD / NVMe benchmark** — per physical disk (HDDs excluded), up to three disk slots, READ/WRITE results with stability rating and comparison against the previous run of the same disk. An UNSTABLE result is automatically confirmed by one retest; both runs are kept.
-- **NVMe Health** — native read-only SMART / Health and Error Information log of NVMe drives (Windows storage API, no third-party tools), correlated per physical disk with the benchmark and Windows storage events. Benchmark instability alone is never reported as an SSD failure.
-- **CryptoPro** — presence, CSP version, licence key and HASH state, checked read-only at launch and with ⟳; ReHash is the only exception to read-only behavior and runs only after a warning and an explicit confirmation.
-- **Startup preflight** — at launch the Driver Audit, CryptoPro, WinDbg / cdb detection and a crash / dump summary run in the background (no session, no report, no `!analyze`). Each result shows when and how it was produced; a full diagnostic always runs its own checks for the client report.
-
-**Application**
-- RU / EN interface, switchable live.
-- Safe Graphics: normal hardware rendering with automatic fallback to a software (WARP) renderer.
-- Session journal with a full-journal viewer (save / copy).
-- Footer shows the full Windows build (for example `26200.xxxx`).
-
-## Reports
-
-```
-WinStateDiag.exe
-Reports\
-├── <Client> - <Computer> - DD-MM-YY\
-│   └── <Client> - <Computer> - DD-MM-YY.zip
-└── History\ssd_benchmark_history.log      (persistent SSD history)
-```
-
-- One cumulative package per PC and date: every module adds its evidence (TXT / JSON / HTML) to the same ZIP.
-- Every ZIP contains **`manifest.json`** (schema 1.0): producer and version, computer, time, Windows build, modules with their evidence files, and SFC / DISM / CHKDSK result states. It is designed to be machine-readable for future tooling; no integration with other tools is implied.
-- Each ZIP is written to a temporary file, read back and checked (CRC of every entry) before it replaces the previous one. Only after that verification does the report folder keep just the final ZIP; on any doubt all files are kept.
-- The ZIP can be handed to an engineer or an AI assistant for analysis. WinStateDiag itself performs no AI analysis.
-
-## AI-assisted report analysis
-
-When uploading a WinStateDiag ZIP report to ChatGPT, Claude, Gemini or another AI assistant, use the included **[`AI_ANALYSIS_PROMPT.md`](AI_ANALYSIS_PROMPT.md)**.
-
-The prompt asks the AI to inspect the **entire archive**, correlate evidence between files, distinguish current problems from historical/system noise, reference the source evidence for important findings, and avoid unsupported repair recommendations.
-
-## Build from source
-
-Requirements: Rust (stable, edition 2024) with the `x86_64-pc-windows-msvc` toolchain.
+Use Windows x64, the Rust MSVC toolchain, and the Windows SDK with its resource compiler.
 
 ```powershell
-cargo test
-cargo build --release          # static CRT, see .cargo/config.toml
-# third-party sensor bundle (nuget.org, verified against scripts\release\lhm_bundle.sha256):
-powershell -ExecutionPolicy Bypass -File scripts\release\fetch_lhm.ps1
-# versioned portable release (fmt/check/test, fresh build, SHA-256 check):
-powershell -ExecutionPolicy Bypass -File scripts\make_release.ps1
-# proven release: clean worktree at an exact commit, live probes, evidence
-# in release-evidence\ (elevated; fails closed):
-scripts\release\release_gate.cmd <expected-head-sha>
+cargo build --release --locked --bin win_state_diag
+cargo test --lib --locked
 ```
 
-The release script produces `dist\WinStateDiag-vX.Y\WinStateDiag.exe` (since v1.0 releases are named `major.minor`; a patch digit appears only when it is not zero). The version comes from `Cargo.toml` (title bar, EXE metadata, manifest and release folder follow it).
+The executable is produced at `target/release/win_state_diag.exe`. The local packaging script is `scripts/make_release.ps1`.
 
-Repository layout: `src\` (Rust GUI and orchestration), `embedded\` (PowerShell diagnostic engine, embedded into the EXE), `assets\` (icon and branding), `scripts\` (release and QA scripts), `docs\` (architecture, known bugs, visual master).
+WinDiag reads Windows diagnostics, builds reports, renders client posters, previews A4 printing, and can prepare a masked AI request for explicit submission. The portable executable includes its PowerLab runtime and the original standalone hardware support packages. The WinDiag executable uses an administrator manifest.
 
-## Known limitations
+## Distribution notices
 
-See [docs/KNOWN_BUGS.md](docs/KNOWN_BUGS.md).
+`licenses/hardware` and `third_party/powerlab-runtime/licenses` contain notices and corresponding sources for the bundled hardware components and runtime. The official PawnIO installer is redistributed unchanged under its separate terms. See `third_party/PawnIO-2.2.0/NOTICE.txt`.
 
----
+The sources for the embedded Rust helper interfaces are in `third_party/powerlab-core`. Git does not contain client reports or working-session evidence.
 
-## Русский
-
-**WinStateDiag — портативный диагностический центр состояния Windows (только чтение).**
-Windows 10 / 11 x64, без установки, один файл `WinStateDiag.exe`.
-
-> WinStateDiag **диагностирует и формирует отчёт**. Он **не** ремонтирует Windows и никогда не запускает команды восстановления автоматически.
-
-**Возможности**
-- Диагностика ПК EXPC — 14 этапов; режимы: Основная, Глубокие проверки (выбор SFC / DISM / CHKDSK), Полная.
-- Результат SFC / DISM / CHKDSK отдельно от хода выполнения: OK / ВНИМАНИЕ / ОШИБКА. Например, `DISM ⚠ 100%` — проверка завершена, хранилище компонентов требует восстановления. Команда восстановления только показывается текстом и не выполняется.
-- Паспорт оборудования — одна прокручиваемая страница компактных карточек (процессор, память, плата, BIOS/UEFI, накопители, видео, сеть, питание/батарея); конфигурация, текущие измерения и неподтверждённые сведения различаются, универсального «OK» нет.
-- Проверка драйверов (только чтение): автоматически при запуске, кнопка «Проверка» — повторная проверка, журнал проверок в «Подробнее».
-- Предварительные проверки при запуске (в фоне, без сессии и отчёта): драйверы, КриптоПро, обнаружение WinDbg / cdb, сводка сбоев и дампов без `!analyze`. Полная диагностика выполняет собственные проверки для отчёта клиента.
-- Тест SSD / NVMe по физическим дискам с историей и сравнением с предыдущим результатом; нестабильный замер автоматически проверяется одним повтором.
-- Здоровье NVMe: собственное чтение SMART / Health и журнала ошибок контроллера (только чтение), сопоставление с замером и событиями Windows. Нестабильный замер сам по себе не считается отказом SSD.
-- КриптоПро: наличие, версия CSP, ключ лицензии и состояние HASH (только чтение, при запуске и по ⟳); ReHash — только после предупреждения и явного подтверждения.
-- Интерфейс RU / EN, безопасный запуск графики (резервный программный рендер WARP), журнал сессии.
-
-**Отчёт**: одна накопительная ZIP-папка на компьютер и дату в `Reports\`, внутри — `manifest.json` (машиночитаемое описание модулей, файлов и результатов глубоких проверок). После проверки итогового ZIP в папке отчёта остаётся только он; при любой ошибке все файлы сохраняются.
-
-**Анализ отчёта с помощью ИИ:** при загрузке ZIP в ChatGPT, Claude, Gemini или другой ИИ используйте готовый **[`AI_ANALYSIS_PROMPT.md`](AI_ANALYSIS_PROMPT.md)**. Он задаёт правильный порядок анализа всего архива, сопоставление данных между файлами, отделение актуальных проблем от старых событий и системного шума, а также требует подтверждать существенные выводы конкретными данными отчёта.
-
-## Real screenshots / Реальные скриншоты
-
-Real WinStateDiag v0.4.0 sessions on Windows.
-
-![WinStateDiag v0.4.0 real diagnostic session](assets/screenshots/WinStateDiag-v0.4.0-real-01-v2.jpg)
-
-![WinStateDiag v0.4.0 real diagnostic session](assets/screenshots/WinStateDiag-v0.4.0-real-02.jpg)
-
+Native Windows acceptance of the 1.12 application is still in progress.

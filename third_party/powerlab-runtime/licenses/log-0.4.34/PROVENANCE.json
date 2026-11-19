@@ -1,0 +1,22 @@
+{
+  "name": "log",
+  "version": "0.4.34",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/rust-lang/log",
+  "authors": [
+    "The Rust Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\log-0.4.34\\LICENSE-APACHE",
+    "licenses\\log-0.4.34\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "8034743dd9d7f7583bd9a670271483d176130911"
+    },
+    "path_in_vcs": ""
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "raw-window-handle",
+  "version": "0.6.2",
+  "license": "MIT OR Apache-2.0 OR Zlib",
+  "repository": "https://github.com/rust-windowing/raw-window-handle",
+  "authors": [
+    "Osspial <osspial@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\raw-window-handle-0.6.2\\LICENSE-APACHE.md",
+    "licenses\\raw-window-handle-0.6.2\\LICENSE-MIT.md",
+    "licenses\\raw-window-handle-0.6.2\\LICENSE-ZLIB.md"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "5fda8e8420b069368e9450e70c2869e32dcdffc1"
+    },
+    "path_in_vcs": ""
+  }
+}

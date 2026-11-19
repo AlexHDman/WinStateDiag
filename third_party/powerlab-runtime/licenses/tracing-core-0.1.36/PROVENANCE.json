@@ -1,0 +1,22 @@
+{
+  "name": "tracing-core",
+  "version": "0.1.36",
+  "license": "MIT",
+  "repository": "https://github.com/tokio-rs/tracing",
+  "authors": [
+    "Tokio Contributors <team@tokio.rs>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\tracing-core-0.1.36\\LICENSE",
+    "licenses\\tracing-core-0.1.36\\src\\spin\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "10a9e838a35e6ded79d66af246be2ee05417136d"
+    },
+    "path_in_vcs": "tracing-core"
+  }
+}

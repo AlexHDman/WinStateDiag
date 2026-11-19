@@ -1,0 +1,23 @@
+{
+  "name": "winapi-util",
+  "version": "0.1.11",
+  "license": "Unlicense OR MIT",
+  "repository": "https://github.com/BurntSushi/winapi-util",
+  "authors": [
+    "Andrew Gallant <jamslam@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\winapi-util-0.1.11\\COPYING",
+    "licenses\\winapi-util-0.1.11\\LICENSE-MIT",
+    "licenses\\winapi-util-0.1.11\\UNLICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "803874c57dc1f10ecd42f7c86d9de72f53818432"
+    },
+    "path_in_vcs": ""
+  }
+}

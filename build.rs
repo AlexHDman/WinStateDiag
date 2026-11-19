@@ -1,3 +1,5 @@
+#[path = "src/content_hash.rs"]
+mod content_hash;
 // Embeds the application icon and the Windows manifest (UAC elevation +
 // per-monitor DPI awareness) into the compiled .exe. Only runs when the
 // target is Windows; harmless no-op on any other host used for `cargo check`.
@@ -6,12 +8,12 @@
 const APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
-    version="1.1.0.0"
+    version="1.2.0.0"
     processorArchitecture="*"
-    name="WinStateDiag"
+    name="WinDiag"
     type="win32"
   />
-  <description>WinStateDiag - Windows State Diagnostics</description>
+  <description>EXPC WinDiag - Windows Diagnostics</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -104,8 +106,16 @@ fn embed_app_manifest() {
     }
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let manifest = out_dir.join("WinStateDiag.exe.manifest");
-    std::fs::write(&manifest, APP_MANIFEST).expect("write app manifest");
+    let version = std::env::var("CARGO_PKG_VERSION").expect("version");
+    let numeric_version = version.split('-').next().expect("numeric version");
+    let xml = APP_MANIFEST.replace(
+        "version=\"1.2.0.0\"",
+        &format!("version=\"{numeric_version}.0\""),
+    );
+    std::fs::write(&manifest, xml).expect("write app manifest");
     for arg in [
+        // Content-derived PE timestamps and debug identity make identical inputs reproducible.
+        "/Brepro".to_string(),
         "/MANIFEST:EMBED".to_string(),
         format!("/MANIFESTINPUT:{}", manifest.display()),
         // trustInfo comes verbatim from APP_MANIFEST; stop link.exe from
@@ -130,10 +140,45 @@ fn display_version(semver: &str) -> String {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=WSD_BUILD_ID");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "UNKNOWN".into());
+    let mut refs = vec!["HEAD".to_string(), "index".to_string()];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        refs.push(branch);
+    }
+    for reference in refs {
+        if let Some(path) = git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &reference,
+        ]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let dirty = git(&["status", "--porcelain"]).map(|s| !s.is_empty());
+    println!("cargo:rustc-env=WSD_PRODUCER_COMMIT={commit}");
+    println!(
+        "cargo:rustc-env=WSD_SOURCE_DIRTY={}",
+        dirty
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    );
     let display = display_version(&std::env::var("CARGO_PKG_VERSION").expect("version"));
     println!("cargo:rustc-env=WSD_DISPLAY_VERSION={display}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rustc-env=WSD_BUILD_DATE={}", build_date());
     embed_graphic_report_template();
     embed_lhm_bundle();
+    embed_portable_payload();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "windows" {
         return;
@@ -150,10 +195,147 @@ fn main() {
     // VERSIONINFO numbers stay the full 1.0.0.0 from Cargo.
     res.set("FileVersion", &display);
     res.set("ProductVersion", &display);
+    res.set("ProductName", "EXPC WinDiag");
+    res.set("FileDescription", "EXPC WinDiag");
+    res.set("InternalName", "WinDiag");
+    res.set("OriginalFilename", "WinDiag.exe");
     if let Err(e) = res.compile() {
         // Do not hard-fail cargo check on non-Windows-resource-capable hosts
         // (e.g. cross-compilation sanity checks); a real Windows release
         // build must not hit this branch.
         println!("cargo:warning=failed to embed Windows resources: {e}");
     }
+}
+
+fn build_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s <= 253_402_300_799)
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+    let days = seconds / 86_400;
+    let mut year = 1970 + 400 * (days / 146_097);
+    let mut day = days % 146_097;
+    let leap = |year: u64| {
+        year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100))
+    };
+    loop {
+        let days_in_year = 365 + u64::from(leap(year));
+        if day < days_in_year {
+            break;
+        }
+        day -= days_in_year;
+        year += 1;
+    }
+    for (index, days) in [
+        31,
+        28 + u64::from(leap(year)),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if day < days {
+            return format!("{year:04}-{:02}-{:02}", index + 1, day + 1);
+        }
+        day -= days;
+    }
+    unreachable!("validated UTC day")
+}
+
+// A deterministic, indexed gzip resource. All input files are tracked by Cargo.
+fn embed_portable_payload() {
+    println!("cargo:rerun-if-changed=third_party/powerlab-runtime");
+    println!("cargo:rerun-if-changed=licenses");
+    use std::{
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+    };
+    fn visit(base: &Path, dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+        let mut paths: Vec<_> = fs::read_dir(dir)
+            .expect("required payload directory")
+            .map(|e| e.unwrap().path())
+            .collect();
+        paths.sort();
+        for p in paths {
+            assert!(!p.is_symlink(), "payload symlink");
+            if p.is_dir() {
+                visit(base, &p, prefix, out)
+            } else {
+                out.push((
+                    format!(
+                        "{prefix}/{}",
+                        p.strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    ),
+                    p,
+                ));
+            }
+        }
+    }
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut files = vec![];
+    visit(
+        Path::new("third_party/powerlab-runtime"),
+        Path::new("third_party/powerlab-runtime"),
+        "PowerLab",
+        &mut files,
+    );
+    visit(
+        Path::new("licenses"),
+        Path::new("licenses"),
+        "licenses",
+        &mut files,
+    );
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut blob = fs::File::create(out.join("portable-payload.bin")).unwrap();
+    let mut index = String::from("const ENTRIES:&[Entry]=&[\n");
+    let mut offset = 0usize;
+    let mut stored = std::collections::BTreeMap::<String, (u64, usize, usize)>::new();
+    for (name, path) in files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(size <= 32 * 1024 * 1024);
+        let hash = content_hash::sha256(fs::File::open(&path).unwrap()).unwrap();
+        let (start, length) = if let Some(&(stored_size, start, length)) = stored.get(&hash) {
+            assert_eq!(stored_size, size, "payload SHA256 collision");
+            (start, length)
+        } else {
+            let mut gzip =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::copy(&mut fs::File::open(&path).unwrap(), &mut gzip).unwrap();
+            let bytes = gzip.finish().unwrap();
+            blob.write_all(&bytes).unwrap();
+            let start = offset;
+            offset += bytes.len();
+            stored.insert(hash.clone(), (size, start, bytes.len()));
+            (start, bytes.len())
+        };
+        index.push_str(&format!(
+            "Entry{{name:{name:?},size:{size},sha:{hash:?},offset:{start},length:{length}}},\n"
+        ));
+    }
+    drop(blob);
+    let id =
+        content_hash::sha256(fs::File::open(out.join("portable-payload.bin")).unwrap()).unwrap();
+    index.push_str(&format!("];\npub const PAYLOAD_ID:&str={id:?};\n"));
+    fs::write(out.join("portable-payload.rs"), index).unwrap();
 }

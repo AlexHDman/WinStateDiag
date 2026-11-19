@@ -17,6 +17,7 @@ pub enum Kind {
     Config,
     Measured,
     Unconfirmed,
+    Attention,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -338,7 +339,19 @@ pub fn build(text: &str, t: &Texts<'_>) -> Option<Passport> {
             d.pp_total,
             num_of(get(&v, &["Ram", "TotalBytes"]))
                 .filter(|n| *n > 0.0)
-                .map(bytes_text),
+                .map(bytes_text)
+                .map(|t| {
+                    // v1.1 RC (X79G): an incomplete SMBIOS module list
+                    // gives a lower bound, never a confirmed total.
+                    match get(&v, &["Ram", "InventoryComplete"]) {
+                        Some(json::Value::Bool(false)) => format!(
+                            "≥ {t} · {}",
+                            text_of(get(&v, &["Ram", "InventoryNote"]))
+                                .unwrap_or_else(|| "DIMM inventory incomplete".into())
+                        ),
+                        _ => t,
+                    }
+                }),
         ),
     ];
     let modules = list_of(get(&v, &["Ram", "Modules"]));
@@ -372,7 +385,6 @@ pub fn build(text: &str, t: &Texts<'_>) -> Option<Passport> {
                 .map(bytes_text),
             text_of(m.get("Type")).filter(|s| !is_unconfirmed(s)),
             num_of(m.get("ConfiguredSpeedMTs"))
-                .or_else(|| num_of(m.get("RatedSpeedMTs")))
                 .filter(|n| *n > 0.0)
                 .map(|n| format!("{} MT/s", num_text(n))),
             text_of(m.get("Manufacturer")).filter(|s| !is_unconfirmed(s)),
@@ -387,13 +399,15 @@ pub fn build(text: &str, t: &Texts<'_>) -> Option<Passport> {
         } else {
             plain(&label, parts.join(" · "), Kind::Config)
         });
+        if let Some(part) = text_of(m.get("PartNumber")).filter(|v| !is_unconfirmed(v)) {
+            rows.push(plain("Part Number", part, Kind::Config));
+        }
     }
     // Declared / configured data rates are SMBIOS facts, not measurements.
     let mut speeds: Vec<String> = modules
         .iter()
         .filter_map(|m| {
             num_of(m.get("ConfiguredSpeedMTs"))
-                .or_else(|| num_of(m.get("RatedSpeedMTs")))
                 .filter(|n| *n > 0.0)
                 .map(|n| format!("{} MT/s", num_text(n)))
         })
@@ -401,6 +415,59 @@ pub fn build(text: &str, t: &Texts<'_>) -> Option<Passport> {
     speeds.dedup();
     if !speeds.is_empty() {
         rows.insert(2, plain(d.pp_speed, speeds.join(" / "), Kind::Config));
+    }
+    if let Some(i) = get(&v, &["Ram", "Intelligence"]) {
+        let attention = text_of(i.get("Status")).as_deref() == Some("ATTENTION");
+        let kind = if attention {
+            Kind::Attention
+        } else {
+            Kind::Config
+        };
+        rows.push(plain(
+            "Настройка RAM",
+            text_of(i.get("Recommendation")).unwrap_or_else(|| "Нет данных".into()),
+            kind,
+        ));
+        for (key, label) in [
+            ("CurrentMTs", "Текущая скорость (SMBIOS)"),
+            ("ProfileMTs", "Профиль SPD/XMP"),
+            ("CpuOfficialMTs", "Официальный лимит CPU"),
+            ("BoardOfficialMTs", "Плата: без разгона"),
+            ("PreviousMTs", "Предыдущая сессия"),
+        ] {
+            rows.push(b.config(
+                ram_title,
+                label,
+                num_of(i.get(key)).map(|n| format!("{} MT/s", num_text(n))),
+            ));
+        }
+        rows.push(plain(
+            "Активность XMP / стабильность",
+            "Не определена / не проверялась".into(),
+            Kind::Unconfirmed,
+        ));
+        if let Some(change) = num_of(i.get("TransferRateChangePercent")) {
+            rows.push(plain(
+                "Изменение MT/s",
+                format!("{change:+.1}% · изменение производительности не измерено"),
+                Kind::Config,
+            ));
+        }
+        for note in list_of(i.get("Notes")) {
+            if let Some(note) = text_of(Some(note)) {
+                rows.push(plain("", note, kind));
+            }
+        }
+        rows.push(plain(
+            "Источник SPD",
+            if text_of(i.get("SpdAvailability")).as_deref() == Some("IMPORTED") {
+                "Импортированный DDR4 SPD; совпадение серийного номера и Part Number"
+            } else {
+                "Недоступен; XMP не определён"
+            }
+            .into(),
+            Kind::Unconfirmed,
+        ));
     }
     for note in list_of(get(&v, &["Ram", "Context"])) {
         if let Some(n) = text_of(Some(note)) {
@@ -681,6 +748,7 @@ pub fn summary_text(p: &Passport, d: &crate::i18n::Dict) -> String {
             let mark = match r.kind {
                 Kind::Config => "",
                 Kind::Measured => " *",
+                Kind::Attention => " !",
                 Kind::Unconfirmed => " ?",
             };
             match (r.label.is_empty(), r.value.is_empty()) {
@@ -853,6 +921,34 @@ pub(crate) mod tests {
             p.unconfirmed
                 .iter()
                 .any(|u| u.contains(crate::i18n::RU.pp_version))
+        );
+    }
+
+    #[test]
+    fn incomplete_dimm_inventory_is_a_lower_bound_not_a_total() {
+        let doc = QA_PASSPORT_JSON.replace(
+            r#""TotalBytes": 51539607552,"#,
+            r#""TotalBytes": 17044000000, "InventoryComplete": false, "InventoryNote": "DIMM inventory incomplete: firmware/SMBIOS lists 2 module(s)","#,
+        );
+        assert_ne!(doc, QA_PASSPORT_JSON);
+        let p = build(&doc, &texts(false)).unwrap();
+        let all: Vec<&str> = p
+            .cards
+            .iter()
+            .flat_map(|c| c.rows.iter().map(|r| r.value.as_str()))
+            .collect();
+        assert!(
+            all.iter()
+                .any(|v| v.starts_with("≥ ") && v.contains("lists 2 module")),
+            "{all:?}"
+        );
+        // Complete inventory (the real MSI fixture): a plain total.
+        let p = build(QA_PASSPORT_JSON, &texts(false)).unwrap();
+        assert!(
+            !p.cards
+                .iter()
+                .flat_map(|c| c.rows.iter())
+                .any(|r| r.value.starts_with('≥'))
         );
     }
 

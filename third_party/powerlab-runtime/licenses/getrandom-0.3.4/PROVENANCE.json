@@ -1,0 +1,22 @@
+{
+  "name": "getrandom",
+  "version": "0.3.4",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/rust-random/getrandom",
+  "authors": [
+    "The Rand Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\getrandom-0.3.4\\LICENSE-APACHE",
+    "licenses\\getrandom-0.3.4\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "38e4ad38309a85b56eef4fc759535ccfc322ba9a"
+    },
+    "path_in_vcs": ""
+  }
+}

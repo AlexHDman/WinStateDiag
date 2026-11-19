@@ -1,0 +1,216 @@
+{
+  "retrieved": "2026-11-15",
+  "sources": [
+    {
+      "name": "asrock-b760-page",
+      "url": "https://www.asrock.com/mb/Intel/B760M%20Pro%20RSD4/index.asp",
+      "final_url": "https://www.asrock.com/mb/Intel/B760M%20Pro%20RSD4/index.asp",
+      "status": 200,
+      "bytes": 212,
+      "sha256": "d02032286070b4dd9d8fbd985a7bdca8af8edf52b89ff177db3bfcb2c8a9c43d",
+      "title": [],
+      "challenge": true
+    },
+    {
+      "name": "asrock-b550-page",
+      "url": "https://www.asrock.com/mb/AMD/B550M%20Pro4/index.asp",
+      "final_url": "https://www.asrock.com/mb/AMD/B550M%20Pro4/index.asp",
+      "status": 200,
+      "bytes": 212,
+      "sha256": "d02032286070b4dd9d8fbd985a7bdca8af8edf52b89ff177db3bfcb2c8a9c43d",
+      "title": [],
+      "challenge": true
+    },
+    {
+      "name": "asrock-index",
+      "url": "https://www.asrock.com/mb/index.asp",
+      "final_url": "https://www.asrock.com/mb/index.asp",
+      "status": 200,
+      "bytes": 212,
+      "sha256": "d02032286070b4dd9d8fbd985a7bdca8af8edf52b89ff177db3bfcb2c8a9c43d",
+      "title": [],
+      "challenge": true
+    },
+    {
+      "name": "asrock-bios-index",
+      "url": "https://www.asrock.com/support/index.asp?cat=BIOS",
+      "final_url": "https://www.asrock.com/support/index.asp?cat=BIOS",
+      "status": 200,
+      "bytes": 212,
+      "sha256": "d02032286070b4dd9d8fbd985a7bdca8af8edf52b89ff177db3bfcb2c8a9c43d",
+      "title": [],
+      "challenge": true
+    },
+    {
+      "name": "asus-b550-page",
+      "url": "https://www.asus.com/us/supportonly/tuf%20gaming%20b550-plus/helpdesk_bios/",
+      "final_url": "https://www.asus.com/us/supportonly/tuf%20gaming%20b550-plus/helpdesk_bios/",
+      "status": 200,
+      "bytes": 653381,
+      "sha256": "566b59ca6018845550c125223728fee6cbeacdbfb4c34271128a715266bcd823",
+      "title": [
+        "TUF GAMING B550-PLUS - Support"
+      ],
+      "challenge": true
+    },
+    {
+      "name": "gigabyte-legacy",
+      "url": "https://www.gigabyte.com/products/product-page.aspx?pid=8701",
+      "final_url": "https://www.gigabyte.com/Motherboard/B760M-DS3H-DDR4-rev-1x",
+      "status": 200,
+      "bytes": 729202,
+      "sha256": "df6e839ef1326236bcd0962b881ca22247cb8ac6bc51feb9a2433fbd22c256df",
+      "title": [
+        "B760M DS3H DDR4 (Rev. 1.x) Motherboard - GIGABYTE Global"
+      ],
+      "challenge": true
+    },
+    {
+      "name": "msi-z890",
+      "url": "https://www.msi.com/api/v1/product/support/panel?product=PRO-Z890-P-WIFI&type=bios",
+      "final_url": "https://www.msi.com/api/v1/product/support/panel?product=PRO-Z890-P-WIFI&type=bios",
+      "status": 200,
+      "bytes": 11489,
+      "sha256": "5af88ad38f8613ab9f2683e7aec88d1bb10995cc06b197371cb200b6271b8254",
+      "title": [],
+      "challenge": false
+    },
+    {
+      "name": "msi-b450",
+      "url": "https://www.msi.com/api/v1/product/support/panel?product=B450-TOMAHAWK-MAX&type=bios",
+      "final_url": "https://www.msi.com/api/v1/product/support/panel?product=B450-TOMAHAWK-MAX&type=bios",
+      "status": 200,
+      "bytes": 17005,
+      "sha256": "504d4b026b4a78d7d4cff2e96528cea396e9ddd9d34aa6f22b0c365c9d877d91",
+      "title": [],
+      "challenge": false
+    },
+    {
+      "name": "asrock-search-b760",
+      "url": "https://www.asrock.com/support/index.us.asp?Model=B760M+Pro+RS%2FD4",
+      "final_url": "https://www.asrock.com/support/index.us.asp?Model=B760M+Pro+RS%2FD4",
+      "status": 200,
+      "bytes": 845,
+      "sha256": "b4769474ed976b76ab628a9a41f2f7fb93f49d19104d30430839f53c9112079a",
+      "title": []
+    },
+    {
+      "name": "asrock-search-b550",
+      "url": "https://www.asrock.com/support/index.us.asp?Model=B550M+Pro4",
+      "final_url": "https://www.asrock.com/support/index.us.asp?Model=B550M+Pro4",
+      "status": 200,
+      "bytes": 844,
+      "sha256": "24354fea2584e4dcaa8f4cc20dc1592c39c0b0224c98121ca0858e506ce218c2",
+      "title": []
+    },
+    {
+      "name": "asrock-pg-page",
+      "url": "https://pg.asrock.com/mb/AMD/B650M%20PG%20Riptide/index.asp",
+      "final_url": "https://pg.asrock.com/mb/AMD/B650M%20PG%20Riptide/index.asp",
+      "status": 200,
+      "bytes": 212,
+      "sha256": "d02032286070b4dd9d8fbd985a7bdca8af8edf52b89ff177db3bfcb2c8a9c43d",
+      "title": []
+    },
+    {
+      "name": "asrock-tw-page",
+      "url": "https://www.asrock.com.tw/mb/AMD/B550M%20Pro4/index.asp",
+      "final_url": "https://www.asrock.com.tw/mb/AMD/B550M%20Pro4/index.asp",
+      "status": 200,
+      "bytes": 212,
+      "sha256": "d02032286070b4dd9d8fbd985a7bdca8af8edf52b89ff177db3bfcb2c8a9c43d",
+      "title": []
+    },
+    {
+      "name": "asrock-us-page",
+      "url": "https://www.asrock.com/mb/AMD/B550M%20Pro4/index.us.asp",
+      "final_url": "https://www.asrock.com/mb/AMD/B550M%20Pro4/index.us.asp",
+      "status": 200,
+      "bytes": 850,
+      "sha256": "3477edf1795617c98f7fc91e6c6e4734f4f23443b78c7f172df378066eeeed5d",
+      "title": []
+    },
+    {
+      "name": "asus-b550-api",
+      "url": "https://www.asus.com/support/webapi/ProductV2/GetPDBIOS?website=us&model=TUF%20GAMING%20B550-PLUS&pdhashedid=&pdid=99999&cpu=&siteID=www&sitelang=",
+      "final_url": "https://www.asus.com/support/webapi/ProductV2/GetPDBIOS?website=us&model=TUF%20GAMING%20B550-PLUS&pdhashedid=&pdid=99999&cpu=&siteID=www&sitelang=",
+      "status": 200,
+      "bytes": 28576,
+      "sha256": "dccd0b75f36503e7feca9b1c3cdc71d6ca0ccd6532f048c471d492988e22ac02",
+      "title": []
+    },
+    {
+      "name": "asus-b660-api",
+      "url": "https://www.asus.com/support/webapi/ProductV2/GetPDBIOS?website=us&model=PRIME%20B660M-K%20D4&pdhashedid=&pdid=99999&cpu=&siteID=www&sitelang=",
+      "final_url": "https://www.asus.com/support/webapi/ProductV2/GetPDBIOS?website=us&model=PRIME%20B660M-K%20D4&pdhashedid=&pdid=99999&cpu=&siteID=www&sitelang=",
+      "status": 200,
+      "bytes": 32246,
+      "sha256": "676a35b61862b6c39e0a9474a52d254b1771ca892f7a53f8cd82494a58f0487e",
+      "title": []
+    },
+    {
+      "name": "asrock-b650-bios",
+      "url": "https://www.asrock.com/mb/AMD/B650E%20Steel%20Legend%20WiFi/BIOS.html",
+      "time": "2026-11-15T20:58:10.929884+00:00",
+      "status": 200,
+      "final_url": "https://www.asrock.com/mb/AMD/B650E%20Steel%20Legend%20WiFi/BIOS.html",
+      "bytes": 848,
+      "sha256": "9e54c8dcbd646c6729d26a644a469f4dcdc0caeba539e40f945a50239dd8d79f"
+    },
+    {
+      "name": "asrock-x570-bios",
+      "url": "https://www.asrock.com/mb/AMD/X570%20Steel%20Legend/bios.html",
+      "time": "2026-11-15T20:58:10.929884+00:00",
+      "status": 200,
+      "final_url": "https://www.asrock.com/mb/AMD/X570%20Steel%20Legend/bios.html",
+      "bytes": 843,
+      "sha256": "b42d797264b9a57db1073c09ee5fccff4b7a73af9210f71ac276084e5f59d7d2"
+    },
+    {
+      "name": "asrock-z790-bios",
+      "url": "https://pg.asrock.com/mb/Intel/Z790%20Lightning%20WiFi/bios.html",
+      "time": "2026-11-15T20:58:10.929884+00:00",
+      "status": 200,
+      "final_url": "https://pg.asrock.com/mb/Intel/Z790%20Lightning%20WiFi/bios.html",
+      "bytes": 839,
+      "sha256": "c910003484603053c46c6fd60fda35e4dfbffddd20e099685c2b6a2d2bc30ec1"
+    },
+    {
+      "name": "gigabyte-x570",
+      "url": "https://www.gigabyte.com/iisApplicationNuxt/api/proxy/api/v1.0/Consumer/global/GetProductTabDataAsync/Support/6897",
+      "time": "2026-11-15T20:58:10.929884+00:00",
+      "status": 200,
+      "final_url": "https://www.gigabyte.com/iisApplicationNuxt/api/proxy/api/v1.0/Consumer/global/GetProductTabDataAsync/Support/6897",
+      "bytes": 29833,
+      "sha256": "8176ffbe4bf16b8881892f512ebadf8435cf17ef59b1e8125bbb83f31c566077"
+    },
+    {
+      "name": "gigabyte-b550",
+      "url": "https://www.gigabyte.com/iisApplicationNuxt/api/proxy/api/v1.0/Consumer/global/GetProductTabDataAsync/Support/7500",
+      "time": "2026-11-15T20:58:12.206688+00:00",
+      "status": 200,
+      "final_url": "https://www.gigabyte.com/iisApplicationNuxt/api/proxy/api/v1.0/Consumer/global/GetProductTabDataAsync/Support/7500",
+      "bytes": 27547,
+      "sha256": "b014ea7ee2b4c4732a40bf585aeebd1ac7ef1820a6fdc4db19280bf32d91703c"
+    },
+    {
+      "name": "gigabyte-b550-page",
+      "url": "https://www.gigabyte.com/products/product-page.aspx?pid=7500",
+      "time": "2026-11-15T20:58:12.251259+00:00",
+      "status": 200,
+      "final_url": "https://www.gigabyte.com/Motherboard/B550-AORUS-ELITE-V2-rev-10-11",
+      "bytes": 795233,
+      "sha256": "fd25f440bb6556ab3c982a3cc729fbc7fd72ade8b0a983df19754c612aa80cd8"
+    },
+    {
+      "name": "asus-b660-page",
+      "url": "https://www.asus.com/us/supportonly/prime%20b660m-k%20d4/helpdesk_bios/",
+      "time": "2026-11-15T20:58:12.343262+00:00",
+      "status": 200,
+      "final_url": "https://www.asus.com/us/supportonly/prime%20b660m-k%20d4/helpdesk_bios/",
+      "bytes": 661982,
+      "sha256": "b8d05425c132ffbde1b875de9d2ab84c3354cb99beecf9099d54d38394c7362e"
+    }
+  ],
+  "extraction": "API JSON unchanged. HTML fixtures are exact title elements; ASRock block fixture is a sanitized structural excerpt. No successful ASRock catalogue was received."
+}

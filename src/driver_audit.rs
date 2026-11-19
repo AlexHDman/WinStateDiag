@@ -9,10 +9,10 @@
 //!
 //! Status rules (never age-based):
 //! * PROBLEM — concrete evidence of a fault: a current PnP device error,
-//!   a crash whose faulting module belongs to the driver, a Code Integrity
+//!   a Code Integrity
 //!   failure of a kernel driver, or a boot driver that failed to load and is
 //!   not running now.
-//! * WARNING — evidence of a risk that is not a confirmed fault: display
+//! * WARNING — application crashes in driver modules, or display
 //!   driver timeouts that recovered (TDR), a load failure in the past for a
 //!   device that works now, an unsigned driver, a display adapter running on
 //!   the Microsoft basic driver, a Code Integrity event for a user-mode
@@ -36,6 +36,7 @@ pub const WINDOW_DAYS: u32 = 30;
 pub enum Severity {
     #[default]
     Ok,
+    Incomplete,
     Warning,
     Problem,
 }
@@ -44,6 +45,7 @@ impl Severity {
     pub fn code(self) -> &'static str {
         match self {
             Severity::Ok => "OK",
+            Severity::Incomplete => "INCOMPLETE",
             Severity::Warning => "WARNING",
             Severity::Problem => "PROBLEM",
         }
@@ -51,6 +53,7 @@ impl Severity {
     pub fn label_ru(self) -> &'static str {
         match self {
             Severity::Ok => "OK",
+            Severity::Incomplete => "НЕПОЛНЫЕ ДАННЫЕ",
             Severity::Warning => "Внимание",
             Severity::Problem => "Проблема",
         }
@@ -91,8 +94,12 @@ pub struct RawDevice {
     pub provider: String,
     pub version: String,
     pub date: String,
+    pub date_source: String,
+    pub date_raw: String,
     pub inf: String,
     pub error_code: Option<u32>,
+    pub pnp_source: String,
+    pub pnp_query_error: String,
     pub signed: Option<bool>,
     pub pnp_id: String,
     pub service: String,
@@ -108,6 +115,8 @@ pub struct RawSysDriver {
     pub start_mode: String,
     /// "Kernel Driver", "File System Driver", ...
     pub service_type: String,
+    /// Optional component policy; currently EnableLUA for luafv, never inferred from name.
+    pub component_enabled: Option<bool>,
 }
 
 /// One `DRVFILE` record: read-only facts about the image of a driver named
@@ -274,16 +283,34 @@ pub struct AuditItem {
     pub provider: String,
     pub version: String,
     pub date: String,
+    pub date_source: String,
+    pub date_raw: String,
     pub inf: String,
     pub service: String,
     pub pnp_id: String,
     pub pnp_error_code: Option<u32>,
+    pub pnp_source: String,
+    pub pnp_query_error: String,
     pub signed: Option<bool>,
     pub status: Severity,
     pub evidence: Vec<Evidence>,
 }
 
 impl AuditItem {
+    pub fn status_code(&self) -> &'static str {
+        if self.status == Severity::Ok {
+            if self.pnp_error_code == Some(45) {
+                return "NOT_PRESENT";
+            }
+            match self.pnp_source.as_str() {
+                "CfgMgr32.NOT_PRESENT" => return "NOT_PRESENT",
+                "Win32_Printer.PRINT_QUEUE_NOT_PNP" => return "NOT_APPLICABLE",
+                _ => {}
+            }
+        }
+        self.status.code()
+    }
+
     fn recompute_status(&mut self) {
         self.status = self
             .evidence
@@ -347,10 +374,207 @@ pub struct AuditReport {
     pub errors: Vec<String>,
 }
 
+/// v1.1 RC: the event logs and queries the collector reads (DriverAudit.ps1).
+/// Shown in the text / JSON report so every status names its sources.
+pub const EVENT_SOURCES: &[&str] = &[
+    "System / Service Control Manager 7026, 7000 (7001, 7009 — контекст)",
+    "System / Microsoft-Windows-Kernel-PnP 219",
+    "System / Display 4101",
+    "Application / Application Error 1000",
+    "Microsoft-Windows-CodeIntegrity/Operational 3001, 3002, 3004, 3033, 3063, 3077",
+    "CIM Win32_PnPEntity, Win32_PnPSignedDriver, Win32_SystemDriver; Get-WindowsDriver",
+];
+
+pub fn generic_absent(item: &AuditItem) -> bool {
+    let name = item.device.to_lowercase();
+    item.status_code() == "NOT_PRESENT"
+        && item.status == Severity::Ok
+        && (name.contains("generic software device")
+            || name.contains("универсальное программное устройство"))
+}
 impl AuditReport {
-    pub fn count(&self, s: Severity) -> usize {
-        self.items.iter().filter(|i| i.status == s).count()
+    pub fn scope_counts(&self) -> (usize, usize, usize) {
+        let context = self
+            .items
+            .iter()
+            .filter(|i| matches!(i.status_code(), "NOT_PRESENT" | "NOT_APPLICABLE"))
+            .count();
+        let ci = self
+            .items
+            .iter()
+            .flat_map(|i| &i.evidence)
+            .chain(&self.software_findings)
+            .chain(&self.unattributed)
+            .filter(|e| e.kind == EvidenceKind::CodeIntegrity && e.severity >= Severity::Warning)
+            .count();
+        let pnp = self
+            .items
+            .iter()
+            .filter(|i| {
+                i.evidence
+                    .iter()
+                    .any(|e| e.kind == EvidenceKind::PnpError && e.severity >= Severity::Warning)
+            })
+            .count();
+        (pnp, ci, context)
     }
+    pub fn context_summary(&self) -> String {
+        format!(
+            "Generic software device NOT_PRESENT: {}; здоровье NOT TESTED. Полные идентификаторы и исходные доказательства — в DriverAudit JSON.",
+            self.items.iter().filter(|i| generic_absent(i)).count()
+        )
+    }
+    pub fn scope_summary(&self) -> String {
+        let (pnp, ci, context) = self.scope_counts();
+        format!(
+            "PnP: устройств с ошибками {pnp}; записи драйверов: проблем {}, предупреждений {}; Code Integrity: групп предупреждений {ci}; отсутствуют/не применимо: {context} (здоровье NOT TESTED)",
+            self.count(Severity::Problem),
+            self.count(Severity::Warning)
+        )
+    }
+    pub fn package_inventory_status(&self) -> &'static str {
+        if self
+            .errors
+            .iter()
+            .any(|e| e.starts_with("Get-WindowsDriver:"))
+        {
+            "LIMITED"
+        } else if self.complete {
+            "COMPLETE"
+        } else {
+            "UNKNOWN"
+        }
+    }
+    pub fn pnp_status(&self) -> &'static str {
+        if self.devices_scanned == 0 {
+            "NO_DATA"
+        } else {
+            self.overall.code()
+        }
+    }
+    pub fn count(&self, s: Severity) -> usize {
+        self.items
+            .iter()
+            .filter(|i| i.status == s && (s != Severity::Ok || i.status_code() == "OK"))
+            .count()
+    }
+
+    /// v1.1 RC: why the collection cannot back an "OK": collector errors
+    /// (access denied, query failure, unreadable log) and a run that did not
+    /// reach its end marker. Empty means the evidence basis is complete.
+    pub fn coverage_gaps(&self) -> Vec<String> {
+        let mut gaps = self.errors.clone();
+        if self.devices_scanned == 0
+            || self
+                .items
+                .iter()
+                .all(|i| matches!(i.status_code(), "NOT_PRESENT" | "NOT_APPLICABLE"))
+        {
+            gaps.push(if self.complete && self.errors.is_empty() {
+                "PnP inventory completed, but no present devices were observed (NO DATA)".into()
+            } else {
+                "PnP inventory unavailable or incomplete: no present devices observed".into()
+            });
+        }
+        for item in &self.items {
+            if item
+                .evidence
+                .iter()
+                .any(|e| e.severity == Severity::Incomplete)
+            {
+                gaps.push(format!(
+                    "PnP UNKNOWN: {} [{}]; {}",
+                    item.device, item.pnp_id, item.pnp_query_error
+                ));
+            }
+        }
+        if !self.complete {
+            gaps.push("сбор не завершён (нет маркера окончания)".into());
+        }
+        gaps
+    }
+
+    /// v1.1 RC: an OK with gaps in the evidence is not an OK. PROBLEM and
+    /// WARNING stand on their own evidence and are never weakened.
+    pub fn is_incomplete_ok(&self) -> bool {
+        matches!(self.overall, Severity::Ok | Severity::Incomplete)
+            && !self.coverage_gaps().is_empty()
+    }
+
+    /// Verdict code for reports: OK / WARNING / PROBLEM / INCOMPLETE.
+    pub fn verdict_code(&self) -> &'static str {
+        if self.is_incomplete_ok() {
+            "INCOMPLETE"
+        } else {
+            self.overall.code()
+        }
+    }
+
+    pub fn verdict_label_ru(&self) -> &'static str {
+        if self.is_incomplete_ok() {
+            "НЕПОЛНЫЕ ДАННЫЕ"
+        } else {
+            self.overall.label_ru()
+        }
+    }
+
+    /// Event window "<from> — <to>" from the collector's own clock; the
+    /// day count alone when the start time is unknown.
+    pub fn window_text(&self) -> String {
+        match window_start(&self.generated, self.window_days) {
+            Some(from) => format!("{from} — {} ({} дн.)", self.generated, self.window_days),
+            None => format!("{} дн.", self.window_days),
+        }
+    }
+}
+
+/// Metadata observation only: never changes driver health or PnP coverage.
+fn driver_date_is_future(date: &str, generated: &str) -> bool {
+    let iso = |s: &str| {
+        s.len() == 10
+            && s.bytes().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            })
+    };
+    generated
+        .get(..10)
+        .is_some_and(|today| iso(date) && iso(today) && date > today)
+}
+
+/// `generated` (yyyy-MM-ddTHH:mm:ss) minus `days`, as yyyy-MM-ddTHH:mm:ss.
+fn window_start(generated: &str, days: u32) -> Option<String> {
+    let (date, time) = generated.split_once('T')?;
+    let mut it = date.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days from civil (Howard Hinnant), then back.
+    let civil = |y: i64, m: i64, d: i64| {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe - 719468
+    };
+    let z = civil(y, m, d) - days as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dd = doy - (153 * mp + 2) / 5 + 1;
+    let mm = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yy = yoe + era * 400 + if mm <= 2 { 1 } else { 0 };
+    Some(format!("{yy:04}-{mm:02}-{dd:02}T{time}"))
 }
 
 // ---------------------------------------------------------------------
@@ -390,6 +614,14 @@ pub fn parse_collector_output(text: &str) -> RawAudit {
                 date: get(6),
                 inf: get(7),
                 error_code: get(8).parse().ok(),
+                pnp_source: get(12),
+                pnp_query_error: get(13),
+                date_source: if get(14).is_empty() {
+                    "Win32_PnPSignedDriver.DriverDate (legacy)".into()
+                } else {
+                    get(14)
+                },
+                date_raw: if get(15).is_empty() { get(6) } else { get(15) },
                 signed: parse_bool(&get(9)),
                 pnp_id: get(10),
                 service: get(11),
@@ -401,6 +633,7 @@ pub fn parse_collector_output(text: &str) -> RawAudit {
                 state: get(4),
                 start_mode: get(5),
                 service_type: get(6),
+                component_enabled: parse_bool(&get(7)),
             }),
             Some("DRVFILE") => raw.driver_files.push(RawDriverFile {
                 service: get(1),
@@ -715,19 +948,45 @@ fn device_matches_vendor(dev: &AuditItem, vendor: &str) -> bool {
 // Classification
 // ---------------------------------------------------------------------
 
+/// Display validation only: raw compatibility metadata is retained unchanged.
+pub fn is_numeric_driver_version(version: &str) -> bool {
+    let parts: Vec<_> = version.trim().split('.').collect();
+    (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn item_from_device(cat: Category, dev: &RawDevice) -> AuditItem {
     AuditItem {
         category: cat,
         label: short_label(cat, dev),
-        device: clean_name(&dev.name),
+        device: if dev.name.trim().is_empty() {
+            if dev.pnp_id.trim().is_empty() {
+                let label = short_label(cat, dev);
+                if label.trim().is_empty() {
+                    "PnP device (name unavailable)".into()
+                } else {
+                    label
+                }
+            } else {
+                dev.pnp_id.clone()
+            }
+        } else {
+            clean_name(&dev.name)
+        },
         vendor: vendor_of(dev),
         provider: dev.provider.clone(),
         version: dev.version.clone(),
         date: dev.date.clone(),
+        date_source: dev.date_source.clone(),
+        date_raw: dev.date_raw.clone(),
         inf: dev.inf.clone(),
         service: dev.service.clone(),
         pnp_id: dev.pnp_id.clone(),
         pnp_error_code: dev.error_code,
+        pnp_source: dev.pnp_source.clone(),
+        pnp_query_error: dev.pnp_query_error.clone(),
         signed: dev.signed,
         status: Severity::Ok,
         evidence: Vec::new(),
@@ -842,7 +1101,41 @@ fn package_conflicts(items: &mut [AuditItem], packages: &[DriverPackage]) {
 
 fn device_facts(item: &mut AuditItem, dev: &RawDevice) {
     match dev.error_code {
-        None | Some(0) => {}
+        Some(0) => {}
+        Some(45) => {
+            item.add_evidence(Evidence::fact(
+                EvidenceKind::ExpectedInactive,
+                Severity::Ok,
+                "PnP",
+                "NOT_PRESENT: код 45, устройство не подключено; запись сохранена".into(),
+            ));
+            return;
+        }
+        Some(24) => {
+            item.add_evidence(Evidence::fact(EvidenceKind::PnpError, Severity::Warning, "PnP", "Код 24: устройство отсутствует, не работает или не имеет полного комплекта драйверов; текущая причина не подтверждена".into()));
+        }
+        None if dev.pnp_source == "CfgMgr32.NOT_PRESENT" => {
+            item.add_evidence(Evidence::fact(
+                EvidenceKind::ExpectedInactive, Severity::Ok, &dev.pnp_source,
+                "NOT_PRESENT: driver inventory record without a current devnode; device health NOT TESTED".into(),
+            ));
+            return;
+        }
+        None if dev.pnp_source == "Win32_Printer.PRINT_QUEUE_NOT_PNP" => {
+            item.add_evidence(Evidence::fact(
+                EvidenceKind::ExpectedInactive,
+                Severity::Ok,
+                &dev.pnp_source,
+                "PnP NOT APPLICABLE: confirmed software print queue; queue health NOT TESTED"
+                    .into(),
+            ));
+        }
+        None => item.add_evidence(Evidence::fact(
+            EvidenceKind::PnpError,
+            Severity::Incomplete,
+            "CIM Win32_PnPEntity",
+            "PnP UNKNOWN: текущий код состояния не получен; неисправность не подтверждена".into(),
+        )),
         Some(22) => item.add_evidence(Evidence::fact(
             EvidenceKind::Disabled,
             Severity::Ok,
@@ -954,6 +1247,7 @@ fn normalise_exception(s: &str) -> String {
 
 struct Ctx<'a> {
     items: Vec<AuditItem>,
+    generated: &'a str,
     sys: &'a [RawSysDriver],
     files: &'a [RawDriverFile],
     events: &'a [RawEvent],
@@ -1011,10 +1305,14 @@ impl Ctx<'_> {
             provider: String::new(),
             version: String::new(),
             date: String::new(),
+            date_source: String::new(),
+            date_raw: String::new(),
             inf: String::new(),
             service: name,
             pnp_id: String::new(),
             pnp_error_code: None,
+            pnp_source: String::new(),
+            pnp_query_error: String::new(),
             signed: None,
             status: Severity::Ok,
             evidence: Vec::new(),
@@ -1055,10 +1353,14 @@ impl Ctx<'_> {
             provider: String::new(),
             version: String::new(),
             date: String::new(),
+            date_source: String::new(),
+            date_raw: String::new(),
             inf: String::new(),
             service: String::new(),
             pnp_id: String::new(),
             pnp_error_code: None,
+            pnp_source: String::new(),
+            pnp_query_error: String::new(),
             signed: None,
             status: Severity::Ok,
             evidence: Vec::new(),
@@ -1140,14 +1442,32 @@ fn expected_inactive_check(
     ev: &RawEvent,
 ) -> Result<String, Vec<String>> {
     let mut failed = Vec::new();
-    if ev.level != Some(4) {
-        failed.push("событие 7026 не информационное".to_string());
-    }
     let stem = file_stem_lower(name);
     let Some(sd) = ctx.sys_driver(name) else {
         return Err(vec!["служба драйвера не найдена".into()]);
     };
-    if !sd.service_type.eq_ignore_ascii_case("Kernel Driver") {
+    let disabled = sd.start_mode.eq_ignore_ascii_case("Disabled")
+        || (sd.name.eq_ignore_ascii_case("luafv") && sd.component_enabled == Some(false));
+    // The service name alone never suppresses an error. A policy-disabled luafv
+    // needs both the current policy and the expected load-blocked error (1275).
+    let policy_block = |e: &RawEvent| {
+        e.tag == "SCM7000"
+            && sd.name.eq_ignore_ascii_case("luafv")
+            && sd.component_enabled == Some(false)
+            && e.props
+                .iter()
+                .any(|p| matches!(p.trim(), "%%1275" | "1275" | "0x000004fb"))
+    };
+    let blocked_by_policy = policy_block(ev);
+    if !(ev.tag == "SCM7026" && (ev.level == Some(4) || disabled)
+        || ev.tag == "SCM7000" && blocked_by_policy)
+    {
+        failed.push("нет подтверждения штатного неактивного состояния".to_string());
+    }
+    if !matches!(
+        sd.service_type.to_ascii_lowercase().as_str(),
+        "kernel driver" | "file system driver"
+    ) {
         failed.push(format!("тип службы «{}»", sd.service_type));
     }
     let image = file_name(&sd.path).to_lowercase();
@@ -1194,14 +1514,14 @@ fn expected_inactive_check(
     if ctx
         .events
         .iter()
-        .any(|e| (e.tag == "SCM7000" || e.tag == "SCMERR") && mentions(e))
+        .any(|e| (e.tag == "SCM7000" || e.tag == "SCMERR") && mentions(e) && !policy_block(e))
     {
         failed.push("есть ошибки запуска службы (SCM 7000/7001/7009)".into());
     }
     if ctx
         .events
         .iter()
-        .any(|e| e.tag == "SCM7026" && e.level != Some(4) && mentions(e))
+        .any(|e| e.tag == "SCM7026" && e.level != Some(4) && mentions(e) && !disabled)
     {
         failed.push("есть неинформационные события 7026".into());
     }
@@ -1211,6 +1531,12 @@ fn expected_inactive_check(
         } else {
             sd.display_name.clone()
         };
+        if disabled {
+            return Ok(format!(
+                "{label}: компонент отключён текущей конфигурацией (StartMode={}, EnableLUA={:?}); событие сохранено как контекст. Файл и подпись Microsoft проверены; работоспособность отключённого компонента не проверялась.",
+                sd.start_mode, sd.component_enabled
+            ));
+        }
         Ok(format!(
             "{label}: драйвер сейчас неактивен (ожидаемо); файл, конфигурация и цифровая подпись Microsoft в порядке. Исправление не требуется."
         ))
@@ -1233,11 +1559,11 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
             let process = prop(ev, 0);
             let mut e = Evidence::from_event(
                 EvidenceKind::Crash,
-                Severity::Problem,
+                Severity::Warning,
                 ev,
                 "Application / Application Error",
                 format!(
-                    "сбой приложения {process} в модуле видеодрайвера {module} {version}{}",
+                    "сбой приложения {process} в модуле видеодрайвера {module} {version}{}; сам по себе не подтверждает текущую неисправность GPU/драйвера; отсутствие TDR/LiveKernelEvent не доказывает исправность",
                     if exception.is_empty() {
                         String::new()
                     } else {
@@ -1323,8 +1649,22 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
                     .sys_driver(name)
                     .map(|s| s.state.eq_ignore_ascii_case("running"))
                     .unwrap_or(false);
-                let (sev, tail) = if running {
-                    (Severity::Warning, "; сейчас драйвер работает")
+                let active_start = ctx.sys_driver(name).is_some_and(|s| {
+                    matches!(
+                        s.start_mode.to_ascii_lowercase().as_str(),
+                        "boot" | "system"
+                    )
+                });
+                let recent = crate::diag_state::recent(&ev.time, ctx.generated);
+                let (sev, tail) = if running || !active_start || !recent {
+                    (
+                        Severity::Warning,
+                        if running {
+                            "; сейчас драйвер работает"
+                        } else {
+                            "; прошлое событие или запуск по требованию; текущая неисправность не подтверждена"
+                        },
+                    )
                 } else {
                     (Severity::Problem, "; сейчас драйвер не запущен")
                 };
@@ -1345,12 +1685,17 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
                 e.module = name.to_string();
                 let mut targets = ctx.by_driver_name(name);
                 if targets.is_empty() {
-                    if ctx.sys_driver(name).is_some() {
-                        targets = vec![ctx.kernel_item(name)];
-                    } else {
-                        ctx.unattributed(e);
-                        continue;
+                    if ctx.sys_driver(name).is_none() {
+                        // v1.1 RC: a load failure inside the window is a
+                        // confirmed failure even when the driver is no longer
+                        // registered (or the driver list was unreadable):
+                        // past load failure -> WARNING, never a silent OK.
+                        e.severity = Severity::Warning;
+                        e.reason = format!(
+                            "драйвер {name} не загрузился при старте системы; сейчас драйвер не найден в списке системных драйверов (прошлый сбой загрузки)"
+                        );
                     }
+                    targets = vec![ctx.kernel_item(name)];
                 }
                 ctx.attach(&targets, &e);
             }
@@ -1361,10 +1706,33 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
             let Some(sd) = ctx.sys_driver(&display).cloned() else {
                 return;
             };
+            if let Ok(detail) = expected_inactive_check(ctx, &sd.name, ev) {
+                let mut e = Evidence::from_event(
+                    EvidenceKind::ExpectedInactive,
+                    Severity::Ok,
+                    ev,
+                    "System / Service Control Manager",
+                    detail,
+                );
+                e.module = sd.name.clone();
+                let mut targets = ctx.by_driver_name(&sd.name);
+                if targets.is_empty() {
+                    targets.push(ctx.kernel_item(&sd.name));
+                }
+                ctx.attach(&targets, &e);
+                ctx.expected_inactive_note(e);
+                return;
+            }
             let running = sd.state.eq_ignore_ascii_case("running");
             let mut e = Evidence::from_event(
                 EvidenceKind::BootDriverLoadFailure,
-                if running {
+                if running
+                    || !matches!(
+                        sd.start_mode.to_ascii_lowercase().as_str(),
+                        "boot" | "system"
+                    )
+                    || !crate::diag_state::recent(&ev.time, ctx.generated)
+                {
                     Severity::Warning
                 } else {
                     Severity::Problem
@@ -1477,7 +1845,10 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
             let is_kernel = fname.to_lowercase().ends_with(".sys");
             let mut e = Evidence::from_event(
                 EvidenceKind::CodeIntegrity,
-                if is_kernel {
+                if is_kernel
+                    && !matches!(ev.id, 3033 | 3063)
+                    && crate::diag_state::recent(&ev.time, ctx.generated)
+                {
                     Severity::Problem
                 } else {
                     Severity::Warning
@@ -1495,6 +1866,13 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
                     }
                 ),
             );
+            if matches!(ev.id, 3033 | 3063) {
+                e.reason.push_str("; SECURITY: политика уровня подписи/блокировки; не доказательство неисправности устройства");
+            }
+            if !crate::diag_state::recent(&ev.time, ctx.generated) {
+                e.reason
+                    .push_str("; HISTORICAL_OR_UNDATED: текущая неисправность не подтверждена");
+            }
             e.module = fname.clone();
             e.process = process;
             let mut targets = ctx.by_driver_name(&fname);
@@ -1503,7 +1881,16 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
                     targets = ctx.display_targets(v, "");
                 }
             }
-            if targets.is_empty() && is_kernel && ctx.sys_driver(&fname).is_some() {
+            if targets.is_empty() && is_kernel {
+                if ctx.sys_driver(&fname).is_none() {
+                    // v1.1 RC: kernel CI failure for a driver that is not
+                    // registered now: a confirmed in-window failure (WARNING),
+                    // not only a side note that leaves the audit OK.
+                    e.severity = Severity::Warning;
+                    e.reason.push_str(
+                        "; драйвер сейчас не найден в списке системных драйверов (прошлый сбой)",
+                    );
+                }
                 targets = vec![ctx.kernel_item(&fname)];
             }
             if targets.is_empty() {
@@ -1530,6 +1917,7 @@ fn apply_event(ctx: &mut Ctx<'_>, ev: &RawEvent) {
 pub fn classify(raw: &RawAudit) -> AuditReport {
     let mut ctx = Ctx {
         items: Vec::new(),
+        generated: &raw.generated,
         sys: &raw.sys_drivers,
         files: &raw.driver_files,
         events: &raw.events,
@@ -1539,14 +1927,23 @@ pub fn classify(raw: &RawAudit) -> AuditReport {
     };
     let mut scanned = 0usize;
     for dev in &raw.devices {
-        // Not present (24/45) devices are not part of the running system.
-        if matches!(dev.error_code, Some(24) | Some(45)) {
-            continue;
-        }
+        // All enumerated records stay accounted for, including phantom devices.
         scanned += 1;
         let cat = categorize(dev);
         let mut item = item_from_device(cat, dev);
         device_facts(&mut item, dev);
+        if let Some(e) = item
+            .evidence
+            .iter_mut()
+            .find(|e| e.kind == EvidenceKind::PnpError)
+        {
+            if !dev.pnp_source.is_empty() {
+                e.source = dev.pnp_source.clone();
+            }
+            if !dev.pnp_query_error.is_empty() {
+                e.reason.push_str(&format!("; {}", dev.pnp_query_error));
+            }
+        }
         if let Some(e) = signature_evidence(dev, &raw.sig_checks) {
             item.add_evidence(e);
         }
@@ -1561,16 +1958,7 @@ pub fn classify(raw: &RawAudit) -> AuditReport {
         apply_event(&mut ctx, ev);
     }
     package_conflicts(&mut ctx.items, &raw.packages);
-    let mut items: Vec<AuditItem> = ctx
-        .items
-        .into_iter()
-        // Items carrying evidence stay listed even when it is only
-        // historical/informational (e.g. a past Kernel-PnP 219), so it is
-        // never hidden from Details.
-        .filter(|it| {
-            it.category != Category::Other || it.status != Severity::Ok || !it.evidence.is_empty()
-        })
-        .collect();
+    let mut items: Vec<AuditItem> = ctx.items.into_iter().collect();
     items.sort_by(|a, b| {
         b.status
             .cmp(&a.status)
@@ -1752,12 +2140,50 @@ fn evidence_json(e: &Evidence, ind: &str) -> String {
 pub fn to_json(r: &AuditReport) -> String {
     let mut o = String::new();
     o.push_str("{\n");
+    let (pnp, ci, context) = r.scope_counts();
+    let _ = writeln!(
+        o,
+        "  \"scope_counts\": {{\"pnp_issue_devices\": {pnp}, \"code_integrity_warning_groups\": {ci}, \"not_present_or_not_applicable\": {context}}},"
+    );
+
+    let _ = writeln!(o, "  \"scope_summary\": {},", json_str(&r.scope_summary()));
     let _ = writeln!(o, "  \"schema\": {},", json_str(SCHEMA));
+    let _ = writeln!(
+        o,
+        "  \"producer_version\": {},",
+        json_str(crate::APP_VERSION)
+    );
+    let _ = writeln!(o, "  \"pnp_status\": {},", json_str(r.pnp_status()));
+    let _ = writeln!(
+        o,
+        "  \"package_inventory_status\": {},",
+        json_str(r.package_inventory_status())
+    );
     let _ = writeln!(o, "  \"generated\": {},", json_opt_str(&r.generated));
     let _ = writeln!(o, "  \"window_days\": {},", r.window_days);
     let _ = writeln!(o, "  \"collection_complete\": {},", r.complete);
     let _ = writeln!(o, "  \"devices_scanned\": {},", r.devices_scanned);
-    let _ = writeln!(o, "  \"overall\": {},", json_str(r.overall.code()));
+    let _ = writeln!(o, "  \"overall\": {},", json_str(r.verdict_code()));
+    let _ = writeln!(o, "  \"verdict\": {},", json_str(r.verdict_code()));
+    let _ = writeln!(o, "  \"event_window\": {},", json_str(&r.window_text()));
+    let _ = writeln!(
+        o,
+        "  \"event_sources\": [{}],",
+        EVENT_SOURCES
+            .iter()
+            .map(|x| json_str(x))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let _ = writeln!(
+        o,
+        "  \"coverage_gaps\": [{}],",
+        r.coverage_gaps()
+            .iter()
+            .map(|x| json_str(x))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let _ = writeln!(
         o,
         "  \"counts\": {{\"problem\": {}, \"warning\": {}, \"ok\": {}}},",
@@ -1769,7 +2195,7 @@ pub fn to_json(r: &AuditReport) -> String {
         o,
         "  \"status_rules\": {},",
         json_str(
-            "PROBLEM only with concrete fault evidence (PnP error, driver-module crash, kernel Code Integrity failure, boot driver not loaded); WARNING only with risk evidence (recovered display timeouts, past load failure, unsigned or basic driver, user-mode Code Integrity event); driver age alone is never a finding."
+            "PROBLEM requires concrete fault evidence (current PnP error, kernel Code Integrity failure, boot driver not loaded); WARNING includes application crashes in driver modules and recovered display timeouts, not proof of a current device fault. Unknown PnP is INCOMPLETE; driver age alone is never a finding."
         )
     );
     o.push_str("  \"items\": [");
@@ -1788,12 +2214,42 @@ pub fn to_json(r: &AuditReport) -> String {
         let _ = writeln!(
             o,
             "      \"driver_version\": {},",
+            json_opt_str(if is_numeric_driver_version(&it.version) {
+                &it.version
+            } else {
+                ""
+            })
+        );
+        let _ = writeln!(
+            o,
+            "      \"driver_version_raw\": {},",
             json_opt_str(&it.version)
         );
         let _ = writeln!(o, "      \"driver_date\": {},", json_opt_str(&it.date));
+        let _ = writeln!(
+            o,
+            "      \"driver_date_in_future\": {},",
+            driver_date_is_future(&it.date, &r.generated)
+        );
+        let _ = writeln!(
+            o,
+            "      \"driver_date_source\": {},",
+            json_opt_str(&it.date_source)
+        );
+        let _ = writeln!(
+            o,
+            "      \"driver_date_raw_cim\": {},",
+            json_opt_str(&it.date_raw)
+        );
         let _ = writeln!(o, "      \"inf\": {},", json_opt_str(&it.inf));
         let _ = writeln!(o, "      \"service\": {},", json_opt_str(&it.service));
         let _ = writeln!(o, "      \"pnp_device_id\": {},", json_opt_str(&it.pnp_id));
+        let _ = writeln!(o, "      \"pnp_source\": {},", json_opt_str(&it.pnp_source));
+        let _ = writeln!(
+            o,
+            "      \"pnp_query_error\": {},",
+            json_opt_str(&it.pnp_query_error)
+        );
         let _ = writeln!(
             o,
             "      \"pnp_error_code\": {},",
@@ -1808,7 +2264,7 @@ pub fn to_json(r: &AuditReport) -> String {
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".into())
         );
-        let _ = writeln!(o, "      \"status\": {},", json_str(it.status.code()));
+        let _ = writeln!(o, "      \"status\": {},", json_str(it.status_code()));
         let reasons: Vec<String> = it
             .evidence
             .iter()
@@ -1872,33 +2328,82 @@ pub fn to_json(r: &AuditReport) -> String {
 /// Human-readable companion to the JSON (same facts).
 pub fn to_text(r: &AuditReport) -> String {
     let mut o = String::new();
-    let _ = writeln!(o, "WinStateDiag — Проверка драйверов");
+    let _ = writeln!(
+        o,
+        "WinStateDiag {} — Проверка драйверов",
+        crate::APP_VERSION
+    );
+    let _ = writeln!(o, "{}", r.scope_summary());
     let _ = writeln!(o, "Сформировано: {}", r.generated);
     let _ = writeln!(
         o,
-        "Итог: {}  (проблем: {}, предупреждений: {}, без замечаний: {}); устройств просмотрено: {}; окно событий: {} дн.",
-        r.overall.label_ru(),
+        "Устройства PnP: {}; покрытие пакетов драйверов: {}",
+        r.pnp_status(),
+        r.package_inventory_status()
+    );
+    let _ = writeln!(
+        o,
+        "Итог: {}  (проблем: {}, предупреждений: {}, без замечаний: {}); устройств просмотрено: {}; окно событий: {}",
+        r.verdict_label_ru(),
         r.count(Severity::Problem),
         r.count(Severity::Warning),
         r.count(Severity::Ok),
         r.devices_scanned,
-        r.window_days
+        r.window_text()
     );
+    let _ = writeln!(o, "Источники событий: {}", EVENT_SOURCES.join("; "));
+    let gaps = r.coverage_gaps();
+    if !gaps.is_empty() {
+        let _ = writeln!(
+            o,
+            "Сбор неполный — отсутствие находок не означает отсутствие проблем: {}",
+            gaps.join("; ")
+        );
+    }
     let _ = writeln!(
         o,
         "Правило: статус ставится только по конкретным признакам; возраст драйвера сам по себе не считается проблемой.\n"
     );
-    for it in &r.items {
-        let _ = writeln!(o, "[{}] {} — {}", it.status.label_ru(), it.label, it.device);
+    let _ = writeln!(o, "{}", r.context_summary());
+    for it in r.items.iter().filter(|i| !generic_absent(i)) {
+        let _ = writeln!(
+            o,
+            "[{}] {} — {}",
+            if it.status_code() != it.status.code() {
+                it.status_code()
+            } else {
+                it.status.label_ru()
+            },
+            it.label,
+            it.device
+        );
         let _ = writeln!(
             o,
             "    версия: {}; дата: {}; поставщик: {}; INF: {}; служба: {}",
-            or_na(&it.version),
+            or_na(if is_numeric_driver_version(&it.version) {
+                &it.version
+            } else {
+                ""
+            }),
             or_na(&it.date),
             or_na(&it.provider),
             or_na(&it.inf),
             or_na(&it.service)
         );
+        let _ = writeln!(
+            o,
+            "  DriverDate source: {}; raw CIM: {}",
+            it.date_source, it.date_raw
+        );
+        if driver_date_is_future(&it.date, &r.generated) {
+            let _ = writeln!(
+                o,
+                "    Дата из Win32_PnPSignedDriver позже даты диагностики; сохранена без исправления. Сверьте свойства устройства/INF. Это не ошибка PnP."
+            );
+        }
+        if !it.version.is_empty() && !is_numeric_driver_version(&it.version) {
+            let _ = writeln!(o, "    raw driver metadata (not a version): {}", it.version);
+        }
         for e in &it.evidence {
             let _ = writeln!(
                 o,
@@ -1985,11 +2490,37 @@ pub fn write_report(report: &AuditReport, dir: &Path, tag: &str) -> Result<PathB
 /// Runs the read-only collector from `work_dir` and classifies the result;
 /// `cancel` (Stop, a superseding diagnostic, app close) ends the collector
 /// process early. Classification is unchanged.
+pub type ProgressSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
+pub fn progress_text(line: &str) -> Option<String> {
+    let fields: Vec<_> = line.trim().split('\t').collect();
+    if fields.first().copied() != Some("PROGRESS") || fields.len() != 5 {
+        return None;
+    }
+    let done = fields[2].parse::<usize>().ok()?;
+    let total = fields[3].parse::<usize>().ok()?;
+    let elapsed = fields[4].parse::<f64>().ok()?;
+    if !elapsed.is_finite() || elapsed < 0.0 || done > total {
+        return None;
+    }
+    Some(if total > 0 {
+        format!("{}: {done}/{total}; {elapsed:.1} s", fields[1])
+    } else {
+        format!("{}; {elapsed:.1} s", fields[1])
+    })
+}
 pub fn run_audit_with_cancel(
     work_dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<AuditReport, String> {
-    let text = run_collector(work_dir, cancel)?;
+    run_audit_with_progress(work_dir, cancel, None)
+}
+pub fn run_audit_with_progress(
+    work_dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: Option<ProgressSink>,
+) -> Result<AuditReport, String> {
+    let text = run_collector(work_dir, cancel, progress)?;
     let raw = parse_collector_output(&text);
     if raw.devices.is_empty() && !raw.errors.is_empty() {
         return Err(format!(
@@ -2004,9 +2535,10 @@ pub fn run_audit_with_cancel(
 fn run_collector(
     work_dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,
+    progress: Option<ProgressSink>,
 ) -> Result<String, String> {
     use crate::engine::{ProcessGuard, WaitEnd};
-    use std::io::Read;
+    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
@@ -2014,6 +2546,15 @@ fn run_collector(
     let script = work_dir.join("DriverAudit.ps1");
     std::fs::write(&script, COLLECTOR_PS1).map_err(|e| format!("Driver Audit: {e}"))?;
     let mut cmd = Command::new("powershell.exe");
+    let logs = crate::app_paths::data_root(work_dir)
+        .join("Logs")
+        .join("DriverAudit");
+    if std::fs::create_dir_all(&logs).is_ok() {
+        cmd.env("WSD_A5_LOG_DIR", &logs);
+    }
+    cmd.env_remove("PSModulePath")
+        .env("TEMP", work_dir)
+        .env("TMP", work_dir);
     cmd.args([
         "-NoLogo",
         "-NoProfile",
@@ -2030,14 +2571,33 @@ fn run_collector(
     // Hidden, and owned by this WinStateDiag (its process tree only).
     let mut guard = ProcessGuard::spawn(cmd)
         .map_err(|e| format!("Не удалось запустить проверку драйверов: {e}"))?;
-    let mut stdout = guard
+    let stdout = guard
         .child_mut()
         .stdout
         .take()
         .ok_or("Driver Audit: нет stdout")?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    buf.extend_from_slice(b"ERR\tstdout\tRead failed\n");
+                    break;
+                }
+            }
+            if let (Some(sink), Some(text)) = (&progress, progress_text(&line)) {
+                sink(text);
+            }
+            if buf.len() + line.len() <= 64 * 1024 * 1024 {
+                buf.extend_from_slice(line.as_bytes());
+            } else if !buf.ends_with(b"ERR\tstdout\tOutput limit exceeded\n") {
+                buf.extend_from_slice(b"ERR\tstdout\tOutput limit exceeded\n");
+            }
+        }
         buf
     });
     match guard.wait_or_cancel(cancel, Some(Duration::from_secs(180))) {
@@ -2060,6 +2620,7 @@ fn run_collector(
 fn run_collector(
     _work_dir: &Path,
     _cancel: &std::sync::atomic::AtomicBool,
+    _progress: Option<ProgressSink>,
 ) -> Result<String, String> {
     Err("Проверка драйверов доступна только в Windows.".into())
 }
@@ -2071,6 +2632,243 @@ fn run_collector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1211_radeon_disabled_matches_stage03_but_fault_codes_survive() {
+        for code in [22, 10, 28, 31, 43] {
+            let r = report(
+                vec![dev(
+                    "DISPLAY",
+                    "AMD Radeon HD 7450",
+                    "AMD",
+                    "8.970.100.9001",
+                    code,
+                )],
+                vec![],
+            );
+            assert_eq!(
+                item(&r, "7450").status,
+                if code == 22 {
+                    Severity::Ok
+                } else {
+                    Severity::Problem
+                }
+            );
+            assert_eq!(r.devices_scanned, 1);
+        }
+    }
+    #[test]
+    fn rc7_field_retained_items_replay_keeps_unknown_without_native_evidence() {
+        let Ok(root) = std::env::var("WSD_RC7_FIELD_ROOT") else {
+            return;
+        };
+        for (machine, expected) in [
+            ("LAB-A-SERVER", 37),
+            ("LAB-B-SERVER", 17),
+            ("LAB-C-SERVER", 33),
+            ("LAB-E-SERVER", 72),
+            ("LAB-D-SERVER", 80),
+        ] {
+            let text = std::fs::read_to_string(
+                std::path::Path::new(&root)
+                    .join(machine)
+                    .join("retained-items.tsv"),
+            )
+            .unwrap();
+            let raw = parse_collector_output(&text);
+            let report = classify(&raw);
+            let unknown = report
+                .items
+                .iter()
+                .filter(|i| i.status == Severity::Incomplete && i.pnp_error_code.is_none())
+                .count();
+            assert_eq!(unknown, expected, "{machine}: no invented native evidence");
+            assert!(
+                !report
+                    .items
+                    .iter()
+                    .any(|i| i.pnp_error_code.is_none() && i.status == Severity::Problem)
+            );
+            assert!(crate::deep_checks::json::parse(&to_json(&report)).is_some());
+            std::fs::write(
+                std::path::Path::new(&root)
+                    .join(machine)
+                    .join("rc7-replay-driver.json"),
+                to_json(&report),
+            )
+            .unwrap();
+            println!(
+                "{machine}: {unknown} UNKNOWN retained; current native presence requires LIVE rerun"
+            );
+        }
+    }
+
+    #[test]
+    fn rc7_native_absence_never_means_device_ok_or_masks_real_fault() {
+        let mut raw = RawAudit {
+            complete: true,
+            devices: vec![
+                RawDevice {
+                    name: "PCI device".into(),
+                    class: "DISPLAY".into(),
+                    error_code: Some(0),
+                    ..Default::default()
+                },
+                RawDevice {
+                    name: "RDP historical node".into(),
+                    pnp_source: "CfgMgr32.NOT_PRESENT".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let r = classify(&raw);
+        assert_eq!(r.devices_scanned, 2);
+        assert_eq!(r.count(Severity::Ok), 1, "NOT_PRESENT is not an OK device");
+        let it = r
+            .items
+            .iter()
+            .find(|i| i.device == "RDP historical node")
+            .unwrap();
+        assert_eq!(it.status_code(), "NOT_PRESENT");
+        assert!(to_json(&r).contains("NOT_PRESENT"));
+        assert!(to_text(&r).contains("NOT_PRESENT"));
+        raw.devices[1].pnp_source = "UNAVAILABLE".into();
+        assert_eq!(classify(&raw).verdict_code(), "INCOMPLETE");
+        raw.devices[1].error_code = Some(43);
+        assert_eq!(classify(&raw).verdict_code(), "PROBLEM");
+    }
+
+    #[test]
+    fn rc6_queue_unknown_and_fault_are_distinct() {
+        let queue = RawDevice {
+            name: "Confirmed queue".into(),
+            pnp_id: "Confirmed queue".into(),
+            pnp_source: "Win32_Printer.PRINT_QUEUE_NOT_PNP".into(),
+            ..Default::default()
+        };
+        let mut raw = RawAudit {
+            complete: true,
+            devices: vec![queue],
+            ..Default::default()
+        };
+        let report = classify(&raw);
+        assert_eq!(report.devices_scanned, 1);
+        assert_eq!(report.verdict_code(), "INCOMPLETE");
+        assert!(to_text(&report).contains("NOT APPLICABLE"));
+        raw.devices.push(RawDevice {
+            class: "DISPLAY".into(),
+            name: "GPU".into(),
+            error_code: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(classify(&raw).verdict_code(), "OK");
+        raw.devices[1].error_code = None;
+        raw.devices[1].pnp_query_error = "Access denied".into();
+        assert_eq!(classify(&raw).verdict_code(), "INCOMPLETE");
+        assert!(to_json(&classify(&raw)).contains("Access denied"));
+        raw.devices[1].error_code = Some(43);
+        assert_eq!(classify(&raw).verdict_code(), "PROBLEM");
+    }
+
+    #[test]
+    fn rc6_live_trace_preserves_coverage_errors() {
+        let Some(path) = std::env::var_os("WSD_RC6_DRIVER_TRACE") else {
+            return;
+        };
+        let raw = parse_collector_output(&std::fs::read_to_string(path).unwrap());
+        assert!(raw.complete && !raw.devices.is_empty());
+        let report = classify(&raw);
+        assert!(!report.items.iter().any(
+            |i| i.pnp_source == "Win32_Printer.PRINT_QUEUE_NOT_PNP" && i.status != Severity::Ok
+        ));
+        assert_eq!(report.errors, raw.errors);
+        if !raw.errors.is_empty() {
+            assert_ne!(report.verdict_code(), "OK");
+        }
+    }
+
+    #[test]
+    fn phase06_friendly_name_fallback_and_raw_version_preserved() {
+        let mut dev = intel_gpu();
+        dev.name = "Intel Arc friendly PnP name".into();
+        dev.version = "Windows 10 / Windows 11".into();
+        let r = report(vec![dev.clone()], vec![]);
+        assert_eq!(r.items[0].device, dev.name);
+        assert!(to_json(&r).contains(&dev.version));
+        assert!(to_json(&r).contains("\"driver_version\": null"));
+        assert!(to_json(&r).contains("\"driver_version_raw\": \"Windows 10 / Windows 11\""));
+        assert!(to_text(&r).contains(&dev.version));
+        assert!(!is_numeric_driver_version(&dev.version));
+        assert!(is_numeric_driver_version("32.0.101.6739"));
+        dev.name.clear();
+        assert_eq!(item_from_device(Category::Display, &dev).device, dev.pnp_id);
+        dev.pnp_id.clear();
+        assert!(!item_from_device(Category::Display, &dev).device.is_empty());
+    }
+
+    #[test]
+    fn phase03_b2_unknown_pnp_is_incomplete_not_ok_or_problem() {
+        let mut gpu = intel_gpu();
+        gpu.error_code = None;
+        let r = report(vec![gpu.clone()], vec![]);
+        assert_eq!(r.verdict_code(), "INCOMPLETE");
+        assert_eq!(r.items[0].status, Severity::Incomplete);
+        assert!(to_text(&r).contains("[НЕПОЛНЫЕ ДАННЫЕ]"));
+        assert!(!to_text(&r).contains("[OK]"));
+        let json = crate::deep_checks::json::parse(&to_json(&r)).unwrap();
+        assert_eq!(
+            json.get("overall").and_then(|x| x.as_str()),
+            Some("INCOMPLETE")
+        );
+        gpu.error_code = Some(0);
+        assert_eq!(report(vec![gpu.clone()], vec![]).verdict_code(), "OK");
+        gpu.error_code = Some(43);
+        assert_eq!(report(vec![gpu], vec![]).verdict_code(), "PROBLEM");
+    }
+
+    #[test]
+    fn phase04_empty_inventory_and_unknown_details_preserve_coverage() {
+        let r = report(vec![], vec![]);
+        assert_eq!(r.verdict_code(), "INCOMPLETE");
+        assert!(to_text(&r).contains("PnP inventory completed"));
+        let json = crate::deep_checks::json::parse(&to_json(&r)).unwrap();
+        assert_eq!(
+            json.get("overall").and_then(|v| v.as_str()),
+            Some("INCOMPLETE")
+        );
+        let mut gpu = intel_gpu();
+        gpu.error_code = None;
+        let r = report(vec![gpu], vec![]);
+        for d in [&crate::i18n::RU, &crate::i18n::EN] {
+            let text = crate::details::driver_issues_text(&r, d, &str::to_string);
+            assert!(!text.contains(d.driver_issues_none));
+            assert!(text.contains("PnP UNKNOWN"));
+            for e in &r.items[0].evidence {
+                assert!(text.contains(&e.reason));
+            }
+        }
+    }
+
+    #[test]
+    fn diag_101_application_crash_does_not_mask_current_pnp_fault() {
+        let crash = app_crash("2026-09-24T09:00:00", "igvk64.dll", "30.0.101.1273");
+        let mut gpu = intel_gpu();
+        let report_ok = report(vec![gpu.clone()], vec![crash.clone(), crash.clone()]);
+        let row = item(&report_ok, "UHD");
+        assert_eq!(row.status, Severity::Warning);
+        assert_eq!(row.evidence[0].count, 2);
+        assert_eq!(row.evidence[0].event_id, Some(1000));
+        assert_eq!(row.evidence[0].last_seen, "2026-09-24T09:00:00");
+        assert!(row.evidence[0].reason.contains("не доказывает исправность"));
+        assert!(to_json(&report_ok).contains("WARNING"));
+        assert!(to_text(&report_ok).contains("сам по себе не подтверждает"));
+        gpu.error_code = Some(43);
+        assert_eq!(
+            item(&report(vec![gpu], vec![crash]), "UHD").status,
+            Severity::Problem
+        );
+    }
 
     fn dev(class: &str, name: &str, mfr: &str, ver: &str, code: u32) -> RawDevice {
         RawDevice {
@@ -2085,6 +2883,7 @@ mod tests {
             signed: Some(true),
             pnp_id: format!("PCI\\VEN_TEST&DEV_{}", name.len()),
             service: String::new(),
+            ..Default::default()
         }
     }
 
@@ -2147,6 +2946,7 @@ mod tests {
                 state: "Stopped".into(),
                 start_mode: "Boot".into(),
                 service_type: "Kernel Driver".into(),
+                component_enabled: None,
             }],
             driver_files: vec![],
             events,
@@ -2181,7 +2981,11 @@ mod tests {
             "disable-",
             "enable-",
             "pnputil",
-            "dism",
+            "dism.exe",
+            "dism /",
+            "/restorehealth",
+            "/add-driver",
+            "/remove-driver",
         ] {
             assert!(!ps.contains(verb), "collector must stay read-only: {verb}");
         }
@@ -2235,7 +3039,7 @@ mod tests {
             )],
         );
         let it = item(&r, "UHD");
-        assert_eq!(it.status, Severity::Problem);
+        assert_eq!(it.status, Severity::Warning);
         let e = &it.evidence[0];
         assert_eq!(e.kind, EvidenceKind::Crash);
         assert_eq!(e.module, "igvk64.dll");
@@ -2243,7 +3047,7 @@ mod tests {
         assert_eq!(e.exception, "0xC0000005");
         assert_eq!(e.process, "win_state_diag.exe");
         assert_eq!(e.event_id, Some(1000));
-        assert_eq!(r.overall, Severity::Problem);
+        assert_eq!(r.overall, Severity::Warning);
     }
 
     fn intel_uhd750(ver: &str) -> RawDevice {
@@ -2286,7 +3090,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_of_the_current_driver_version_is_a_current_problem() {
+    fn crash_of_the_current_driver_version_is_not_a_confirmed_driver_fault() {
         let r = report(
             vec![intel_uhd750("32.0.101.7088")],
             vec![
@@ -2295,12 +3099,12 @@ mod tests {
             ],
         );
         let it = item(&r, "UHD");
-        assert_eq!(it.status, Severity::Problem);
-        assert_eq!(r.overall, Severity::Problem);
+        assert_eq!(it.status, Severity::Warning);
+        assert_eq!(r.overall, Severity::Warning);
         assert!(
             it.evidence
                 .iter()
-                .any(|e| e.module_version == "32.0.101.7088" && e.severity == Severity::Problem)
+                .any(|e| e.module_version == "32.0.101.7088" && e.severity == Severity::Warning)
         );
         assert!(
             it.evidence
@@ -2316,7 +3120,7 @@ mod tests {
                 vec![intel_uhd750("32.0.101.7088")],
                 vec![app_crash("2026-09-24T09:00:00", "igvk64.dll", v)],
             );
-            assert_eq!(item(&r, "UHD").status, Severity::Problem, "version {v:?}");
+            assert_eq!(item(&r, "UHD").status, Severity::Warning, "version {v:?}");
         }
     }
 
@@ -2341,7 +3145,7 @@ mod tests {
                 "30.0.101.1273",
             )],
         );
-        assert_eq!(item(&r, "UHD").status, Severity::Problem);
+        assert_eq!(item(&r, "UHD").status, Severity::Warning);
         assert_eq!(item(&r, "Iris").status, Severity::Ok);
         assert_eq!(item(&r, "NVIDIA").status, Severity::Ok);
     }
@@ -2360,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_without_device_creates_problem_placeholder() {
+    fn crash_without_device_creates_warning_placeholder() {
         let r = report(
             vec![],
             vec![app_crash(
@@ -2369,12 +3173,12 @@ mod tests {
                 "30.0.101.1273",
             )],
         );
-        assert_eq!(r.overall, Severity::Problem);
+        assert_eq!(r.overall, Severity::Warning);
         assert!(r.items[0].device.contains("igvk64.dll"));
     }
 
     #[test]
-    fn code_integrity_kernel_driver_is_problem() {
+    fn ci_3033_is_security_warning_not_device_fault() {
         let mut stor = dev(
             "SCSIAdapter",
             "Intel RST VMD Controller 9A0B",
@@ -2398,7 +3202,7 @@ mod tests {
             )],
         );
         let it = item(&r, "VMD");
-        assert_eq!(it.status, Severity::Problem);
+        assert_eq!(it.status, Severity::Warning);
         assert_eq!(it.evidence[0].kind, EvidenceKind::CodeIntegrity);
         assert_eq!(it.evidence[0].module, "iaStorVD.sys");
     }
@@ -2643,6 +3447,27 @@ mod tests {
     }
 
     #[test]
+    fn rc8_future_windows_driver_date_is_preserved_without_fault() {
+        let mut d = dev(
+            "MEDIA",
+            "UGREEN Camera Audio",
+            "Microsoft",
+            "10.0.26100.9457",
+            0,
+        );
+        d.date = "2026-12-09".into();
+        let r = report(vec![d], vec![]);
+        assert_eq!(item(&r, "UGREEN").date, "2026-12-09");
+        assert_eq!(r.overall, Severity::Ok);
+        assert!(to_json(&r).contains("\"driver_date\": \"2026-12-09\""));
+        assert!(to_json(&r).contains("\"driver_date_in_future\": true"));
+        assert!(to_text(&r).contains("сохранена без исправления"));
+        assert!(!driver_date_is_future("09.12.2026", &r.generated));
+        assert!(!driver_date_is_future("2026-12-09", ""));
+        assert!(!driver_date_is_future("2026-10-23", "2026-10-23T17:29:00"));
+    }
+
+    #[test]
     fn old_driver_alone_is_not_a_warning() {
         let mut d = dev(
             "MEDIA",
@@ -2810,8 +3635,11 @@ mod tests {
         );
         let it = item(&r, "UHD");
         assert_eq!(it.evidence.len(), 2);
-        assert_eq!(it.status, Severity::Problem);
-        assert_eq!(it.primary_reason().unwrap().kind, EvidenceKind::Crash);
+        assert_eq!(it.status, Severity::Warning);
+        assert_eq!(
+            it.primary_reason().unwrap().kind,
+            EvidenceKind::DisplayTimeout
+        );
         // Items are ordered PROBLEM first.
         let r2 = report(
             vec![
@@ -2834,8 +3662,9 @@ mod tests {
             ],
             vec![],
         );
-        assert_eq!(r.items.len(), 1);
-        assert_eq!(r.items[0].status, Severity::Problem);
+        assert_eq!(r.items.len(), 3);
+        assert_eq!(r.count(Severity::Problem), 1);
+        assert_eq!(r.devices_scanned, 3);
     }
 
     #[test]
@@ -2857,7 +3686,7 @@ mod tests {
         assert_eq!(raw.events[0].props[3], "igvk64.dll");
         assert_eq!(raw.errors, vec!["CI: access denied".to_string()]);
         let r = classify(&raw);
-        assert_eq!(r.overall, Severity::Problem);
+        assert_eq!(r.overall, Severity::Warning);
     }
 
     #[test]
@@ -2875,10 +3704,10 @@ mod tests {
         );
         let j = to_json(&r);
         assert!(j.contains("\"schema\": \"winstatediag.driver_audit/1\""));
-        assert!(j.contains("\"overall\": \"PROBLEM\""));
+        assert!(j.contains("\"overall\": \"WARNING\""));
         assert!(j.contains("\"device\": \"Intel UHD Graphics 630\""));
         assert!(j.contains("\"driver_version\": \"30.0.101.1273\""));
-        assert!(j.contains("\"status\": \"PROBLEM\""));
+        assert!(j.contains("\"status\": \"WARNING\""));
         assert!(j.contains("\"kind\": \"crash\""));
         assert!(j.contains("\"module\": \"igvk64.dll\""));
         assert!(j.contains("\"exception\": \"0xC0000005\""));
@@ -2889,7 +3718,7 @@ mod tests {
         let closes = j.matches('}').count() + j.matches(']').count();
         assert_eq!(opens, closes);
         let t = to_text(&r);
-        assert!(t.contains("[Проблема] Intel UHD Graphics 630"));
+        assert!(t.contains("[Внимание] Intel UHD Graphics 630"));
         assert!(t.contains("igvk64.dll"));
     }
 
@@ -2955,7 +3784,7 @@ mod tests {
         let labels: Vec<&str> = rows.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(rows.len(), 6);
         assert_eq!(rows[0].label, "Intel UHD Graphics 630");
-        assert_eq!(rows[0].status, Severity::Problem);
+        assert_eq!(rows[0].status, Severity::Warning);
         assert!(labels.contains(&"Чипсет (Intel)"));
         assert!(labels.contains(&"Аудио (Realtek)"));
         assert!(labels.contains(&"Сеть (Intel Wi-Fi)"));
@@ -3001,6 +3830,7 @@ mod tests {
                 state: "Stopped".into(),
                 start_mode: "System".into(),
                 service_type: sys_type.into(),
+                component_enabled: None,
             }],
             driver_files: vec![file],
             events,
@@ -3008,6 +3838,94 @@ mod tests {
             sig_checks: Vec::new(),
             packages: Vec::new(),
         })
+    }
+
+    #[test]
+    fn v1212_component_policy_is_evidence_not_name_allowlist() {
+        for (name, start, policy, tag, code, expected) in [
+            (
+                "luafv",
+                "Auto",
+                Some(false),
+                "SCM7000",
+                "%%1275",
+                Severity::Ok,
+            ),
+            (
+                "luafv",
+                "Auto",
+                Some(true),
+                "SCM7000",
+                "%%1275",
+                Severity::Warning,
+            ),
+            (
+                "luafv",
+                "Auto",
+                None,
+                "SCM7000",
+                "%%1275",
+                Severity::Warning,
+            ),
+            (
+                "luafv",
+                "System",
+                Some(false),
+                "SCM7000",
+                "%%2",
+                Severity::Problem,
+            ),
+            ("wesp", "Disabled", None, "SCM7026", "", Severity::Ok),
+            ("wesp", "System", None, "SCM7026", "", Severity::Problem),
+        ] {
+            let mut sd = vbox_sys("Stopped");
+            sd.name = name.into();
+            sd.display_name = name.into();
+            sd.path = format!("C:\\Windows\\System32\\drivers\\{name}.sys");
+            sd.start_mode = start.into();
+            sd.component_enabled = policy;
+            if name == "luafv" {
+                sd.service_type = "File System Driver".into();
+            }
+            let mut f = dam_file();
+            f.service = name.into();
+            f.path = sd.path.clone();
+            let mut e = evt(
+                tag,
+                if tag == "SCM7000" { 7000 } else { 7026 },
+                "2026-10-12T08:00:00",
+                &[name, code],
+            );
+            e.level = Some(2);
+            let mut repeated = e.clone();
+            repeated.time = "2026-10-12T08:01:00".into();
+            let mut raw = raw_with(vec![sd], vec![e, repeated]);
+            raw.driver_files = vec![f];
+            let r = classify(&raw);
+            assert_eq!(
+                r.overall,
+                expected,
+                "{name}/{start}/{policy:?}/{code}: {}",
+                to_text(&r)
+            );
+            assert!(to_json(&r).contains(name));
+            if expected == Severity::Ok {
+                raw.driver_files[0].signature = "HashMismatch".into();
+                assert_ne!(
+                    classify(&raw).overall,
+                    Severity::Ok,
+                    "invalid file must not be suppressed"
+                );
+                raw.driver_files[0].signature = "Valid".into();
+                raw.events.push(evt(
+                    "CI",
+                    3004,
+                    "2026-10-12T08:00:00",
+                    &[&format!("{name}.sys")],
+                ));
+                assert_ne!(classify(&raw).overall, Severity::Ok, "CI remains visible");
+            }
+        }
     }
 
     fn dam_file() -> RawDriverFile {
@@ -3143,5 +4061,189 @@ mod tests {
         let r = classify(&raw);
         assert_eq!(r.overall, Severity::Ok);
         assert_eq!(r.expected_inactive.len(), 1);
+    }
+
+    // ---- v1.1 RC stabilization: driver / service failures in the window ----
+
+    fn vbox_sys(state: &str) -> RawSysDriver {
+        RawSysDriver {
+            name: "VBoxNetLwf".into(),
+            display_name: "VirtualBox NDIS6 Bridged Networking Driver".into(),
+            path: "C:\\Windows\\system32\\DRIVERS\\VBoxNetLwf.sys".into(),
+            state: state.into(),
+            start_mode: "System".into(),
+            service_type: "Kernel Driver".into(),
+            component_enabled: None,
+        }
+    }
+
+    fn raw_with(sys: Vec<RawSysDriver>, events: Vec<RawEvent>) -> RawAudit {
+        RawAudit {
+            generated: "2026-10-13T22:49:52".into(),
+            window_days: 30,
+            complete: true,
+            devices: vec![intel_gpu()],
+            sys_drivers: sys,
+            events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vboxnetlwf_7026_registered_and_stopped_is_problem() {
+        let r = classify(&raw_with(
+            vec![vbox_sys("Stopped")],
+            vec![evt("SCM7026", 7026, "2026-10-12T08:00:00", &["VBoxNetLwf"])],
+        ));
+        assert_eq!(r.overall, Severity::Problem);
+        assert_eq!(item(&r, "VBoxNetLwf").status, Severity::Problem);
+        assert_ne!(r.verdict_code(), "OK");
+    }
+
+    #[test]
+    fn vboxnetlwf_7000_by_display_name_is_reported() {
+        let r = classify(&raw_with(
+            vec![vbox_sys("Running")],
+            vec![evt(
+                "SCM7000",
+                7000,
+                "2026-10-12T08:00:00",
+                &["VirtualBox NDIS6 Bridged Networking Driver", "%%1275"],
+            )],
+        ));
+        assert_eq!(r.overall, Severity::Warning);
+    }
+
+    #[test]
+    fn unregistered_driver_7026_in_window_is_warning_not_ok() {
+        // Driver no longer (or not readably) registered: the in-window load
+        // failure is still a confirmed failure, never a silent OK.
+        let r = classify(&raw_with(
+            vec![],
+            vec![evt("SCM7026", 7026, "2026-10-12T08:00:00", &["VBoxNetLwf"])],
+        ));
+        assert_eq!(r.overall, Severity::Warning);
+        assert!(r.unattributed.is_empty());
+        let it = item(&r, "VBoxNetLwf");
+        assert!(it.evidence[0].reason.contains("прошлый сбой"));
+        assert_eq!(it.evidence[0].event_id, Some(7026));
+        assert_eq!(it.evidence[0].first_seen, "2026-10-12T08:00:00");
+    }
+
+    #[test]
+    fn kernel_ci_for_unregistered_sys_is_warning_not_software_note() {
+        let r = classify(&raw_with(
+            vec![],
+            vec![evt(
+                "CI",
+                3033,
+                "2026-10-12T08:00:00",
+                &[
+                    "\\Device\\HarddiskVolume3\\Windows\\System32\\drivers\\VBoxNetLwf.sys",
+                    "System",
+                ],
+            )],
+        ));
+        assert_eq!(r.overall, Severity::Warning);
+        assert!(r.software_findings.is_empty());
+    }
+
+    #[test]
+    fn ci_3063_running_driver_is_security_warning() {
+        let r = classify(&raw_with(
+            vec![vbox_sys("Running")],
+            vec![evt(
+                "CI",
+                3063,
+                "2026-10-12T08:00:00",
+                &[
+                    "\\Device\\HarddiskVolume3\\Windows\\System32\\drivers\\VBoxNetLwf.sys",
+                    "System",
+                ],
+            )],
+        ));
+        assert_eq!(r.overall, Severity::Warning);
+    }
+
+    #[test]
+    fn user_mode_ci_stays_software_finding() {
+        // Real MSI session class (3033 vulkan-1.dll): kept visible, not a
+        // device-driver status.
+        let r = classify(&raw_with(
+            vec![],
+            vec![evt(
+                "CI",
+                3033,
+                "2026-10-12T08:00:00",
+                &[
+                    "\\Device\\HarddiskVolume3\\Windows\\System32\\vulkan-1.dll",
+                    "C:\\Program Files\\App\\app.exe",
+                ],
+            )],
+        ));
+        assert_eq!(r.overall, Severity::Ok);
+        assert_eq!(r.software_findings.len(), 1);
+        assert_eq!(r.verdict_code(), "OK");
+    }
+
+    #[test]
+    fn collector_error_makes_ok_incomplete() {
+        let mut raw = raw_with(vec![], vec![]);
+        raw.errors.push("SCM7026: Access is denied".into());
+        let r = classify(&raw);
+        assert_eq!(r.overall, Severity::Ok);
+        assert!(r.is_incomplete_ok());
+        assert_eq!(r.verdict_code(), "INCOMPLETE");
+        let txt = to_text(&r);
+        assert!(txt.contains("НЕПОЛНЫЕ ДАННЫЕ"));
+        assert!(txt.contains("Access is denied"));
+        let json = to_json(&r);
+        assert!(json.contains("\"verdict\": \"INCOMPLETE\""));
+        assert!(json.contains("\"overall\": \"INCOMPLETE\""));
+    }
+
+    #[test]
+    fn missing_done_marker_makes_ok_incomplete() {
+        let mut raw = raw_with(vec![], vec![]);
+        raw.complete = false;
+        assert_eq!(classify(&raw).verdict_code(), "INCOMPLETE");
+    }
+
+    #[test]
+    fn incomplete_never_weakens_problem() {
+        let mut raw = raw_with(
+            vec![vbox_sys("Stopped")],
+            vec![evt("SCM7026", 7026, "2026-10-12T08:00:00", &["VBoxNetLwf"])],
+        );
+        raw.errors.push("CI: log unreadable".into());
+        assert_eq!(classify(&raw).verdict_code(), "PROBLEM");
+    }
+
+    #[test]
+    fn report_names_window_and_sources() {
+        let r = classify(&raw_with(vec![], vec![]));
+        assert_eq!(
+            r.window_text(),
+            "2026-09-13T22:49:52 — 2026-10-13T22:49:52 (30 дн.)"
+        );
+        let txt = to_text(&r);
+        assert!(txt.contains("2026-09-13T22:49:52 — 2026-10-13T22:49:52"));
+        assert!(txt.contains("Источники событий: System / Service Control Manager 7026"));
+        let json = to_json(&r);
+        assert!(json.contains("\"event_window\""));
+        assert!(json.contains("\"coverage_gaps\": []"));
+    }
+
+    #[test]
+    fn window_start_crosses_year_and_leap_day() {
+        assert_eq!(
+            window_start("2026-01-10T01:02:03", 30).as_deref(),
+            Some("2025-12-11T01:02:03")
+        );
+        assert_eq!(
+            window_start("2024-03-01T00:00:00", 1).as_deref(),
+            Some("2024-02-29T00:00:00")
+        );
+        assert_eq!(window_start("garbage", 30), None);
     }
 }

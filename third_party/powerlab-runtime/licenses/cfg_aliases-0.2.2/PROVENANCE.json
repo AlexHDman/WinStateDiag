@@ -1,0 +1,22 @@
+{
+  "name": "cfg_aliases",
+  "version": "0.2.2",
+  "license": "MIT",
+  "repository": "https://github.com/katharostech/cfg_aliases",
+  "authors": [
+    "Zicklag <zicklag@katharostech.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\cfg_aliases-0.2.2\\LICENSE",
+    "licenses\\cfg_aliases-0.2.2\\NOTICES.md"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "e069ce61e00fee423ac1dbe6a897f228f1774716"
+    },
+    "path_in_vcs": ""
+  }
+}

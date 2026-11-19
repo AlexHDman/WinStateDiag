@@ -1,0 +1,21 @@
+{
+  "name": "writeable",
+  "version": "0.6.4",
+  "license": "Unicode-3.0",
+  "repository": "https://github.com/unicode-org/icu4x",
+  "authors": [
+    "The ICU4X Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\writeable-0.6.4\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "a14f2dad852be26bad277ae704abf27a15cbfed1"
+    },
+    "path_in_vcs": "utils/writeable"
+  }
+}

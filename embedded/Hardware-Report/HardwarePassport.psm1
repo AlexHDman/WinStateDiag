@@ -1,4 +1,4 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Compatibility.psm1')
 
 function Get-HardwareValue {
@@ -324,6 +324,50 @@ function Get-HardwareSource {
     }
 }
 
+
+# SPD files are operator-provided snapshots; no hardware driver or SMBus access.
+function Read-HardwareSpd {
+ param([byte[]]$Bytes)
+ if($Bytes.Length -ne 512 -or $Bytes[2] -ne 12 -or $Bytes[17] -ne 0){throw 'Unsupported SPD: only DDR4 / 512 bytes / standard timebase'}
+ $crc=0;foreach($b in $Bytes[0..125]){$crc=$crc -bxor ([int]$b -shl 8);for($i=0;$i -lt 8;$i++){if($crc -band 32768){$crc=(($crc -shl 1) -bxor 0x1021) -band 65535}else{$crc=($crc -shl 1) -band 65535}}}
+ if($crc -ne ([int]$Bytes[126]+256*[int]$Bytes[127])){throw 'SPD base CRC mismatch'}
+ $rate={param($a,$b) $fine=if($b -ge 128){[int]$b-256}else{[int]$b};$ps=125*[int]$a+$fine;if($ps -le 0){return $null};$n=2000000.0/$ps;if($n -lt 800 -or $n -gt 8000){return $null};$known=@(1600,1866,2133,2400,2666,2800,2933,3000,3200,3333,3466,3600,3733,3800,4000,4133,4266,4400,4600,4800,5000,5333);$near=$known|Sort-Object {[Math]::Abs($_-$n)}|Select-Object -First 1;if([Math]::Abs($near-$n)/$n -lt 0.005){[int]$near}else{[int][Math]::Round($n)}}
+ $profiles=@();if($Bytes[384] -eq 12 -and $Bytes[385] -eq 74 -and $Bytes[387] -eq 32){foreach($i in 0..1){if($Bytes[386] -band (1 -shl $i)){$n=& $rate $Bytes[(396+47*$i)] $Bytes[(431+47*$i)];if($n){$profiles+=$n}}}}
+ $sha=[Security.Cryptography.SHA256]::Create();try{$hash=[BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','')}finally{$sha.Dispose()}
+ [pscustomobject]@{Serial=([BitConverter]::ToString($Bytes[325..328]).Replace('-',''));PartNumber=[Text.Encoding]::ASCII.GetString($Bytes[329..348]).Trim([char]0,' ');JedecMTs=(& $rate $Bytes[18] $Bytes[125]);Profiles=@($profiles);Source='OPERATOR_SPD_DUMP_DDR4';SHA256=$hash;RawBase64=[Convert]::ToBase64String($Bytes)}
+}
+function Get-HardwareRamIntelligence {
+ param($Passport,[object[]]$Spd=@(),$Previous=$null)
+ $mods=@($Passport.Ram.Modules);$rates=@($mods|ForEach-Object ConfiguredSpeedMTs|Where-Object {$_ -gt 0}|Sort-Object -Unique)
+ $current=if($rates.Count -eq 1 -and @($mods|Where-Object {$_.ConfiguredSpeedMTs -gt 0}).Count -eq $mods.Count){[int]$rates[0]}else{$null}
+ $cpu=@($Passport.Cpu.Models)-join ' ';$type=@($mods|ForEach-Object Type|Sort-Object -Unique)-join '/';$limit=$null;$boardLimit=$null
+ $sources=@('Win32_PhysicalMemory / SMBIOS: reported MT/s, not measured')
+ if($cpu -match '(?i)\bi5-14600K(F)?\b'){$limit=if($type -eq 'DDR4'){3200}elseif($type -eq 'DDR5'){5600}else{$null};$sources+='https://www.intel.com/content/www/us/en/products/sku/236778/intel-core-i5-processor-14600kf-24m-cache-up-to-5-30-ghz/specifications.html'}
+ if($Passport.Motherboard.Manufacturer -match '(?i)Gigabyte' -and $Passport.Motherboard.Product -eq 'B760 GAMING X DDR4 GEN5' -and $type -eq 'DDR4'){$boardLimit=3200;$sources+='https://www.gigabyte.com/pt/Motherboard/B760-GAMING-X-DDR4-GEN5/sp'}
+ $bound=@();$common=$null
+ foreach($m in $mods){$matches=@($Spd|Where-Object {$_.Serial -eq $m.Serial -and $_.Serial -notmatch '^(0+|F+|)$' -and $_.PartNumber -eq $m.PartNumber});if($matches.Count -ne 1){$common=@();continue};$bound+=$matches[0];if($null -eq $common){$common=@($matches[0].Profiles)}else{$profiles=$matches[0].Profiles;$common=@($common|Where-Object {$profiles -contains $_})}}
+ if($bound.Count -ne $mods.Count){$common=@()};$target=if(@($common).Count){($common|Measure-Object -Maximum).Maximum}else{$null}
+ $status='UNKNOWN';$color='GRAY';$notes=@();$action='Целевой профиль не определён: проверь SPD/XMP в BIOS или предоставь SPD-дамп. Автоматических изменений нет.'
+ if($target -and $current){if($current -lt $target-2){$status='ATTENTION';$color='ORANGE';$notes+='Скорость ниже подтверждённого профиля DIMM.';$action='Проверь настройки памяти/XMP в BIOS с учётом лимита CPU; после изменения проверь стабильность.'}elseif([Math]::Abs($current-$target) -le 2){$status='CONFIGURATION_MATCH';$color='GREEN';$action='Скорость соответствует профилю DIMM; активность XMP и стабильность этим не доказаны.'}else{$status='ATTENTION';$color='ORANGE';$notes+='Скорость выше подтверждённого профиля; стабильность не проверялась.'}}
+ if($current -and $limit -and $boardLimit -and $current -lt [Math]::Min($limit,$boardLimit)-2){$status='ATTENTION';$color='ORANGE';$notes+='Скорость ниже официальной возможности CPU и этой платы; возможности DIMM требуют проверки.';$action='Проверь профили DIMM и настройки памяти в BIOS. XMP не определён; не включай разгон без проверки.'}
+ if($current -and $limit -and $current -gt $limit+2){$status='ATTENTION';$color='ORANGE';$notes+='Скорость выше официального лимита CPU; требуется проверка стабильности. Не является доказательством неисправности.'}
+ if(@($mods|ForEach-Object PartNumber|Sort-Object -Unique).Count -gt 1 -or @($mods|ForEach-Object CapacityBytes|Sort-Object -Unique).Count -gt 1){$notes+='Различающиеся DIMM: проверь совместимость и расположение.';if($color -eq 'GREEN'){$color='ORANGE';$status='ATTENTION'}}
+ if($mods.Count -eq 1){$notes+='Один DIMM: проверь конфигурацию каналов по руководству платы. Активный режим каналов не измерен.'}
+ if($color -eq 'GREEN' -and (-not $limit -or -not $boardLimit)){$color='GRAY';$status='PROFILE_MATCH_PLATFORM_UNKNOWN';$notes+='Скорость совпадает с DIMM-профилем, но официальные ограничения CPU/платы не установлены.'}
+ $previousRate=$null;$change=$null
+ if($Previous -and $Previous.Identity -and $Previous.Identity -eq $Passport.Ram.Identity -and $Previous.GeneratedAt -lt $Passport.GeneratedAt){$previousRate=$Previous.CurrentMTs;if($current -and $previousRate -gt 0){$change=[Math]::Round(100.0*($current-$previousRate)/$previousRate,1);if($current -lt $previousRate-2){$status='ATTENTION';$color='ORANGE';$notes+='Скорость ниже предыдущей сессии той же конфигурации.'}}}
+ [pscustomobject]@{Status=$status;Color=$color;CurrentMTs=$current;JedecMTs=@($bound|ForEach-Object JedecMTs|Sort-Object -Unique);ProfileMTs=$target;AvailableProfiles=@($common);XmpActive='UNKNOWN';SpdAvailability=$(if($bound.Count -eq $mods.Count -and $mods.Count){'IMPORTED'}else{'UNAVAILABLE'});CpuOfficialMTs=$limit;BoardOfficialMTs=$boardLimit;PreviousMTs=$previousRate;TransferRateChangePercent=$change;PerformanceChange='NOT_MEASURED';Stability='NOT_TESTED';Channels='UNKNOWN';Notes=$notes;Recommendation=$action;Sources=$sources;SpdEvidence=$bound;HistoryStatus='NOT_LOADED'}
+}
+function Update-HardwareRamHistory {
+ param($Passport,[string]$Directory)
+ $spd=@();$issues=@();$history=Join-Path $Directory 'MemoryHistory';$identity=[string]$Passport.Ram.Identity;$prev=$null
+ try{if(Test-Path -LiteralPath (Join-Path $Directory 'SPD')){foreach($f in @(Get-ChildItem -LiteralPath (Join-Path $Directory 'SPD') -Filter '*.bin' -File -ErrorAction Stop|Select-Object -First 16)){try{if($f.Length -ne 512){throw 'Unsupported SPD size'};$spd+=Read-HardwareSpd ([IO.File]::ReadAllBytes($f.FullName))}catch{$issues+=$_.Exception.Message}}}}catch{$issues+=$_.Exception.Message}
+ try{if($identity -and (Test-Path -LiteralPath $history)){$prev=@(Get-ChildItem -LiteralPath $history -Filter ($identity+'-*.json') -File|Sort-Object Name -Descending|Select-Object -First 100|ForEach-Object {try{[IO.File]::ReadAllText($_.FullName)|ConvertFrom-Json}catch{$issues+='History unreadable'}}|Where-Object {$_.GeneratedAt -lt $Passport.GeneratedAt}|Sort-Object GeneratedAt -Descending|Select-Object -First 1)[0]}}catch{$issues+=$_.Exception.Message}
+ $Passport.Ram.Intelligence=Get-HardwareRamIntelligence $Passport $spd $prev
+ try{if($identity){[void][IO.Directory]::CreateDirectory($history);$record=[ordered]@{Identity=$identity;GeneratedAt=$Passport.GeneratedAt;CurrentMTs=$Passport.Ram.Intelligence.CurrentMTs;Bios=$Passport.Bios.Version};$file=Join-Path $history ($identity+'-'+(Get-Date -Format yyyyMMddHHmmssffff)+'-'+[guid]::NewGuid().ToString('N')+'.json');[IO.File]::WriteAllText($file,($record|ConvertTo-Json),[Text.UTF8Encoding]::new($false));$Passport.Ram.Intelligence.HistoryStatus='SAVED'}else{$Passport.Ram.Intelligence.HistoryStatus='IDENTITY_UNKNOWN'}}catch{$issues+=$_.Exception.Message;$Passport.Ram.Intelligence.HistoryStatus='ERROR'}
+ $Passport.Ram.Intelligence.Notes+=@($issues|ForEach-Object {'Источник RAM недоступен: '+$_})
+ $Passport.Ram.Context+=@($Passport.Ram.Intelligence.Notes)+@($Passport.Ram.Intelligence.Recommendation)
+}
 function New-HardwarePassport {
     [CmdletBinding()]
     param([AllowNull()][object]$Source)
@@ -377,6 +421,17 @@ function New-HardwarePassport {
     if ($speeds.Count -gt 1) { $ramContext += 'Mixed declared module speeds (context).' }
     if (@($ramRows | Where-Object { $_.RatedSpeedMHz -and $_.ConfiguredClockMHz -and [int]$_.ConfiguredClockMHz -lt [int]$_.RatedSpeedMHz }).Count) { $ramContext += 'Configured data rate below the declared rate (JEDEC / XMP-EXPO profile context, not a fault).' }
     $declaredSlots = [int](($arrays | Measure-Object MemoryDevices -Sum).Sum)
+    # v1.1 RC (KNOWN_BUGS X79G): an independent installed total. When Windows
+    # reports materially more memory than the SMBIOS module list adds up to,
+    # the module list is incomplete (firmware); no module is invented and it
+    # is never a memory fault (state at most INFO).
+    $enumBytes = [uint64](($memory | Measure-Object Capacity -Sum).Sum)
+    $visibleBytes = [uint64]0
+    if ($system -and $system.TotalPhysicalMemory) { try { $visibleBytes = [uint64]$system.TotalPhysicalMemory } catch { } }
+    $inventoryComplete = -not ($enumBytes -gt 0 -and $visibleBytes -gt ($enumBytes * 1.05))
+    $installedBytes = if ($inventoryComplete -and $enumBytes -gt 0) { $enumBytes } else { $visibleBytes }
+    $installedSource = if ($inventoryComplete -and $enumBytes -gt 0) { 'SUM(Win32_PhysicalMemory.Capacity)' } else { 'Win32_ComputerSystem.TotalPhysicalMemory (usable, lower bound)' }
+    $inventoryNote = if ($inventoryComplete) { '' } else { ('DIMM inventory incomplete: firmware/SMBIOS lists {0} module(s) = {1}; Windows reports {2} (lower bound). Not a memory fault.' -f @($ramRows).Count, (ConvertTo-HardwareSize $enumBytes), (ConvertTo-HardwareSize $visibleBytes)) }
     # v1.0 item 34: LPDDR is soldered on-board memory. SMBIOS lists one
     # memory device per channel/package (e.g. 8 x 2 GB) - these are not
     # removable modules; slot / dual-channel / mixed-kit rules do not apply.
@@ -386,6 +441,7 @@ function New-HardwarePassport {
         $ramContext = @($ramContext | Where-Object { $_ -notlike 'Mixed module capacities*' })
         $ramContext += ('On-board (soldered) LPDDR memory: SMBIOS lists {0} memory devices (channels/packages), not removable modules.' -f $ramRows.Count)
     }
+    if ($inventoryNote) { $ramContext += $inventoryNote }
     $ramState = if (-not $ramRows.Count) { 'UNKNOWN' } elseif ($ramReasons.Count) { 'WARNING' } elseif ($ramContext.Count -or $declaredSlots -le 0 -or @($ramRows | Where-Object DeviceLocator -eq 'Unavailable').Count) { 'INFO' } else { 'OK' }
 
     $diskRows = @()
@@ -507,13 +563,13 @@ function New-HardwarePassport {
     $storageState = Get-HardwareOverallState @($diskRows | ForEach-Object Health)
     $overall = Get-HardwareOverallState @($ramState, $storageState, $batteryState)
 
-    [PSCustomObject][ordered]@{
-        Tool='EXPC Hardware Diagnostics'; SchemaVersion=1; GeneratedAt=(Get-Date).ToString('o'); ReadOnly=$true; OverallState=$overall
+    $passport = [PSCustomObject][ordered]@{
+        Tool='EXPC Hardware Diagnostics'; Version=$(if($env:WSD_APP_VERSION){$env:WSD_APP_VERSION}else{'1.3'}); SchemaVersion=1; GeneratedAt=(Get-Date).ToString('o'); ReadOnly=$true; AssessmentScope='Inventory and reported metadata; memory/stress test NOT_TESTED'; OverallState=$(if($overall -eq 'OK'){'CONFIGURATION_DETECTED'}else{$overall})
         System=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $system 'Manufacturer'); Model=ConvertTo-HardwareText (Get-HardwareValue $system 'Model'); Hostname=$(if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { ConvertTo-HardwareText (Get-HardwareValue $system 'Name') }); SystemType=ConvertTo-HardwareText (Get-HardwareValue $system 'SystemType'); WindowsEdition=ConvertTo-HardwareText (Get-HardwareValue $operatingSystem 'Caption'); WindowsBuild=ConvertTo-HardwareText (Get-HardwareValue $operatingSystem 'BuildNumber'); WindowsArchitecture=ConvertTo-HardwareText (Get-HardwareValue $operatingSystem 'OSArchitecture' $env:PROCESSOR_ARCHITECTURE); ProductId=ConvertTo-HardwareText (Get-HardwareValue $product 'IdentifyingNumber') }
         Motherboard=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $board 'Manufacturer'); Product=ConvertTo-HardwareText (Get-HardwareValue $board 'Product'); Version=ConvertTo-HardwareText (Get-HardwareValue $board 'Version'); Serial=ConvertTo-HardwareText (Get-HardwareValue $board 'SerialNumber') }
         Bios=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $bios 'Manufacturer'); Version=ConvertTo-HardwareText (Get-HardwareValue $bios 'SMBIOSBIOSVersion' (Get-HardwareValue $bios 'Version')); ReleaseDate=Get-HardwareValue $bios 'ReleaseDate'; FirmwareType=ConvertTo-HardwareText $Source.FirmwareType 'UNKNOWN'; SecureBoot=ConvertTo-HardwareText (Get-HardwareValue $Source 'SecureBootState') 'Unable to determine' }
-        Cpu=[PSCustomObject]@{ Models=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Name }); Manufacturers=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Manufacturer }|Sort-Object -Unique); PhysicalCores=[int](($processors | Measure-Object NumberOfCores -Sum).Sum); LogicalProcessors=[int](($processors | Measure-Object NumberOfLogicalProcessors -Sum).Sum); MaxClockMHz=$(($processors | Measure-Object MaxClockSpeed -Maximum).Maximum); CurrentClockMHz=$(($processors | Measure-Object CurrentClockSpeed -Maximum).Maximum); Sockets=@($processors | ForEach-Object SocketDesignation | Where-Object { $_ }); Architecture=$(switch([int](Get-HardwareValue ($processors|Select-Object -First 1) 'Architecture' -1)){0{'x86'}5{'ARM'}9{'x64'}12{'ARM64'}default{'Unknown'}}); L2CacheKB=[int](($processors|Measure-Object L2CacheSize -Sum).Sum); L3CacheKB=[int](($processors|Measure-Object L3CacheSize -Sum).Sum) }
-        Ram=[PSCustomObject]@{ State=$ramState; Reasons=$ramReasons; Context=$ramContext; TotalBytes=[uint64](($memory | Measure-Object Capacity -Sum).Sum); Total=ConvertTo-HardwareSize (($memory | Measure-Object Capacity -Sum).Sum); ModuleCount=$ramRows.Count; DeclaredSlots=$declaredSlots; Topology=$ramTopology; Modules=$ramRows }
+        Cpu=[PSCustomObject]@{ Models=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Name }); Manufacturers=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Manufacturer }|Sort-Object -Unique); PhysicalCores=[int](($processors | Measure-Object NumberOfCores -Sum).Sum); LogicalProcessors=[int](($processors | Measure-Object NumberOfLogicalProcessors -Sum).Sum); MaxClockMHz=$(($processors | Measure-Object MaxClockSpeed -Maximum).Maximum); CurrentClockMHz=$null; CurrentClockSource='NOT_MEASURED'; WindowsReportedCurrentClockMHz=$(($processors | Measure-Object CurrentClockSpeed -Maximum).Maximum); ClockSource='Win32_Processor / SMBIOS (reported, not measured)'; Sockets=@($processors | ForEach-Object SocketDesignation | Where-Object { $_ }); Architecture=$(switch([int](Get-HardwareValue ($processors|Select-Object -First 1) 'Architecture' -1)){0{'x86'}5{'ARM'}9{'x64'}12{'ARM64'}default{'Unknown'}}); L2CacheKB=[int](($processors|Measure-Object L2CacheSize -Sum).Sum); L3CacheKB=[int](($processors|Measure-Object L3CacheSize -Sum).Sum) }
+        Ram=[PSCustomObject]@{ State=$(if($ramState -eq 'OK'){'CONFIGURATION_DETECTED'}else{$ramState}); MemoryTest='NOT_TESTED'; Reasons=$ramReasons; Context=$ramContext; TotalBytes=$installedBytes; Total=$(if($inventoryComplete){ConvertTo-HardwareSize $installedBytes}else{'>= ' + (ConvertTo-HardwareSize $installedBytes) + ' (DIMM inventory incomplete)'}); InstalledSource=$installedSource; EnumeratedBytes=$enumBytes; InventoryComplete=[bool]$inventoryComplete; InventoryNote=$inventoryNote; ModuleCount=$ramRows.Count; DeclaredSlots=$declaredSlots; Topology=$ramTopology; Modules=$ramRows }
         Storage=[PSCustomObject]@{ State=$storageState; Disks=$diskRows }
         Gpu=[PSCustomObject]@{ State=$(if ($gpus.Count) { 'INFO' } else { 'UNKNOWN' }); Controllers=$gpus }
         Network=[PSCustomObject]@{ State=$(if ($networks.Count) { 'INFO' } else { 'UNKNOWN' }); Adapters=$networks }
@@ -521,6 +577,16 @@ function New-HardwarePassport {
         Npu=[PSCustomObject]@{ Detected=($npus.Count -gt 0); Devices=$npus }
         CollectionErrors=@($Source.Errors)
     }
+    $identity='';$uuid=[string](Get-HardwareValue $product 'UUID' '')
+    if($uuid -match '^[0-9a-fA-F-]{36}$' -and $uuid -notmatch '^(0|-)+$|^(F|-)+$' -and $ramRows.Count -and @($ramRows|Where-Object {$_.Serial -match '^(0+|F+|Unavailable|Unknown|)$'}).Count -eq 0){
+        $parts=@($ramRows|ForEach-Object {"$($_.Serial)|$($_.PartNumber)|$($_.CapacityBytes)|$($_.DeviceLocator)"}|Sort-Object)
+        $key=$uuid+'|'+$passport.Motherboard.Product+'|'+$passport.Bios.Version+'|'+($passport.Cpu.Models -join ',')+'|'+($parts -join ';')
+        $sha=[Security.Cryptography.SHA256]::Create();try{$identity=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($key))).Replace('-','')}finally{$sha.Dispose()}
+    }
+    $passport.Ram|Add-Member NoteProperty Identity $identity
+    $passport.Ram|Add-Member NoteProperty Intelligence (Get-HardwareRamIntelligence $passport)
+    return $passport
+
 }
 
-Export-ModuleMember -Function New-HardwarePassport,Get-HardwareOverallState,ConvertTo-HardwareSize,Format-HardwareMemoryRate,Resolve-HardwareGpuMemory,Resolve-HardwareGpuMemoryKind,Select-HardwareGpuDirectX
+Export-ModuleMember -Function Read-HardwareSpd,Get-HardwareRamIntelligence,Update-HardwareRamHistory,New-HardwarePassport,Get-HardwareOverallState,ConvertTo-HardwareSize,Format-HardwareMemoryRate,Resolve-HardwareGpuMemory,Resolve-HardwareGpuMemoryKind,Select-HardwareGpuDirectX

@@ -1,0 +1,22 @@
+{
+  "name": "fdeflate",
+  "version": "0.3.7",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/image-rs/fdeflate",
+  "authors": [
+    "The image-rs Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\fdeflate-0.3.7\\LICENSE-APACHE",
+    "licenses\\fdeflate-0.3.7\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "c365c7e6ffa81feb2e1fb762eed7299f05c9b0ca"
+    },
+    "path_in_vcs": ""
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "zerofrom",
+  "version": "0.1.8",
+  "license": "Unicode-3.0",
+  "repository": "https://github.com/unicode-org/icu4x",
+  "authors": [
+    "The ICU4X Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\zerofrom-0.1.8\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "e9575f7e4b5aeddfeeb87ada5d3e715950e8233e"
+    },
+    "path_in_vcs": "utils/zerofrom"
+  }
+}

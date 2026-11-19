@@ -1,0 +1,22 @@
+{
+  "name": "quick-error",
+  "version": "2.0.1",
+  "license": "MIT/Apache-2.0",
+  "repository": "http://github.com/tailhook/quick-error",
+  "authors": [
+    "Paul Colomiets <paul@colomiets.name>",
+    "Colin Kiegel <kiegel@gmx.de>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\quick-error-2.0.1\\LICENSE-APACHE",
+    "licenses\\quick-error-2.0.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "25ab982bb0c43130ae48485151f4a232eeab7d0c"
+    }
+  }
+}

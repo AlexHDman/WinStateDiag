@@ -1,0 +1,20 @@
+{
+  "name": "linebender_resource_handle",
+  "version": "0.1.1",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/linebender/raw_resource_handle",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\linebender_resource_handle-0.1.1\\LICENSE-APACHE",
+    "licenses\\linebender_resource_handle-0.1.1\\LICENSE-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "bd8694ffca7550e8d569346c50de5fdcb5c51a7f"
+    },
+    "path_in_vcs": ""
+  }
+}

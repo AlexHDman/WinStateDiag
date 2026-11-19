@@ -1,0 +1,20 @@
+{
+  "name": "dpi",
+  "version": "0.1.2",
+  "license": "Apache-2.0 AND MIT",
+  "repository": "https://github.com/rust-windowing/winit",
+  "authors": [],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\dpi-0.1.2\\LICENSE",
+    "licenses\\dpi-0.1.2\\LICENSE-LIBM-MIT"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "587ade844dfb0eada3696ba1cb263c66eea80581"
+    },
+    "path_in_vcs": "dpi"
+  }
+}

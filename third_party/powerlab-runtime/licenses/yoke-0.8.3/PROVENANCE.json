@@ -1,0 +1,21 @@
+{
+  "name": "yoke",
+  "version": "0.8.3",
+  "license": "Unicode-3.0",
+  "repository": "https://github.com/unicode-org/icu4x",
+  "authors": [
+    "Manish Goregaokar <manishsmail@gmail.com>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\yoke-0.8.3\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "a954ec29392c0225453404cb1f6a77f0ded27089"
+    },
+    "path_in_vcs": "utils/yoke"
+  }
+}

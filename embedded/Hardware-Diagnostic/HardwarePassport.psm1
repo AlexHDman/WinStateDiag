@@ -148,7 +148,18 @@ function New-HardwarePassport {
     if ($speeds.Count -gt 1) { $ramReasons += 'Mixed declared module speeds.' }
     if (@($ramRows | Where-Object { $_.RatedSpeedMHz -and $_.ConfiguredClockMHz -and [int]$_.ConfiguredClockMHz -lt [int]$_.RatedSpeedMHz }).Count) { $ramReasons += 'One or more modules run below their declared speed.' }
     $declaredSlots = [int](($arrays | Measure-Object MemoryDevices -Sum).Sum)
-    $ramState = if (-not $ramRows.Count) { 'UNKNOWN' } elseif ($ramReasons.Count) { 'WARNING' } elseif ($declaredSlots -le 0 -or @($ramRows | Where-Object DeviceLocator -eq 'Unavailable').Count) { 'INFO' } else { 'OK' }
+    # v1.1 RC (KNOWN_BUGS X79G): an independent installed total. When Windows
+    # reports materially more memory than the SMBIOS module list adds up to,
+    # the module list is incomplete (firmware); no module is invented and it
+    # is never a memory fault (state at most INFO).
+    $enumBytes = [uint64](($memory | Measure-Object Capacity -Sum).Sum)
+    $visibleBytes = [uint64]0
+    if ($system -and $system.TotalPhysicalMemory) { try { $visibleBytes = [uint64]$system.TotalPhysicalMemory } catch { } }
+    $inventoryComplete = -not ($enumBytes -gt 0 -and $visibleBytes -gt ($enumBytes * 1.05))
+    $installedBytes = if ($inventoryComplete -and $enumBytes -gt 0) { $enumBytes } else { $visibleBytes }
+    $installedSource = if ($inventoryComplete -and $enumBytes -gt 0) { 'SUM(Win32_PhysicalMemory.Capacity)' } else { 'Win32_ComputerSystem.TotalPhysicalMemory (usable, lower bound)' }
+    $inventoryNote = if ($inventoryComplete) { '' } else { ('DIMM inventory incomplete: firmware/SMBIOS lists {0} module(s) = {1}; Windows reports {2} (lower bound). Not a memory fault.' -f @($ramRows).Count, (ConvertTo-HardwareSize $enumBytes), (ConvertTo-HardwareSize $visibleBytes)) }
+    $ramState = if (-not $ramRows.Count) { 'UNKNOWN' } elseif ($ramReasons.Count) { 'WARNING' } elseif (-not $inventoryComplete -or $declaredSlots -le 0 -or @($ramRows | Where-Object DeviceLocator -eq 'Unavailable').Count) { 'INFO' } else { 'OK' }
 
     $diskRows = @()
     if ($physical.Count) {
@@ -207,7 +218,7 @@ function New-HardwarePassport {
         Motherboard=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $board 'Manufacturer'); Product=ConvertTo-HardwareText (Get-HardwareValue $board 'Product'); Version=ConvertTo-HardwareText (Get-HardwareValue $board 'Version'); Serial=ConvertTo-HardwareText (Get-HardwareValue $board 'SerialNumber') }
         Bios=[PSCustomObject]@{ Manufacturer=ConvertTo-HardwareText (Get-HardwareValue $bios 'Manufacturer'); Version=ConvertTo-HardwareText (Get-HardwareValue $bios 'SMBIOSBIOSVersion' (Get-HardwareValue $bios 'Version')); ReleaseDate=Get-HardwareValue $bios 'ReleaseDate'; FirmwareType=ConvertTo-HardwareText $Source.FirmwareType 'UNKNOWN' }
         Cpu=[PSCustomObject]@{ Models=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Name }); Manufacturers=@($processors | ForEach-Object { ConvertTo-HardwareText $_.Manufacturer }|Sort-Object -Unique); PhysicalCores=[int](($processors | Measure-Object NumberOfCores -Sum).Sum); LogicalProcessors=[int](($processors | Measure-Object NumberOfLogicalProcessors -Sum).Sum); MaxClockMHz=$(($processors | Measure-Object MaxClockSpeed -Maximum).Maximum); CurrentClockMHz=$(($processors | Measure-Object CurrentClockSpeed -Maximum).Maximum); Sockets=@($processors | ForEach-Object SocketDesignation | Where-Object { $_ }); Architecture=$(switch([int](Get-HardwareValue ($processors|Select-Object -First 1) 'Architecture' -1)){0{'x86'}5{'ARM'}9{'x64'}12{'ARM64'}default{'Unknown'}}); L2CacheKB=[int](($processors|Measure-Object L2CacheSize -Sum).Sum); L3CacheKB=[int](($processors|Measure-Object L3CacheSize -Sum).Sum) }
-        Ram=[PSCustomObject]@{ State=$ramState; Reasons=$ramReasons; TotalBytes=[uint64](($memory | Measure-Object Capacity -Sum).Sum); Total=ConvertTo-HardwareSize (($memory | Measure-Object Capacity -Sum).Sum); ModuleCount=$ramRows.Count; DeclaredSlots=$declaredSlots; Modules=$ramRows }
+        Ram=[PSCustomObject]@{ State=$ramState; Reasons=$ramReasons; TotalBytes=$installedBytes; Total=$(if($inventoryComplete){ConvertTo-HardwareSize $installedBytes}else{'>= ' + (ConvertTo-HardwareSize $installedBytes) + ' (DIMM inventory incomplete)'}); InstalledSource=$installedSource; EnumeratedBytes=$enumBytes; InventoryComplete=[bool]$inventoryComplete; InventoryNote=$inventoryNote; ModuleCount=$ramRows.Count; DeclaredSlots=$declaredSlots; Modules=$ramRows }
         Storage=[PSCustomObject]@{ State=$storageState; Disks=$diskRows }
         Gpu=[PSCustomObject]@{ State=$(if ($gpus.Count) { 'INFO' } else { 'UNKNOWN' }); Controllers=$gpus }
         Network=[PSCustomObject]@{ State=$(if ($networks.Count) { 'INFO' } else { 'UNKNOWN' }); Adapters=$networks }

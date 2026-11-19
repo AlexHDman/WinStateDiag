@@ -1,0 +1,21 @@
+{
+  "name": "xml-rs",
+  "version": "0.8.29",
+  "license": "MIT",
+  "repository": "https://github.com/kornelski/xml-rs",
+  "authors": [
+    "Vladimir Matveev <vmatveev@citrine.cc>"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\xml-rs-0.8.29\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "33cdf417b112c0ebd1f0858b2a67464b3712a4c6"
+    },
+    "path_in_vcs": ""
+  }
+}

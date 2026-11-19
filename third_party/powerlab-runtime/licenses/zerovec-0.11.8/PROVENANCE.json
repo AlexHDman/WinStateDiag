@@ -1,0 +1,21 @@
+{
+  "name": "zerovec",
+  "version": "0.11.8",
+  "license": "Unicode-3.0",
+  "repository": "https://github.com/unicode-org/icu4x",
+  "authors": [
+    "The ICU4X Project Developers"
+  ],
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "selected_when_missing_text": null,
+  "license_files": [
+    "licenses\\zerovec-0.11.8\\LICENSE"
+  ],
+  "provenance_note": null,
+  "vcs": {
+    "git": {
+      "sha1": "c56bbb5a7b47409759113903764c456f13b418e5"
+    },
+    "path_in_vcs": "utils/zerovec"
+  }
+}

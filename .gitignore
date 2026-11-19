@@ -8,6 +8,7 @@
 # Diagnostic reports / runtime state (real machine data — never commit)
 /Reports/
 /reports/
+/.WinStateDiag-work/
 **/Reports/
 *.zip
 WinStateDiag.lang
@@ -62,3 +63,14 @@ __pycache__/
 
 # Power telemetry research: raw probe output names the machine - local only.
 /research/power_telemetry/logs/
+
+# Private field originals: use separately generated synthetic fixtures for publication.
+/scripts/fixtures/v1.2.11/
+
+# Local secrets and field captures
+.env
+.env.*
+*.pfx
+*.p12
+*.dmp
+*.evtx
